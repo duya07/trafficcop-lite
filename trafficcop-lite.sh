@@ -10,8 +10,9 @@ WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
 TELEGRAM_SCRIPT="trafficcop-lite-telegram.sh"
 MACHINE_LIMIT_SCRIPT="trafficcop-lite-machine-limit.sh"
-SHORTCUT_PATH="/usr/local/bin/ncl"
-LEGACY_SHORTCUT_PATH="/usr/local/bin/tc"
+SHORTCUT_PATH="/usr/local/bin/ntc"
+LEGACY_NCL_SHORTCUT_PATH="/usr/local/bin/ncl"
+LEGACY_TC_SHORTCUT_PATH="/usr/local/bin/tc"
 REPO="${REPO:-duya07/trafficcop-lite}"
 BRANCH="${BRANCH:-main}"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/${REPO}/${BRANCH}}"
@@ -143,10 +144,14 @@ install_shortcut() {
     mkdir -p "$(dirname "$SHORTCUT_PATH")"
     ln -sfn "$WORK_DIR/trafficcop-lite.sh" "$SHORTCUT_PATH"
     chmod +x "$WORK_DIR/trafficcop-lite.sh"
-    echo -e "${GREEN}✓ 快捷命令已安装：sudo ncl${NC}"
-    if [ "$(readlink "$LEGACY_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
-        rm -f "$LEGACY_SHORTCUT_PATH"
-        echo -e "${GREEN}✓ 已清理旧快捷命令：$LEGACY_SHORTCUT_PATH${NC}"
+    echo -e "${GREEN}✓ 快捷命令已安装：sudo ntc${NC}"
+    if [ "$(readlink "$LEGACY_NCL_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
+        rm -f "$LEGACY_NCL_SHORTCUT_PATH"
+        echo -e "${GREEN}✓ 已清理旧快捷命令：$LEGACY_NCL_SHORTCUT_PATH${NC}"
+    fi
+    if [ "$(readlink "$LEGACY_TC_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
+        rm -f "$LEGACY_TC_SHORTCUT_PATH"
+        echo -e "${GREEN}✓ 已清理旧快捷命令：$LEGACY_TC_SHORTCUT_PATH${NC}"
     fi
     if [ -n "$TC_BIN" ]; then
         echo -e "${CYAN}系统原 tc 命令路径：$TC_BIN${NC}"
@@ -281,13 +286,16 @@ update_scripts() {
         mkdir -p "$(dirname "$SHORTCUT_PATH")"
         ln -sfn "$WORK_DIR/trafficcop-lite.sh" "$SHORTCUT_PATH"
     fi
-    if [ "$(readlink "$LEGACY_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
-        rm -f "$LEGACY_SHORTCUT_PATH"
+    if [ "$(readlink "$LEGACY_NCL_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
+        rm -f "$LEGACY_NCL_SHORTCUT_PATH"
+    fi
+    if [ "$(readlink "$LEGACY_TC_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
+        rm -f "$LEGACY_TC_SHORTCUT_PATH"
     fi
 
     echo ""
     echo -e "${GREEN}脚本更新完成。旧脚本已备份到：$backup_dir${NC}"
-    echo -e "${YELLOW}建议重新执行 sudo ncl 进入新版菜单。${NC}"
+    echo -e "${YELLOW}建议重新执行 sudo ntc 进入新版菜单。${NC}"
 }
 
 update_scripts_interactive() {
@@ -522,9 +530,13 @@ uninstall_lite() {
         rm -f "$SHORTCUT_PATH"
         echo "✓ 已删除快捷命令 $SHORTCUT_PATH"
     fi
-    if [ "$(readlink "$LEGACY_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
-        rm -f "$LEGACY_SHORTCUT_PATH"
-        echo "✓ 已删除旧快捷命令 $LEGACY_SHORTCUT_PATH"
+    if [ "$(readlink "$LEGACY_NCL_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
+        rm -f "$LEGACY_NCL_SHORTCUT_PATH"
+        echo "✓ 已删除旧快捷命令 $LEGACY_NCL_SHORTCUT_PATH"
+    fi
+    if [ "$(readlink "$LEGACY_TC_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
+        rm -f "$LEGACY_TC_SHORTCUT_PATH"
+        echo "✓ 已删除旧快捷命令 $LEGACY_TC_SHORTCUT_PATH"
     fi
 
     echo -e "${GREEN}卸载完成。${NC}"
@@ -539,7 +551,7 @@ show_main_menu() {
     echo -e "${PURPLE}版本: ${SCRIPT_VERSION}    更新: ${LAST_UPDATE}${NC}"
     echo ""
     show_status_line
-    echo -e "${CYAN}快捷命令:${NC} sudo ncl"
+    echo -e "${CYAN}快捷命令:${NC} sudo ntc"
     echo ""
     menu_item "1" "安装/管理流量监控"
     menu_item "2" "安装/管理 Telegram 通知"
@@ -560,7 +572,7 @@ main() {
     case "${1:-}" in
         --install)
             install_shortcut
-            echo -e "${GREEN}安装完成。以后可执行：sudo ncl${NC}"
+            echo -e "${GREEN}安装完成。以后可执行：sudo ntc${NC}"
             exit 0
             ;;
         --uninstall)
@@ -585,7 +597,7 @@ main() {
             ;;
         --help|-h)
             echo "TrafficCop Lite"
-            echo "用法: sudo ncl [--install|--update|--uninstall|--stop|--logs|--config]"
+            echo "用法: sudo ntc [--install|--update|--uninstall|--stop|--logs|--config]"
             echo "无参数运行进入交互菜单。"
             exit 0
             ;;

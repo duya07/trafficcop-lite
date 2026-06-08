@@ -10,7 +10,7 @@ WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
 TELEGRAM_SCRIPT="trafficcop-lite-telegram.sh"
 MACHINE_LIMIT_SCRIPT="trafficcop-lite-machine-limit.sh"
-SHORTCUT_PATH="/usr/local/bin/tc"
+SHORTCUT_PATH="/usr/local/bin/ncl"
 REPO="${REPO:-duya07/trafficcop-lite}"
 BRANCH="${BRANCH:-main}"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/${REPO}/${BRANCH}}"
@@ -126,7 +126,7 @@ install_shortcut() {
 
     ln -sfn "$WORK_DIR/trafficcop-lite.sh" "$SHORTCUT_PATH"
     chmod +x "$WORK_DIR/trafficcop-lite.sh"
-    echo -e "${GREEN}✓ 快捷命令已安装：sudo tc${NC}"
+    echo -e "${GREEN}✓ 快捷命令已安装：sudo ncl${NC}"
     if [ -n "$TC_BIN" ]; then
         echo -e "${CYAN}系统原 tc 命令路径：$TC_BIN${NC}"
     fi
@@ -385,7 +385,7 @@ show_main_menu() {
     echo -e "${PURPLE}版本: ${SCRIPT_VERSION}    更新: ${LAST_UPDATE}${NC}"
     echo ""
     show_status_line
-    echo -e "${CYAN}快捷命令:${NC} sudo tc"
+    echo -e "${CYAN}快捷命令:${NC} sudo ncl"
     [ -n "$TC_BIN" ] && echo -e "${CYAN}系统 tc:${NC} $TC_BIN"
     echo ""
     echo -e "${YELLOW}1) 安装/管理流量监控${NC}"
@@ -406,7 +406,7 @@ main() {
     case "${1:-}" in
         --install)
             install_shortcut
-            echo -e "${GREEN}安装完成。以后可执行：sudo tc${NC}"
+            echo -e "${GREEN}安装完成。以后可执行：sudo ncl${NC}"
             exit 0
             ;;
         --uninstall)
@@ -427,7 +427,7 @@ main() {
             ;;
         --help|-h)
             echo "TrafficCop Lite"
-            echo "用法: sudo tc [--install|--uninstall|--stop|--logs|--config]"
+            echo "用法: sudo ncl [--install|--uninstall|--stop|--logs|--config]"
             echo "无参数运行进入交互菜单。"
             exit 0
             ;;

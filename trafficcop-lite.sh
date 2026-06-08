@@ -23,6 +23,7 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 CYAN='\033[0;36m'
 BOLD='\033[1m'
+WHITE='\033[0;37m'
 NC='\033[0m'
 
 SOURCE_PATH="${BASH_SOURCE[0]}"
@@ -192,8 +193,24 @@ show_status_line() {
         config_state="已配置"
     fi
 
+    local config_color="$YELLOW"
+    local monitor_color="$YELLOW"
+    local telegram_color="$YELLOW"
+
+    [ "$config_state" = "已配置" ] && config_color="$GREEN"
+    [ "$monitor_cron" = "已设置" ] && monitor_color="$GREEN"
+    [ "$telegram_cron" = "已设置" ] && telegram_color="$GREEN"
+
     echo -e "${CYAN}工作目录:${NC} $WORK_DIR"
-    echo -e "${CYAN}监控配置:${NC} $config_state   ${CYAN}监控任务:${NC} $monitor_cron   ${CYAN}TG任务:${NC} $telegram_cron"
+    echo -e "${CYAN}监控配置:${NC} ${config_color}${config_state}${NC}   ${CYAN}监控任务:${NC} ${monitor_color}${monitor_cron}${NC}   ${CYAN}TG任务:${NC} ${telegram_color}${telegram_cron}${NC}"
+}
+
+menu_item() {
+    local number="$1"
+    local label="$2"
+    local number_color="${3:-$PURPLE}"
+    local label_color="${4:-$WHITE}"
+    printf "${number_color}%2s)${NC} ${label_color}%s${NC}\n" "$number" "$label"
 }
 
 tail_file() {
@@ -398,16 +415,15 @@ show_main_menu() {
     echo ""
     show_status_line
     echo -e "${CYAN}快捷命令:${NC} sudo ncl"
-    [ -n "$TC_BIN" ] && echo -e "${CYAN}系统 tc:${NC} $TC_BIN"
     echo ""
-    echo -e "${YELLOW}1) 安装/管理流量监控${NC}"
-    echo -e "${YELLOW}2) 安装/管理 Telegram 通知${NC}"
-    echo -e "${GREEN}7) 机器限速管理 (启用/禁用)${NC}"
-    echo -e "${YELLOW}8) 查看日志${NC}"
-    echo -e "${YELLOW}9) 查看当前配置${NC}"
-    echo -e "${YELLOW}11) 停止所有服务${NC}"
-    echo -e "${RED}12) 卸载 TrafficCop-Lite${NC}"
-    echo -e "${YELLOW}0) 退出${NC}"
+    menu_item "1" "安装/管理流量监控"
+    menu_item "2" "安装/管理 Telegram 通知"
+    menu_item "3" "机器限速管理 (启用/禁用)"
+    menu_item "4" "查看日志"
+    menu_item "5" "查看当前配置"
+    menu_item "6" "停止所有服务"
+    menu_item "7" "卸载 TrafficCop-Lite" "$RED" "$RED"
+    menu_item "0" "退出"
     echo ""
 }
 
@@ -449,15 +465,15 @@ main() {
 
     while true; do
         show_main_menu
-        read -p "请选择操作 [0/1/2/7/8/9/11/12]: " choice
+        read -p "请选择操作 [0-7]: " choice
         case "$choice" in
             1) manage_monitor ;;
             2) manage_telegram ;;
-            7) manage_machine_limit ;;
-            8) view_logs ;;
-            9) view_config ;;
-            11) stop_all_services ;;
-            12) uninstall_lite ;;
+            3) manage_machine_limit ;;
+            4) view_logs ;;
+            5) view_config ;;
+            6) stop_all_services ;;
+            7) uninstall_lite ;;
             0) echo -e "${GREEN}已退出 TrafficCop-Lite。${NC}"; exit 0 ;;
             *) echo -e "${RED}无效选择，请重新输入。${NC}"; sleep 1 ;;
         esac

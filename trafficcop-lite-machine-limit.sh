@@ -278,7 +278,13 @@ show_detailed_status() {
     # 检查当前流量使用
     echo -e "${CYAN}当前流量统计:${NC}"
     if command -v vnstat >/dev/null 2>&1; then
-        vnstat -i $(get_main_interface) --oneline 2>/dev/null | head -1 || echo "无法获取流量统计"
+        local interface
+        interface=$(get_main_interface)
+        if [ -n "$interface" ]; then
+            vnstat -i "$interface" --oneline 2>/dev/null | head -1 || echo "无法获取流量统计"
+        else
+            echo "无法检测网络接口"
+        fi
     else
         echo "vnstat 未安装"
     fi

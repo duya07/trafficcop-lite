@@ -11,6 +11,7 @@ MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
 TELEGRAM_SCRIPT="trafficcop-lite-telegram.sh"
 MACHINE_LIMIT_SCRIPT="trafficcop-lite-machine-limit.sh"
 SHORTCUT_PATH="/usr/local/bin/ncl"
+LEGACY_SHORTCUT_PATH="/usr/local/bin/tc"
 REPO="${REPO:-duya07/trafficcop-lite}"
 BRANCH="${BRANCH:-main}"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/${REPO}/${BRANCH}}"
@@ -124,9 +125,14 @@ install_shortcut() {
         return 0
     fi
 
+    mkdir -p "$(dirname "$SHORTCUT_PATH")"
     ln -sfn "$WORK_DIR/trafficcop-lite.sh" "$SHORTCUT_PATH"
     chmod +x "$WORK_DIR/trafficcop-lite.sh"
     echo -e "${GREEN}✓ 快捷命令已安装：sudo ncl${NC}"
+    if [ "$(readlink "$LEGACY_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
+        rm -f "$LEGACY_SHORTCUT_PATH"
+        echo -e "${GREEN}✓ 已清理旧快捷命令：$LEGACY_SHORTCUT_PATH${NC}"
+    fi
     if [ -n "$TC_BIN" ]; then
         echo -e "${CYAN}系统原 tc 命令路径：$TC_BIN${NC}"
     fi
@@ -354,6 +360,8 @@ uninstall_lite() {
 
     stop_lite_processes
     remove_lite_cron
+    clear_lite_tc_rules_interactive
+    cancel_shutdown_interactive
 
     if [ -d "$WORK_DIR" ]; then
         read -p "是否先备份配置和日志？[Y/n]: " keep_backup
@@ -371,6 +379,10 @@ uninstall_lite() {
     if [ "$(readlink "$SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
         rm -f "$SHORTCUT_PATH"
         echo "✓ 已删除快捷命令 $SHORTCUT_PATH"
+    fi
+    if [ "$(readlink "$LEGACY_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
+        rm -f "$LEGACY_SHORTCUT_PATH"
+        echo "✓ 已删除旧快捷命令 $LEGACY_SHORTCUT_PATH"
     fi
 
     echo -e "${GREEN}卸载完成。${NC}"

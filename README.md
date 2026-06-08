@@ -20,7 +20,7 @@
 4. 安装后提供快捷命令 `ncl`，可直接执行 `sudo ncl` 打开管理菜单。
 5. 脚本内部调用系统限速命令时使用 `/usr/sbin/tc` 等原始路径，避免与 Linux 自带 `tc` 限速命令冲突。
 6. 停止服务和卸载时只处理 `/etc/trafficcop-lite` 相关进程、crontab 和文件，不删除上游默认目录 `/root/TrafficCop`。
-7. 卸载默认先备份配置和日志到 `/etc/trafficcop-lite-backup-时间戳/`。
+7. 卸载会先按配置检查 TC 限速和计划关机，再备份配置和日志到 `/etc/trafficcop-lite-backup-时间戳/`。
 
 ## 下载方式说明
 
@@ -129,7 +129,9 @@ sudo bash /etc/trafficcop-lite/trafficcop-lite.sh --uninstall
 
 - 删除 `/etc/trafficcop-lite`。
 - 删除 `/usr/local/bin/ncl` 快捷命令（仅当它指向本脚本时）。
+- 清理旧版 `/usr/local/bin/tc` 快捷命令（仅当它指向本脚本时）。
 - 清理独立版 crontab 条目。
+- 删除目录前会按当前配置检查 TC 限速规则和计划关机，并要求确认后处理。
 - 默认备份配置和日志到 `/etc/trafficcop-lite-backup-时间戳/`。
 - 不卸载系统依赖包。
 - 不删除上游默认目录 `/root/TrafficCop`。

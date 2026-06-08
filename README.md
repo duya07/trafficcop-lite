@@ -77,6 +77,7 @@ sudo ncl
 
 ```bash
 sudo ncl --install
+sudo ncl --update
 sudo ncl --stop
 sudo ncl --logs
 sudo ncl --config
@@ -84,6 +85,7 @@ sudo ncl --uninstall
 ```
 
 - `--install`: 安装/更新组件，并创建 `ncl` 快捷命令。
+- `--update`: 从仓库更新脚本文件，不覆盖配置和日志。
 - `--stop`: 停止独立版监控和通知任务。
 - `--logs`: 查看日志。
 - `--config`: 查看配置。
@@ -98,10 +100,37 @@ sudo ncl --uninstall
 4) 查看日志
 5) 查看当前配置
 6) 停止所有服务
-7) 卸载 TrafficCop-Lite
+7) 更新脚本
+8) 卸载 TrafficCop-Lite
 ```
 
-## 3) 年度起始月份
+## 3) 更新脚本
+
+交互菜单中选择 `7) 更新脚本`，可选择直连或国内优先线路。
+
+命令行更新:
+
+直连:
+
+```bash
+sudo ncl --update
+```
+
+国内优先（gh-proxy）:
+
+```bash
+sudo env RAW_BASE="https://v6.gh-proxy.org/https://raw.githubusercontent.com/duya07/trafficcop-lite/main" /usr/local/bin/ncl --update
+```
+
+更新行为:
+
+- 只覆盖 `/etc/trafficcop-lite` 下的脚本文件。
+- 不覆盖 `traffic_monitor_config.txt`、`tg_notifier_config.txt`、日志和 crontab。
+- 下载到临时文件并通过 `bash -n` 语法检查后才替换。
+- 旧脚本会备份到 `/etc/trafficcop-lite/backups/scripts-时间戳/`。
+- 更新完成后建议重新执行 `sudo ncl` 进入新版菜单。
+
+## 4) 年度起始月份
 
 配置流量监控时，选择统计周期 `y` 后会额外提示:
 
@@ -111,7 +140,7 @@ sudo ncl --uninstall
 
 例如输入 `6`，年度统计周期会按每年 6 月的指定起始日开始计算。
 
-## 4) 卸载
+## 5) 卸载
 
 推荐使用:
 
@@ -136,7 +165,7 @@ sudo bash /etc/trafficcop-lite/trafficcop-lite.sh --uninstall
 - 不卸载系统依赖包。
 - 不删除上游默认目录 `/root/TrafficCop`。
 
-## 5) 目录说明
+## 6) 目录说明
 
 安装后的默认目录:
 

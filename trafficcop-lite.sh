@@ -88,6 +88,20 @@ download_component() {
     chmod +x "$dest"
 }
 
+download_url_to_file() {
+    local url="$1"
+    local dest="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$url" -o "$dest"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$dest" "$url"
+    else
+        echo -e "${RED}缺少 curl/wget，无法下载文件。${NC}"
+        return 1
+    fi
+}
+
 ensure_component() {
     local script_name="$1"
     local src="$SCRIPT_DIR/$script_name"
@@ -178,6 +192,117 @@ manage_machine_limit() {
     pause
 }
 
+choose_update_base() {
+    local direct_base="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
+    local proxy_base="https://v6.gh-proxy.org/https://raw.githubusercontent.com/${REPO}/${BRANCH}"
+    local source_choice
+
+    echo -e "${CYAN}请选择更新线路${NC}" >&2
+    menu_item "1" "直连" >&2
+    menu_item "2" "国内优先" >&2
+    menu_item "0" "返回" >&2
+    echo "" >&2
+    read -p "请输入选项: " source_choice
+
+    case "$source_choice" in
+        1|"")
+            echo "$direct_base"
+            ;;
+        2)
+            echo "$proxy_base"
+            ;;
+        0)
+            return 1
+            ;;
+        *)
+            echo -e "${RED}无效选择${NC}" >&2
+            return 1
+            ;;
+    esac
+}
+
+update_scripts() {
+    local update_base="${1:-$RAW_BASE}"
+    local scripts=("trafficcop-lite.sh" "$MONITOR_SCRIPT" "$TELEGRAM_SCRIPT" "$MACHINE_LIMIT_SCRIPT")
+    local temp_files=()
+    local script_name tmp_file url backup_dir
+
+    ensure_work_dir
+    echo -e "${CYAN}正在更新 TrafficCop-Lite 脚本...${NC}"
+    echo -e "${CYAN}更新源:${NC} $update_base"
+    echo -e "${YELLOW}仅覆盖脚本文件；配置、日志、crontab 不会被覆盖。${NC}"
+    echo ""
+
+    for script_name in "${scripts[@]}"; do
+        url="$update_base/$script_name"
+        tmp_file="$WORK_DIR/.${script_name}.new.$$"
+        echo -e "${YELLOW}下载 $script_name...${NC}"
+
+        if ! download_url_to_file "$url" "$tmp_file"; then
+            echo -e "${RED}下载失败：$script_name${NC}"
+            rm -f "${temp_files[@]}" "$tmp_file" 2>/dev/null || true
+            return 1
+        fi
+
+        if [ ! -s "$tmp_file" ]; then
+            echo -e "${RED}下载文件为空：$script_name${NC}"
+            rm -f "${temp_files[@]}" "$tmp_file" 2>/dev/null || true
+            return 1
+        fi
+
+        if ! bash -n "$tmp_file" 2>/dev/null; then
+            echo -e "${RED}语法检查失败：$script_name，已取消更新。${NC}"
+            rm -f "${temp_files[@]}" "$tmp_file" 2>/dev/null || true
+            return 1
+        fi
+
+        temp_files+=("$tmp_file")
+    done
+
+    backup_dir="$WORK_DIR/backups/scripts-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$backup_dir"
+
+    for script_name in "${scripts[@]}"; do
+        if [ -f "$WORK_DIR/$script_name" ]; then
+            cp -a "$WORK_DIR/$script_name" "$backup_dir/"
+        fi
+    done
+
+    for script_name in "${scripts[@]}"; do
+        tmp_file="$WORK_DIR/.${script_name}.new.$$"
+        chmod +x "$tmp_file"
+        mv -f "$tmp_file" "$WORK_DIR/$script_name"
+        echo -e "${GREEN}✓ 已更新 $script_name${NC}"
+    done
+
+    if [ -e "$SHORTCUT_PATH" ] && [ "$(readlink "$SHORTCUT_PATH" 2>/dev/null)" != "$WORK_DIR/trafficcop-lite.sh" ]; then
+        echo -e "${YELLOW}! $SHORTCUT_PATH 已存在且不属于本脚本，已保留。${NC}"
+    else
+        mkdir -p "$(dirname "$SHORTCUT_PATH")"
+        ln -sfn "$WORK_DIR/trafficcop-lite.sh" "$SHORTCUT_PATH"
+    fi
+    if [ "$(readlink "$LEGACY_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
+        rm -f "$LEGACY_SHORTCUT_PATH"
+    fi
+
+    echo ""
+    echo -e "${GREEN}脚本更新完成。旧脚本已备份到：$backup_dir${NC}"
+    echo -e "${YELLOW}建议重新执行 sudo ncl 进入新版菜单。${NC}"
+}
+
+update_scripts_interactive() {
+    local selected_base
+
+    selected_base=$(choose_update_base) || {
+        echo "已取消更新。"
+        pause
+        return
+    }
+
+    update_scripts "$selected_base"
+    pause
+}
+
 show_status_line() {
     local monitor_cron="未设置"
     local telegram_cron="未设置"
@@ -235,7 +360,7 @@ view_logs() {
         echo "3) 当前 crontab 相关条目"
         echo "0) 返回主菜单"
         echo ""
-        read -p "请选择 [0-3]: " choice
+        read -p "请输入选项: " choice
 
         case "$choice" in
             1) tail_file "$WORK_DIR/traffic_monitor.log" "流量监控日志"; pause ;;
@@ -273,7 +398,7 @@ view_config() {
         echo "3) 独立版安装状态"
         echo "0) 返回主菜单"
         echo ""
-        read -p "请选择 [0-3]: " choice
+        read -p "请输入选项: " choice
 
         case "$choice" in
             1) print_config_file "$WORK_DIR/traffic_monitor_config.txt" "流量监控配置"; pause ;;
@@ -422,7 +547,8 @@ show_main_menu() {
     menu_item "4" "查看日志"
     menu_item "5" "查看当前配置"
     menu_item "6" "停止所有服务"
-    menu_item "7" "卸载 TrafficCop-Lite" "$RED" "$RED"
+    menu_item "7" "更新脚本"
+    menu_item "8" "卸载 TrafficCop-Lite" "$RED" "$RED"
     menu_item "0" "退出"
     echo ""
 }
@@ -453,9 +579,13 @@ main() {
             view_config
             exit 0
             ;;
+        --update)
+            update_scripts "$RAW_BASE"
+            exit $?
+            ;;
         --help|-h)
             echo "TrafficCop Lite"
-            echo "用法: sudo ncl [--install|--uninstall|--stop|--logs|--config]"
+            echo "用法: sudo ncl [--install|--update|--uninstall|--stop|--logs|--config]"
             echo "无参数运行进入交互菜单。"
             exit 0
             ;;
@@ -465,7 +595,7 @@ main() {
 
     while true; do
         show_main_menu
-        read -p "请选择操作 [0-7]: " choice
+        read -p "请输入选项: " choice
         case "$choice" in
             1) manage_monitor ;;
             2) manage_telegram ;;
@@ -473,7 +603,8 @@ main() {
             4) view_logs ;;
             5) view_config ;;
             6) stop_all_services ;;
-            7) uninstall_lite ;;
+            7) update_scripts_interactive ;;
+            8) uninstall_lite ;;
             0) echo -e "${GREEN}已退出 TrafficCop-Lite。${NC}"; exit 0 ;;
             *) echo -e "${RED}无效选择，请重新输入。${NC}"; sleep 1 ;;
         esac

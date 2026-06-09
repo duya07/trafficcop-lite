@@ -115,6 +115,8 @@ disable_machine_limit() {
     if [ -f "$CONFIG_FILE" ]; then
         echo "备份当前配置..."
         cp "$CONFIG_FILE" "$BACKUP_CONFIG_FILE"
+        grep -v -E '^(DISABLED|DISABLED_TIME)=' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" || true
+        mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
         echo "DISABLED=true" >> "$CONFIG_FILE"
         echo "DISABLED_TIME=$(date '+%Y-%m-%d %H:%M:%S')" >> "$CONFIG_FILE"
         echo "✓ 配置已备份并标记为禁用"
@@ -148,7 +150,7 @@ enable_machine_limit() {
     # 1. 恢复配置文件（移除DISABLED标记）
     if grep -q "DISABLED=true" "$CONFIG_FILE" 2>/dev/null; then
         echo "恢复配置文件..."
-        grep -v "DISABLED\|DISABLED_TIME" "$CONFIG_FILE" > "$CONFIG_FILE.tmp"
+        grep -v -E '^(DISABLED|DISABLED_TIME)=' "$CONFIG_FILE" > "$CONFIG_FILE.tmp"
         mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
         echo "✓ 配置文件已恢复"
     fi

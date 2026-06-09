@@ -4,7 +4,7 @@
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
 SCRIPT_VERSION="1.0.0"
-LAST_UPDATE="2026-06-08"
+LAST_UPDATE="2026-06-09"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"

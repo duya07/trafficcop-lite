@@ -517,7 +517,11 @@ check_and_limit_traffic() {
         if [ "$LIMIT_MODE" = "tc" ]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 使用 TC 模式限速" | tee -a "$LOG_FILE"
             if [ -n "$TC_BIN" ]; then
-                "$TC_BIN" qdisc add dev "$MAIN_INTERFACE" root tbf rate "${LIMIT_SPEED}kbit" burst 32kbit latency 400ms
+                if "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root tbf rate "${LIMIT_SPEED}kbit" burst 32kbit latency 400ms; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则已应用/更新" | tee -a "$LOG_FILE"
+                else
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则应用失败，请检查接口或 tc 状态" | tee -a "$LOG_FILE"
+                fi
             else
                 echo "$(date '+%Y-%m-%d %H:%M:%S') 未找到系统 tc 命令，无法执行限速" | tee -a "$LOG_FILE"
             fi

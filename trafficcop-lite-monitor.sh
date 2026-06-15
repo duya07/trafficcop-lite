@@ -8,6 +8,7 @@ CONFIG_FILE="$WORK_DIR/traffic_monitor_config.txt"
 LOG_FILE="$WORK_DIR/traffic_monitor.log"
 SCRIPT_PATH="$WORK_DIR/trafficcop-lite-monitor.sh"
 LOCK_FILE="$WORK_DIR/traffic_monitor.lock"
+SCRIPT_VERSION="1.0.1"
 mkdir -p "$WORK_DIR"
 
 find_tc_bin() {
@@ -27,20 +28,7 @@ TC_BIN="$(find_tc_bin)"
 export TZ='Asia/Shanghai'
 
 echo "-----------------------------------------------------"| tee -a "$LOG_FILE"
-echo "$(date '+%Y-%m-%d %H:%M:%S') 当前版本：1.0.84"| tee -a "$LOG_FILE"
-
-
-# 在脚本开始时杀死所有其他 traffic_monitor.sh 进程
-kill_other_instances() {
-    local current_pid=$$
-    local script_name=$(basename "$0")
-    for pid in $(pgrep -f "$script_name"); do
-        if [ "$pid" != "$current_pid" ]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 终止其他脚本实例 (PID: $pid)" | tee -a "$LOG_FILE"
-            kill $pid
-        fi
-    done
-}
+echo "$(date '+%Y-%m-%d %H:%M:%S') 当前版本：$SCRIPT_VERSION"| tee -a "$LOG_FILE"
 
 
 
@@ -190,7 +178,7 @@ get_main_interface() {
             echo "$(date '+%Y-%m-%d %H:%M:%S') 无法自动检测主要网络接口。"| tee -a "$LOG_FILE" >&2
             echo "$(date '+%Y-%m-%d %H:%M:%S') 可用的网络接口有："| tee -a "$LOG_FILE" >&2
             ip -o link show | sed -n 's/^[0-9]*: \([^:]*\):.*/\1/p' >&2
-            read -p "请从上面的列表中选择一个网络接口: " main_interface
+            read -r -p "请从上面的列表中选择一个网络接口: " main_interface
             if [ -z "$main_interface" ]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') 请输入一个有效的接口名称。"| tee -a "$LOG_FILE" >&2
             elif ip link show "$main_interface" > /dev/null 2>&1; then
@@ -200,7 +188,7 @@ get_main_interface() {
             fi
         done
     else
-        read -p "检测到的主要网络接口是: $main_interface, 按Enter使用此接口，或输入新的接口名称: " new_interface
+        read -r -p "检测到的主要网络接口是: $main_interface, 按Enter使用此接口，或输入新的接口名称: " new_interface
         if [ -n "$new_interface" ]; then
             if ip link show "$new_interface" > /dev/null 2>&1; then
                 main_interface=$new_interface
@@ -226,7 +214,7 @@ initial_config() {
         echo "$(date '+%Y-%m-%d %H:%M:%S') 2. 只计算进站流量"| tee -a "$LOG_FILE"
         echo "$(date '+%Y-%m-%d %H:%M:%S') 3. 出进站流量都计算"| tee -a "$LOG_FILE"
         echo "$(date '+%Y-%m-%d %H:%M:%S') 4. 出站和进站流量只取大"| tee -a "$LOG_FILE"
-        read -p "请输入选择 (1-4): " mode_choice
+        read -r -p "请输入选择 (1-4): " mode_choice
         case $mode_choice in
             1) TRAFFIC_MODE="out"; break ;;
             2) TRAFFIC_MODE="in"; break ;;
@@ -236,7 +224,7 @@ initial_config() {
         esac
     done
 
-    read -p "请选择流量统计周期 (m/q/y，默认为m): " period_choice
+    read -r -p "请选择流量统计周期 (m/q/y，默认为m): " period_choice
     case $period_choice in
         q) TRAFFIC_PERIOD="quarterly" ;;
         y) TRAFFIC_PERIOD="yearly" ;;
@@ -246,7 +234,7 @@ initial_config() {
 
     PERIOD_START_MONTH=1
     if [ "$TRAFFIC_PERIOD" = "yearly" ]; then
-        read -p "请输入年度周期起始月份 (1-12，默认为1): " PERIOD_START_MONTH
+        read -r -p "请输入年度周期起始月份 (1-12，默认为1): " PERIOD_START_MONTH
         if [[ -z "$PERIOD_START_MONTH" ]]; then
             PERIOD_START_MONTH=1
         elif ! [[ "$PERIOD_START_MONTH" =~ ^[1-9]$|^1[0-2]$ ]]; then
@@ -255,7 +243,7 @@ initial_config() {
         fi
     fi
 
-    read -p "请输入周期起始日 (1-31，默认为1): " PERIOD_START_DAY
+    read -r -p "请输入周期起始日 (1-31，默认为1): " PERIOD_START_DAY
     if [[ -z "$PERIOD_START_DAY" ]]; then
         PERIOD_START_DAY=1
     elif ! [[ "$PERIOD_START_DAY" =~ ^[1-9]$|^[12][0-9]$|^3[01]$ ]]; then
@@ -264,20 +252,20 @@ initial_config() {
     fi
 
     while true; do
-        read -p "请输入流量限制 (GB): " TRAFFIC_LIMIT
-        if [[ "$TRAFFIC_LIMIT" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        read -r -p "请输入流量限制 (GB): " TRAFFIC_LIMIT
+        if [[ "$TRAFFIC_LIMIT" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(echo "$TRAFFIC_LIMIT > 0" | bc -l 2>/dev/null || echo "0") )); then
             break
         else
-            echo "无效输入，请输入一个有效的数字。"
+            echo "无效输入，请输入一个大于 0 的数字。"
         fi
     done
 
     while true; do
-        read -p "请输入容错范围 (GB): " TRAFFIC_TOLERANCE
-        if [[ "$TRAFFIC_TOLERANCE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        read -r -p "请输入容错范围 (GB): " TRAFFIC_TOLERANCE
+        if [[ "$TRAFFIC_TOLERANCE" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(echo "$TRAFFIC_TOLERANCE < $TRAFFIC_LIMIT" | bc -l 2>/dev/null || echo "0") )); then
             break
         else
-            echo "无效输入，请输入一个有效的数字。"
+            echo "无效输入，容错范围必须大于等于 0 且小于流量限制。"
         fi
     done
 
@@ -285,13 +273,13 @@ initial_config() {
         echo "$(date '+%Y-%m-%d %H:%M:%S') 请选择限制模式："| tee -a "$LOG_FILE"
         echo "$(date '+%Y-%m-%d %H:%M:%S') 1. TC 模式（更灵活）"| tee -a "$LOG_FILE"
         echo "$(date '+%Y-%m-%d %H:%M:%S') 2. 关机模式（更安全）"| tee -a "$LOG_FILE"
-        read -p "请输入选择 (1-2): " limit_mode_choice
+        read -r -p "请输入选择 (1-2): " limit_mode_choice
         case $limit_mode_choice in
             1) 
                 LIMIT_MODE="tc"
-                read -p "请输入限速 (kbit/s，默认为20): " LIMIT_SPEED
+                read -r -p "请输入限速 (kbit/s，默认为20): " LIMIT_SPEED
                 LIMIT_SPEED=${LIMIT_SPEED:-20}
-                if ! [[ "$LIMIT_SPEED" =~ ^[0-9]+$ ]]; then
+                if ! [[ "$LIMIT_SPEED" =~ ^[1-9][0-9]*$ ]]; then
                     echo "无效输入，使用默认值：20 kbit/s"
                     LIMIT_SPEED=20
                 fi
@@ -509,6 +497,11 @@ get_traffic_usage() {
 check_and_limit_traffic() {
     local current_usage=$(get_traffic_usage)
     local limit_threshold=$(echo "$TRAFFIC_LIMIT - $TRAFFIC_TOLERANCE" | bc 2>/dev/null || echo "0")
+
+    if (( $(echo "$limit_threshold < 0" | bc -l 2>/dev/null || echo "0") )); then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到配置异常：容错范围大于流量限制，已将限制阈值按 0 GB 处理" | tee -a "$LOG_FILE"
+        limit_threshold=0
+    fi
     
     echo "$(date '+%Y-%m-%d %H:%M:%S') 当前使用流量: $current_usage GB，限制流量: $limit_threshold GB" | tee -a "$LOG_FILE"
     
@@ -517,7 +510,13 @@ check_and_limit_traffic() {
         if [ "$LIMIT_MODE" = "tc" ]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 使用 TC 模式限速" | tee -a "$LOG_FILE"
             if [ -n "$TC_BIN" ]; then
-                if "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root tbf rate "${LIMIT_SPEED}kbit" burst 32kbit latency 400ms; then
+                local safe_limit_speed="${LIMIT_SPEED:-20}"
+                if ! [[ "$safe_limit_speed" =~ ^[1-9][0-9]*$ ]]; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到限速值异常：$safe_limit_speed，已使用默认值 20 kbit/s" | tee -a "$LOG_FILE"
+                    safe_limit_speed=20
+                fi
+
+                if "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root tbf rate "${safe_limit_speed}kbit" burst 32kbit latency 400ms; then
                     echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则已应用/更新" | tee -a "$LOG_FILE"
                 else
                     echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则应用失败，请检查接口或 tc 状态" | tee -a "$LOG_FILE"
@@ -560,26 +559,22 @@ setup_crontab() {
 
 # 主函数
 main() {
+    # 在脚本开始时调用迁移函数
+    migrate_files
 
+    # 切换到工作目录
+    cd "$WORK_DIR" || exit 1
 
-   # 调用函数来杀死其他实例
-   kill_other_instances
-  
-  # 在脚本开始时调用迁移函数
-   migrate_files
+    # 创建锁文件（如果不存在）
+    touch "${LOCK_FILE}"
 
-  # 切换到工作目录
-   cd "$WORK_DIR" || exit 1
-
-# 创建锁文件（如果不存在）
-touch "${LOCK_FILE}"
-
-# 尝试获取文件锁
-exec 9>"${LOCK_FILE}"
-if ! flock -n 9; then
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 另一个脚本实例正在运行，退出。" | tee -a "$LOG_FILE"
-    exit 1
-fi
+    # 尝试获取文件锁。cron 模式拿不到锁直接退出，避免打断正在进行的交互配置。
+    exec 9>"${LOCK_FILE}"
+    if ! flock -n 9; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 另一个脚本实例正在运行，退出。" | tee -a "$LOG_FILE"
+        exit 1
+    fi
+    trap 'flock -u 9 2>/dev/null || true; rm -f "$LOCK_FILE"' EXIT
 
     # 检查是否以 --run 模式运行
     if [ "$1" = "--run" ] || [ "$1" = "--cron" ]; then
@@ -608,13 +603,13 @@ fi
         echo "$(date '+%Y-%m-%d %H:%M:%S') 开始等待用户输入..." | tee -a "$LOG_FILE"
         
         start_time=$(date +%s.%N)
-     if read -t 5 -n 1 modify_config; then
+     if read -r -t 5 -n 1 modify_config; then
     end_time=$(date +%s.%N)
     duration=$(echo "$end_time - $start_time" | bc 2>/dev/null || echo "0")
     echo ""  # 换行
     echo "$(date '+%Y-%m-%d %H:%M:%S') 收到用户输入: '${modify_config}' (ASCII: $(printf '%d' "'$modify_config" 2>/dev/null || echo "N/A"))" | tee -a "$LOG_FILE"
     echo "$(date '+%Y-%m-%d %H:%M:%S') 等待时间: $duration 秒" | tee -a "$LOG_FILE"
-    if [[ $duration < 0.1 ]]; then
+    if (( $(echo "$duration < 0.1" | bc -l 2>/dev/null || echo "0") )); then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 警告：输入时间过短，可能是自动输入" | tee -a "$LOG_FILE"
         echo "$(date '+%Y-%m-%d %H:%M:%S') 忽略此输入，保持现有配置。" | tee -a "$LOG_FILE"
     else
@@ -656,9 +651,6 @@ fi
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') 配置文件读取失败，请检查配置" | tee -a "$LOG_FILE"
     fi
-    
-# 确保脚本退出时释放锁
-trap 'flock -u 9; rm -f ${LOCK_FILE}' EXIT
 }
 
 

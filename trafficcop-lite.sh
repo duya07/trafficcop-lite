@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.0.0"
-LAST_UPDATE="2026-06-09"
+SCRIPT_VERSION="1.0.1"
+LAST_UPDATE="2026-06-15"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
@@ -50,7 +50,7 @@ TC_BIN="$(find_tc_bin)"
 
 pause() {
     echo ""
-    read -p "按回车键继续..."
+    read -r -p "按回车键继续..."
 }
 
 check_root() {
@@ -76,17 +76,30 @@ download_component() {
     local script_name="$1"
     local dest="$WORK_DIR/$script_name"
     local url="$RAW_BASE/$script_name"
+    local tmp_file="$WORK_DIR/.${script_name}.install.$$"
 
     echo -e "${YELLOW}正在下载 $script_name...${NC}"
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$url" -o "$dest"
-    elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$dest" "$url"
-    else
-        echo -e "${RED}缺少 curl/wget，无法自动下载组件。${NC}"
+    if ! download_url_to_file "$url" "$tmp_file"; then
+        echo -e "${RED}下载失败：$script_name${NC}"
+        rm -f "$tmp_file" 2>/dev/null || true
         return 1
     fi
-    chmod +x "$dest"
+
+    if [ ! -s "$tmp_file" ]; then
+        echo -e "${RED}下载文件为空：$script_name${NC}"
+        rm -f "$tmp_file" 2>/dev/null || true
+        return 1
+    fi
+
+    if ! bash -n "$tmp_file" 2>/dev/null; then
+        echo -e "${RED}语法检查失败：$script_name，已取消安装。${NC}"
+        rm -f "$tmp_file" 2>/dev/null || true
+        return 1
+    fi
+
+    chmod +x "$tmp_file"
+    mv -f "$tmp_file" "$dest"
+    echo -e "${GREEN}✓ 已下载/安装 $script_name${NC}"
 }
 
 download_url_to_file() {
@@ -111,6 +124,10 @@ ensure_component() {
     ensure_work_dir
 
     if [ -f "$src" ] && [ "$src" != "$dest" ]; then
+        if ! bash -n "$src" 2>/dev/null; then
+            echo -e "${RED}本地脚本语法检查失败：$src${NC}"
+            return 1
+        fi
         cp "$src" "$dest"
         chmod +x "$dest"
         echo -e "${GREEN}✓ 已安装/更新 $script_name${NC}"
@@ -118,8 +135,11 @@ ensure_component() {
     fi
 
     if [ -f "$dest" ]; then
-        chmod +x "$dest"
-        return 0
+        if bash -n "$dest" 2>/dev/null; then
+            chmod +x "$dest"
+            return 0
+        fi
+        echo -e "${YELLOW}! 已存在的 $script_name 语法检查失败，将重新下载。${NC}"
     fi
 
     download_component "$script_name"
@@ -207,7 +227,7 @@ choose_update_base() {
     menu_item "2" "国内优先" >&2
     menu_item "0" "返回" >&2
     echo "" >&2
-    read -p "请输入选项: " source_choice
+    read -r -p "请输入选项: " source_choice
 
     case "$source_choice" in
         1|"")
@@ -368,7 +388,7 @@ view_logs() {
         echo "3) 当前 crontab 相关条目"
         echo "0) 返回主菜单"
         echo ""
-        read -p "请输入选项: " choice
+        read -r -p "请输入选项: " choice
 
         case "$choice" in
             1) tail_file "$WORK_DIR/traffic_monitor.log" "流量监控日志"; pause ;;
@@ -406,7 +426,7 @@ view_config() {
         echo "3) 独立版安装状态"
         echo "0) 返回主菜单"
         echo ""
-        read -p "请输入选项: " choice
+        read -r -p "请输入选项: " choice
 
         case "$choice" in
             1) print_config_file "$WORK_DIR/traffic_monitor_config.txt" "流量监控配置"; pause ;;
@@ -422,7 +442,10 @@ remove_lite_cron() {
     local current_crontab
     current_crontab="$(crontab -l 2>/dev/null || true)"
     if [ -n "$current_crontab" ]; then
-        echo "$current_crontab" | grep -v -F "$WORK_DIR" | crontab - 2>/dev/null || true
+        printf '%s\n' "$current_crontab" \
+            | grep -v -F "$WORK_DIR/$MONITOR_SCRIPT" \
+            | grep -v -F "$WORK_DIR/$TELEGRAM_SCRIPT" \
+            | crontab - 2>/dev/null || true
     fi
 }
 
@@ -458,7 +481,7 @@ clear_lite_tc_rules_interactive() {
 
     echo -e "${YELLOW}检测到接口 $interface 上存在 tbf 限速规则。${NC}"
     echo -e "${YELLOW}Linux 无法可靠区分该规则是否由本脚本创建，默认不清除以免影响系统其他限速。${NC}"
-    read -p "确认清除该接口 root TC 规则？[y/N]: " confirm
+    read -r -p "确认清除该接口 root TC 规则？[y/N]: " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
         "$TC_BIN" qdisc del dev "$interface" root 2>/dev/null || true
         echo "✓ 已尝试清除 TC 规则"
@@ -471,7 +494,7 @@ cancel_shutdown_interactive() {
     local config="$WORK_DIR/traffic_monitor_config.txt"
     if grep -q '^LIMIT_MODE=shutdown' "$config" 2>/dev/null; then
         echo -e "${YELLOW}检测到独立版曾配置关机模式。${NC}"
-        read -p "是否取消当前系统计划关机？[y/N]: " confirm
+        read -r -p "是否取消当前系统计划关机？[y/N]: " confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
             shutdown -c 2>/dev/null || true
             echo "✓ 已尝试取消计划关机"
@@ -501,7 +524,7 @@ uninstall_lite() {
     echo "只会处理独立版目录：$WORK_DIR"
     echo "不会删除 /root/TrafficCop，也不会卸载 vnstat/jq/bc/cron/iproute2 等系统软件包。"
     echo ""
-    read -p "确认卸载？请输入 UNINSTALL 继续: " confirm
+    read -r -p "确认卸载？请输入 UNINSTALL 继续: " confirm
     if [ "$confirm" != "UNINSTALL" ]; then
         echo "已取消卸载。"
         pause
@@ -514,9 +537,10 @@ uninstall_lite() {
     cancel_shutdown_interactive
 
     if [ -d "$WORK_DIR" ]; then
-        read -p "是否先备份配置和日志？[Y/n]: " keep_backup
+        read -r -p "是否先备份配置和日志？[Y/n]: " keep_backup
         if [[ ! "$keep_backup" =~ ^[Nn]$ ]]; then
-            local backup_dir="/etc/trafficcop-lite-backup-$(date +%Y%m%d-%H%M%S)"
+            local backup_dir
+            backup_dir="/etc/trafficcop-lite-backup-$(date +%Y%m%d-%H%M%S)"
             cp -a "$WORK_DIR" "$backup_dir"
             echo "✓ 已备份到 $backup_dir"
         fi
@@ -607,7 +631,7 @@ main() {
 
     while true; do
         show_main_menu
-        read -p "请输入选项: " choice
+        read -r -p "请输入选项: " choice
         case "$choice" in
             1) manage_monitor ;;
             2) manage_telegram ;;

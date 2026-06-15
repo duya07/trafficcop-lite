@@ -15,6 +15,7 @@ LOG_FILE="$WORK_DIR/traffic_monitor.log"
 LAST_NOTIFICATION_FILE="$WORK_DIR/last_traffic_notification"
 SCRIPT_PATH="$WORK_DIR/trafficcop-lite-telegram.sh"
 CRON_LOG="$WORK_DIR/tg_notifier_cron.log"
+SCRIPT_VERSION="1.0.1"
 
 # 文件迁移函数
 migrate_files() {
@@ -35,7 +36,7 @@ export TZ='Asia/Shanghai'
 PORT_DATA_CACHE="/tmp/port_traffic_cache.json"
 
 echo "----------------------------------------------"| tee -a "$CRON_LOG"
-echo "$(date '+%Y-%m-%d %H:%M:%S') : 版本号：9.6"  
+echo "$(date '+%Y-%m-%d %H:%M:%S') : 当前版本：$SCRIPT_VERSION" | tee -a "$CRON_LOG"
 
 # 检查是否有同名的 crontab 正在执行:
 check_running() {
@@ -57,7 +58,7 @@ get_valid_input() {
     local prompt="${1:-"请输入："}"
     local input=""
     while true; do
-        read -p "${prompt}" input
+        read -r -p "${prompt}" input
         if [[ -n "${input}" ]]; then
             echo "${input}"
             return
@@ -183,13 +184,21 @@ read_config() {
 }
 
 # 写入配置
+write_config_value() {
+    local key="$1"
+    local value="$2"
+    local quoted
+    printf -v quoted '%q' "$value"
+    printf '%s=%s\n' "$key" "$quoted"
+}
+
 write_config() {
-    cat > "$CONFIG_FILE" << EOF
-BOT_TOKEN="$BOT_TOKEN"
-CHAT_ID="$CHAT_ID"
-DAILY_REPORT_TIME="$DAILY_REPORT_TIME"
-MACHINE_NAME="$MACHINE_NAME"
-EOF
+    {
+        write_config_value "BOT_TOKEN" "$BOT_TOKEN"
+        write_config_value "CHAT_ID" "$CHAT_ID"
+        write_config_value "DAILY_REPORT_TIME" "$DAILY_REPORT_TIME"
+        write_config_value "MACHINE_NAME" "$MACHINE_NAME"
+    } > "$CONFIG_FILE"
     echo "配置已保存到 $CONFIG_FILE"
 }
 
@@ -556,7 +565,7 @@ daily_report() {
                     
                     # 遍历每个端口
                     local i=0
-                    while [ $i -lt $actual_port_count ]; do
+                    while [ "$i" -lt "$actual_port_count" ]; do
                         local port=$(echo "$port_data" | jq -r ".ports[$i].port" 2>/dev/null)
                         local port_desc=$(echo "$port_data" | jq -r ".ports[$i].description" 2>/dev/null)
                         local port_usage=$(echo "$port_data" | jq -r ".ports[$i].usage" 2>/dev/null)
@@ -573,7 +582,7 @@ daily_report() {
                             # 根据使用率选择表情
                             local port_percentage=0
                             if [ -n "$port_limit" ] && [ "$port_limit" != "null" ] && (( $(echo "$port_limit > 0" | bc -l 2>/dev/null || echo "0") )); then
-                                port_percentage=$(printf "%.2f" $(echo "scale=2; ($port_usage / $port_limit) * 100" | bc 2>/dev/null || echo "0"))
+                                port_percentage=$(printf "%.2f" "$(echo "scale=2; ($port_usage / $port_limit) * 100" | bc 2>/dev/null || echo "0")")
                             fi
                             
                             local status_icon="✅"
@@ -607,7 +616,7 @@ daily_report() {
                         if [ "$actual_port_count" -gt 0 ]; then
                             message="${message}%0A%0A🔌 端口流量详情："
                             local i=0
-                            while [ $i -lt $actual_port_count ]; do
+                            while [ "$i" -lt "$actual_port_count" ]; do
                                 local port=$(echo "$port_data" | jq -r ".ports[$i].port" 2>/dev/null)
                                 local port_desc=$(echo "$port_data" | jq -r ".ports[$i].description" 2>/dev/null)
                                 local port_usage=$(echo "$port_data" | jq -r ".ports[$i].usage" 2>/dev/null)
@@ -619,7 +628,7 @@ daily_report() {
                                     
                                     local port_percentage=0
                                     if [ -n "$port_limit" ] && [ "$port_limit" != "null" ] && (( $(echo "$port_limit > 0" | bc -l 2>/dev/null || echo "0") )); then
-                                        port_percentage=$(printf "%.2f" $(echo "scale=2; ($port_usage / $port_limit) * 100" | bc 2>/dev/null || echo "0"))
+                                        port_percentage=$(printf "%.2f" "$(echo "scale=2; ($port_usage / $port_limit) * 100" | bc 2>/dev/null || echo "0")")
                                     fi
                                     
                                     local status_icon="✅"
@@ -677,7 +686,7 @@ daily_report() {
 main() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 进入主任务" >> "$CRON_LOG"
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 参数数量: $#" >> "$CRON_LOG"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') : 所有参数: $@" >> "$CRON_LOG"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') : 所有参数: $*" >> "$CRON_LOG"
     
     check_running
     
@@ -740,7 +749,7 @@ if [[ "$*" == *"-cron"* ]]; then
             echo "======================================"
             echo -n "请选择操作 [0-7]: "
             
-            read choice
+            read -r choice
             echo
             
             case $choice in
@@ -812,7 +821,7 @@ if [[ "$*" == *"-cron"* ]]; then
             if [ "$choice" != "0" ]; then
                 echo
                 echo "按 Enter 键继续..."
-                read
+                read -r
             fi
         done
     fi

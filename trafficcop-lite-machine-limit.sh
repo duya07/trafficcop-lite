@@ -124,7 +124,7 @@ disable_machine_limit() {
     
     # 5. 取消可能的关机计划
     if grep -q "LIMIT_MODE=shutdown" "$CONFIG_FILE" 2>/dev/null; then
-        read -p "检测到关机模式配置，是否取消当前系统计划关机？[y/N]: " cancel_shutdown
+        read -r -p "检测到关机模式配置，是否取消当前系统计划关机？[y/N]: " cancel_shutdown
         if [[ $cancel_shutdown =~ ^[Yy]$ ]]; then
             shutdown -c 2>/dev/null || true
             echo "✓ 已尝试取消关机计划"
@@ -160,7 +160,7 @@ enable_machine_limit() {
     
     # 3. 立即执行一次监控（测试配置）
     echo "启动TrafficCop监控测试..."
-    cd "$WORK_DIR"
+    cd "$WORK_DIR" || return 1
     bash "$SCRIPT_PATH" --run
     
     echo ""
@@ -329,36 +329,36 @@ main() {
     
     while true; do
         show_menu
-        read -p "请选择 [0-5]: " choice
+        read -r -p "请选择 [0-5]: " choice
         
         case $choice in
             1)
                 echo ""
-                read -p "确认禁用机器限速？这将停止所有监控 [y/N]: " confirm
+                read -r -p "确认禁用机器限速？这将停止所有监控 [y/N]: " confirm
                 if [[ $confirm =~ ^[Yy]$ ]]; then
                     disable_machine_limit
-                    read -p "按回车键继续..."
+                    read -r -p "按回车键继续..."
                 fi
                 ;;
             2)
                 echo ""
                 enable_machine_limit
-                read -p "按回车键继续..."
+                read -r -p "按回车键继续..."
                 ;;
             3)
                 echo ""
                 restore_machine_limit
-                read -p "按回车键继续..."
+                read -r -p "按回车键继续..."
                 ;;
             4)
                 echo ""
                 show_detailed_status
-                read -p "按回车键继续..."
+                read -r -p "按回车键继续..."
                 ;;
             5)
                 echo ""
                 clear_tc_rules
-                read -p "按回车键继续..."
+                read -r -p "按回车键继续..."
                 ;;
             0)
                 echo "退出"

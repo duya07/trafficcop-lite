@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.0.1"
-LAST_UPDATE="2026-06-15"
+SCRIPT_VERSION="1.0.2"
+LAST_UPDATE="2026-06-27"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
@@ -358,6 +358,330 @@ show_status_line() {
     echo -e "${CYAN}监控配置:${NC} ${config_color}${config_state}${NC}   ${CYAN}监控任务:${NC} ${monitor_color}${monitor_cron}${NC}   ${CYAN}TG任务:${NC} ${telegram_color}${telegram_cron}${NC}"
 }
 
+lite_is_leap_year() {
+    local year="$1"
+    if { [ $((year % 4)) -eq 0 ] && [ $((year % 100)) -ne 0 ]; } || [ $((year % 400)) -eq 0 ]; then
+        return 0
+    fi
+    return 1
+}
+
+lite_days_in_month() {
+    local year="$1"
+    local month="$2"
+
+    if ! [[ "$month" =~ ^[0-9]+$ ]]; then
+        month=1
+    fi
+    month=$((10#$month))
+
+    case "$month" in
+        1|3|5|7|8|10|12) echo 31 ;;
+        4|6|9|11) echo 30 ;;
+        2)
+            if lite_is_leap_year "$year"; then
+                echo 29
+            else
+                echo 28
+            fi
+            ;;
+        *) echo 31 ;;
+    esac
+}
+
+lite_anchor_date() {
+    local year="$1"
+    local month="$2"
+    local day="$3"
+    local max_day
+
+    if ! [[ "$month" =~ ^[0-9]+$ ]]; then
+        month=1
+    fi
+    month=$((10#$month))
+    if [ "$month" -lt 1 ] || [ "$month" -gt 12 ]; then
+        month=1
+    fi
+
+    if ! [[ "$day" =~ ^[0-9]+$ ]]; then
+        day=1
+    fi
+    day=$((10#$day))
+    if [ "$day" -lt 1 ]; then
+        day=1
+    fi
+
+    max_day=$(lite_days_in_month "$year" "$month")
+    if [ "$day" -gt "$max_day" ]; then
+        day="$max_day"
+    fi
+
+    printf "%04d-%02d-%02d\n" "$year" "$month" "$day"
+}
+
+lite_date_num() {
+    echo "$1" | tr -d '-'
+}
+
+lite_shift_month() {
+    local year="$1"
+    local month="$2"
+    local offset="$3"
+    local total shifted_year shifted_month
+
+    month=$((10#$month))
+    total=$((year * 12 + month - 1 + offset))
+    shifted_year=$((total / 12))
+    shifted_month=$((total % 12 + 1))
+
+    printf "%04d %02d\n" "$shifted_year" "$shifted_month"
+}
+
+lite_previous_day() {
+    local date_value="$1"
+    local year rest month day prev_year prev_month prev_day
+
+    year=${date_value%%-*}
+    rest=${date_value#*-}
+    month=${rest%%-*}
+    day=${date_value##*-}
+
+    year=$((10#$year))
+    month=$((10#$month))
+    day=$((10#$day))
+
+    if [ "$day" -gt 1 ]; then
+        printf "%04d-%02d-%02d\n" "$year" "$month" "$((day - 1))"
+    else
+        read -r prev_year prev_month <<< "$(lite_shift_month "$year" "$month" -1)"
+        prev_day=$(lite_days_in_month "$prev_year" "$prev_month")
+        printf "%04d-%02d-%02d\n" "$prev_year" "$((10#$prev_month))" "$prev_day"
+    fi
+}
+
+lite_period_start_date() {
+    local current_date current_month current_year current_num
+    local anchor_this anchor_num period_year period_month quarter_month start_month
+
+    current_date=$(date +%Y-%m-%d)
+    current_month=$(date +%m)
+    current_year=$(date +%Y)
+    current_num=$(lite_date_num "$current_date")
+
+    case "${TRAFFIC_PERIOD:-monthly}" in
+        quarterly)
+            quarter_month=$(( ((10#$current_month - 1) / 3) * 3 + 1 ))
+            anchor_this=$(lite_anchor_date "$current_year" "$quarter_month" "${PERIOD_START_DAY:-1}")
+            anchor_num=$(lite_date_num "$anchor_this")
+            if [ "$current_num" -lt "$anchor_num" ]; then
+                read -r period_year period_month <<< "$(lite_shift_month "$current_year" "$quarter_month" -3)"
+                lite_anchor_date "$period_year" "$period_month" "${PERIOD_START_DAY:-1}"
+            else
+                echo "$anchor_this"
+            fi
+            ;;
+        yearly)
+            start_month="${PERIOD_START_MONTH:-1}"
+            if [[ "$start_month" =~ ^[0-9]+$ ]]; then
+                start_month=$((10#$start_month))
+            else
+                start_month=1
+            fi
+            if [ "$start_month" -lt 1 ] || [ "$start_month" -gt 12 ]; then
+                start_month=1
+            fi
+            anchor_this=$(lite_anchor_date "$current_year" "$start_month" "${PERIOD_START_DAY:-1}")
+            anchor_num=$(lite_date_num "$anchor_this")
+            if [ "$current_num" -lt "$anchor_num" ]; then
+                read -r period_year period_month <<< "$(lite_shift_month "$current_year" "$start_month" -12)"
+                lite_anchor_date "$period_year" "$period_month" "${PERIOD_START_DAY:-1}"
+            else
+                echo "$anchor_this"
+            fi
+            ;;
+        monthly|*)
+            anchor_this=$(lite_anchor_date "$current_year" "$current_month" "${PERIOD_START_DAY:-1}")
+            anchor_num=$(lite_date_num "$anchor_this")
+            if [ "$current_num" -lt "$anchor_num" ]; then
+                read -r period_year period_month <<< "$(lite_shift_month "$current_year" "$current_month" -1)"
+                lite_anchor_date "$period_year" "$period_month" "${PERIOD_START_DAY:-1}"
+            else
+                echo "$anchor_this"
+            fi
+            ;;
+    esac
+}
+
+lite_period_end_date() {
+    local start_date start_year start_month next_year next_month next_anchor offset
+
+    start_date=$(lite_period_start_date)
+    start_year=${start_date%%-*}
+    start_month=${start_date#*-}
+    start_month=${start_month%%-*}
+
+    case "${TRAFFIC_PERIOD:-monthly}" in
+        quarterly) offset=3 ;;
+        yearly) offset=12 ;;
+        monthly|*) offset=1 ;;
+    esac
+
+    read -r next_year next_month <<< "$(lite_shift_month "$start_year" "$start_month" "$offset")"
+    next_anchor=$(lite_anchor_date "$next_year" "$next_month" "${PERIOD_START_DAY:-1}")
+    lite_previous_day "$next_anchor"
+}
+
+lite_period_label() {
+    case "${1:-monthly}" in
+        monthly) echo "月度" ;;
+        quarterly) echo "季度" ;;
+        yearly) echo "年度" ;;
+        *) echo "未知周期" ;;
+    esac
+}
+
+lite_mode_label() {
+    case "${1:-total}" in
+        out) echo "出站" ;;
+        in) echo "进站" ;;
+        total) echo "进站+出站" ;;
+        max) echo "进出取大" ;;
+        *) echo "未知模式" ;;
+    esac
+}
+
+lite_compare_ge() {
+    awk -v left="$1" -v right="$2" 'BEGIN { exit !(left >= right) }'
+}
+
+lite_usage_bar() {
+    local percent="$1"
+    local color="$2"
+    local width=18
+    local filled empty filled_part empty_part
+
+    filled=$(awk -v p="$percent" -v w="$width" 'BEGIN { if (p < 0) p = 0; if (p > 100) p = 100; printf "%d", (p * w + 50) / 100 }')
+    empty=$((width - filled))
+    printf -v filled_part '%*s' "$filled" ''
+    printf -v empty_part '%*s' "$empty" ''
+    filled_part=${filled_part// /#}
+    empty_part=${empty_part// /-}
+
+    printf "%b[%b%s%b%s%b]" "$WHITE" "$color" "$filled_part" "$WHITE" "$empty_part" "$NC"
+}
+
+lite_current_usage_gb() {
+    local start_date="$1"
+    local end_date="$2"
+    local start_num end_num vnstat_json usage_bytes rx_bytes tx_bytes
+
+    if [ -z "${MAIN_INTERFACE:-}" ]; then
+        return 1
+    fi
+    if ! command -v vnstat >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1; then
+        return 1
+    fi
+
+    vnstat_json=$(vnstat -i "$MAIN_INTERFACE" --json 2>/dev/null) || return 1
+    if [ -z "$vnstat_json" ]; then
+        return 1
+    fi
+
+    start_num=$(lite_date_num "$start_date")
+    end_num=$(lite_date_num "$end_date")
+
+    case "${TRAFFIC_MODE:-total}" in
+        out)
+            usage_bytes=$(printf '%s' "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
+                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .tx] | add // 0' 2>/dev/null) || return 1
+            ;;
+        in)
+            usage_bytes=$(printf '%s' "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
+                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .rx] | add // 0' 2>/dev/null) || return 1
+            ;;
+        max)
+            rx_bytes=$(printf '%s' "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
+                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .rx] | add // 0' 2>/dev/null) || return 1
+            tx_bytes=$(printf '%s' "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
+                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .tx] | add // 0' 2>/dev/null) || return 1
+            usage_bytes=$(awk -v rx="$rx_bytes" -v tx="$tx_bytes" 'BEGIN { if (rx >= tx) print rx; else print tx }')
+            ;;
+        total|*)
+            usage_bytes=$(printf '%s' "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
+                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | (.rx + .tx)] | add // 0' 2>/dev/null) || return 1
+            ;;
+    esac
+
+    if ! [[ "$usage_bytes" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        return 1
+    fi
+
+    awk -v bytes="$usage_bytes" 'BEGIN { printf "%.3f", bytes / 1024 / 1024 / 1024 }'
+}
+
+show_traffic_overview() {
+    local config_file="$WORK_DIR/traffic_monitor_config.txt"
+    local start_date end_date period_label mode_label usage_gb percent usage_color bar limit_text
+
+    if [ ! -s "$config_file" ]; then
+        echo -e "${CYAN}流量概览:${NC} ${YELLOW}未配置${NC}"
+        return
+    fi
+
+    local TRAFFIC_MODE="total"
+    local TRAFFIC_PERIOD="monthly"
+    local TRAFFIC_LIMIT=""
+    local PERIOD_START_DAY="1"
+    local PERIOD_START_MONTH="1"
+    local MAIN_INTERFACE=""
+
+    # shellcheck disable=SC1090
+    if ! source "$config_file" 2>/dev/null; then
+        echo -e "${CYAN}流量概览:${NC} ${YELLOW}配置读取失败${NC}"
+        return
+    fi
+
+    case "$TRAFFIC_PERIOD" in
+        monthly|quarterly|yearly) ;;
+        *) TRAFFIC_PERIOD="monthly" ;;
+    esac
+    if ! [[ "$TRAFFIC_MODE" =~ ^(out|in|total|max)$ ]]; then
+        TRAFFIC_MODE="total"
+    fi
+    if ! [[ "$TRAFFIC_LIMIT" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! lite_compare_ge "$TRAFFIC_LIMIT" "0.000001"; then
+        TRAFFIC_LIMIT=""
+    fi
+
+    start_date=$(lite_period_start_date)
+    end_date=$(lite_period_end_date)
+    period_label=$(lite_period_label "$TRAFFIC_PERIOD")
+    mode_label=$(lite_mode_label "$TRAFFIC_MODE")
+
+    echo -e "${CYAN}流量周期:${NC} ${WHITE}${period_label} · ${mode_label}${NC}  ${WHITE}${start_date} ~ ${end_date}${NC}"
+
+    if [ -z "$TRAFFIC_LIMIT" ]; then
+        echo -e "${CYAN}已用/总量:${NC} ${YELLOW}总量配置异常${NC}"
+        return
+    fi
+
+    limit_text=$(awk -v limit="$TRAFFIC_LIMIT" 'BEGIN { printf "%.3f", limit }')
+    if ! usage_gb=$(lite_current_usage_gb "$start_date" "$end_date"); then
+        echo -e "${CYAN}已用/总量:${NC} ${YELLOW}暂无法读取${NC} / ${WHITE}${limit_text} GB${NC}"
+        return
+    fi
+
+    percent=$(awk -v used="$usage_gb" -v limit="$TRAFFIC_LIMIT" 'BEGIN { if (limit > 0) printf "%.1f", used / limit * 100; else printf "0.0" }')
+    usage_color="$GREEN"
+    if lite_compare_ge "$percent" "90"; then
+        usage_color="$RED"
+    elif lite_compare_ge "$percent" "75"; then
+        usage_color="$YELLOW"
+    fi
+    bar=$(lite_usage_bar "$percent" "$usage_color")
+
+    echo -e "${CYAN}已用/总量:${NC} ${usage_color}${usage_gb} GB${NC} / ${WHITE}${limit_text} GB${NC}  ${usage_color}${percent}%${NC} ${bar}"
+}
+
 menu_item() {
     local number="$1"
     local label="$2"
@@ -576,6 +900,7 @@ show_main_menu() {
     echo ""
     show_status_line
     echo -e "${CYAN}快捷命令:${NC} sudo ntc"
+    show_traffic_overview
     echo ""
     menu_item "1" "安装/管理流量监控"
     menu_item "2" "安装/管理 Telegram 通知"

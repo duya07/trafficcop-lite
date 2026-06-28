@@ -681,27 +681,37 @@ tc_root_qdisc() {
 
 is_default_qdisc_line() {
     local qdisc_line="$1"
-    case "$qdisc_line" in
-        ""|*" qdisc noqueue "*|*" qdisc fq_codel "*|*" qdisc pfifo_fast "*|*" qdisc mq "*|*" qdisc fq "*) return 0 ;;
+    local qdisc_type
+
+    qdisc_type=$(printf '%s\n' "$qdisc_line" | awk '{print $2}')
+    case "$qdisc_type" in
+        ""|noqueue|fq_codel|pfifo_fast|mq|fq) return 0 ;;
         *) return 1 ;;
     esac
 }
 
-tc_state_interface() {
+tc_state_value() {
+    local key="$1"
     if [ -f "$TC_STATE_FILE" ]; then
-        grep '^INTERFACE=' "$TC_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-
+        grep "^${key}=" "$TC_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-
     fi
+}
+
+tc_state_interface() {
+    tc_state_value "INTERFACE"
 }
 
 write_tc_state() {
     local interface="$1"
     local speed="$2"
+    local qdisc_line="$3"
     local period_start
 
     period_start=$(get_period_start_date)
     {
         printf 'INTERFACE=%s\n' "$interface"
         printf 'LIMIT_SPEED=%s\n' "$speed"
+        printf 'QDISC_LINE=%s\n' "$qdisc_line"
         printf 'PERIOD_START=%s\n' "$period_start"
         printf 'APPLIED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     } > "$TC_STATE_FILE"
@@ -739,7 +749,7 @@ apply_tc_limit() {
     fi
 
     if "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root tbf rate "${speed}kbit" burst 32kbit latency 400ms; then
-        write_tc_state "$MAIN_INTERFACE" "$speed"
+        write_tc_state "$MAIN_INTERFACE" "$speed" "$(tc_root_qdisc "$MAIN_INTERFACE")"
         echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则已应用/更新" | tee -a "$LOG_FILE"
         return 0
     fi
@@ -750,7 +760,7 @@ apply_tc_limit() {
 
 clear_owned_tc_rules() {
     local reason="$1"
-    local state_interface qdisc_line
+    local state_interface qdisc_line state_qdisc_line state_speed
 
     if [ ! -f "$TC_STATE_FILE" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：未发现本脚本 TC 状态标记，保留现有 qdisc。" | tee -a "$LOG_FILE"
@@ -771,6 +781,25 @@ clear_owned_tc_rules() {
 
     qdisc_line=$(tc_root_qdisc "$state_interface")
     if echo "$qdisc_line" | grep -q " tbf "; then
+        state_qdisc_line=$(tc_state_value "QDISC_LINE")
+        state_speed=$(tc_state_value "LIMIT_SPEED")
+        if [ -n "$state_qdisc_line" ] && [ "$qdisc_line" != "$state_qdisc_line" ]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：当前 tbf 与本脚本状态记录不一致，保留现有规则并移除状态标记。" | tee -a "$LOG_FILE"
+            rm -f "$TC_STATE_FILE"
+            return 0
+        fi
+        if [ -z "$state_qdisc_line" ]; then
+            if ! echo "$state_speed" | grep -Eq '^[0-9]+$'; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：旧状态记录缺失限速速率，保留现有规则并移除状态标记。" | tee -a "$LOG_FILE"
+                rm -f "$TC_STATE_FILE"
+                return 0
+            fi
+            if ! echo "$qdisc_line" | grep -Eq "rate[[:space:]]+${state_speed}[Kk]bit"; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：当前 tbf 速率与旧状态记录不一致，保留现有规则并移除状态标记。" | tee -a "$LOG_FILE"
+                rm -f "$TC_STATE_FILE"
+                return 0
+            fi
+        fi
         "$TC_BIN" qdisc del dev "$state_interface" root 2>/dev/null || true
         echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：已清理本脚本在接口 $state_interface 上应用的 TC 限速。" | tee -a "$LOG_FILE"
     else

@@ -8,7 +8,8 @@ CONFIG_FILE="$WORK_DIR/traffic_monitor_config.txt"
 LOG_FILE="$WORK_DIR/traffic_monitor.log"
 SCRIPT_PATH="$WORK_DIR/trafficcop-lite-monitor.sh"
 LOCK_FILE="$WORK_DIR/traffic_monitor.lock"
-SCRIPT_VERSION="1.0.1"
+TC_STATE_FILE="$WORK_DIR/tc_limit_state"
+SCRIPT_VERSION="1.0.2"
 mkdir -p "$WORK_DIR"
 
 find_tc_bin() {
@@ -39,42 +40,130 @@ migrate_files() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') 使用独立工作目录: $WORK_DIR" | tee -a "$LOG_FILE"
 }
 
+command_exists() {
+    command -v "$1" >/dev/null 2>&1
+}
+
+run_privileged() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif command_exists sudo; then
+        sudo "$@"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 需要 root 权限或 sudo 才能安装依赖。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+}
+
+add_package_once() {
+    local package="$1"
+    local existing
+    for existing in "${packages_to_install[@]}"; do
+        if [ "$existing" = "$package" ]; then
+            return
+        fi
+    done
+    packages_to_install+=("$package")
+}
+
+add_package_for_command() {
+    local missing_command="$1"
+
+    case "$PACKAGE_MANAGER:$missing_command" in
+        apt:ip) add_package_once "iproute2" ;;
+        apt:crontab) add_package_once "cron" ;;
+        dnf:ip|yum:ip) add_package_once "iproute" ;;
+        dnf:crontab|yum:crontab) add_package_once "cronie" ;;
+        apk:ip) add_package_once "iproute2" ;;
+        apk:crontab) add_package_once "dcron" ;;
+        pacman:ip) add_package_once "iproute2" ;;
+        pacman:crontab) add_package_once "cronie" ;;
+        *) add_package_once "$missing_command" ;;
+    esac
+}
+
+detect_package_manager() {
+    if command_exists apt-get; then
+        echo "apt"
+    elif command_exists dnf; then
+        echo "dnf"
+    elif command_exists yum; then
+        echo "yum"
+    elif command_exists apk; then
+        echo "apk"
+    elif command_exists pacman; then
+        echo "pacman"
+    else
+        echo ""
+    fi
+}
+
+install_packages() {
+    case "$PACKAGE_MANAGER" in
+        apt)
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 正在更新软件包列表..." | tee -a "$LOG_FILE"
+            run_privileged apt-get update || return 1
+            run_privileged apt-get install -y "$@"
+            ;;
+        dnf)
+            run_privileged dnf install -y "$@"
+            ;;
+        yum)
+            run_privileged yum install -y "$@"
+            ;;
+        apk)
+            run_privileged apk add --no-cache "$@"
+            ;;
+        pacman)
+            run_privileged pacman -Sy --noconfirm "$@"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
 
 
 
 
 check_and_install_packages() {
-    local packages=("vnstat" "jq" "bc" "iproute2" "cron")
-    local need_install=false
+    local required_commands=("vnstat" "jq" "bc" "ip" "crontab")
+    local command_name
+    local missing_commands=()
+    local packages_to_install=()
+    local PACKAGE_MANAGER
 
-    for package in "${packages[@]}"; do
-        if ! dpkg -s "$package" >/dev/null 2>&1; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') $package 未安装，将进行安装..." | tee -a "$LOG_FILE"
-            need_install=true
-            break
+    for command_name in "${required_commands[@]}"; do
+        if ! command_exists "$command_name"; then
+            missing_commands+=("$command_name")
         fi
     done
 
-    if $need_install; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 正在更新软件包列表..." | tee -a "$LOG_FILE"
-        if ! sudo apt-get update; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 更新软件包列表失败，请检查网络连接和系统状态。" | tee -a "$LOG_FILE"
+    if [ "${#missing_commands[@]}" -eq 0 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 所有必要的软件包已安装" | tee -a "$LOG_FILE"
+    else
+        PACKAGE_MANAGER="$(detect_package_manager)"
+        if [ -z "$PACKAGE_MANAGER" ]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 缺少命令：${missing_commands[*]}，且未识别到支持的包管理器，请手动安装。" | tee -a "$LOG_FILE"
             return 1
         fi
 
-        for package in "${packages[@]}"; do
-            if ! dpkg -s "$package" >/dev/null 2>&1; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') 正在安装 $package..." | tee -a "$LOG_FILE"
-                if sudo apt-get install -y "$package"; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') $package 安装成功" | tee -a "$LOG_FILE"
-                else
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') $package 安装失败，请手动检查并安装。" | tee -a "$LOG_FILE"
-                    return 1
-                fi
+        for command_name in "${missing_commands[@]}"; do
+            add_package_for_command "$command_name"
+        done
+
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 缺少命令：${missing_commands[*]}，将使用 $PACKAGE_MANAGER 安装：${packages_to_install[*]}" | tee -a "$LOG_FILE"
+        if ! install_packages "${packages_to_install[@]}"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 依赖安装失败，请检查网络连接、包管理器和系统状态。" | tee -a "$LOG_FILE"
+            return 1
+        fi
+
+        for command_name in "${required_commands[@]}"; do
+            if ! command_exists "$command_name"; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 安装后仍缺少命令：$command_name，请手动检查。" | tee -a "$LOG_FILE"
+                return 1
             fi
         done
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 所有必要的软件包已安装" | tee -a "$LOG_FILE"
     fi
 
     # 验证系统 tc 命令是否可用；独立版的 tc 快捷命令不会用于限速。
@@ -109,8 +198,7 @@ check_and_install_packages() {
 
 # 检查配置和定时任务
 check_existing_setup() {
-     if [ -s "$CONFIG_FILE" ]; then  
-        source "$CONFIG_FILE"
+     if [ -s "$CONFIG_FILE" ] && read_config; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 配置已存在"| tee -a "$LOG_FILE"
         if crontab -l 2>/dev/null | grep -q "$SCRIPT_PATH --run"; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 每分钟一次的定时任务已在执行。"| tee -a "$LOG_FILE"
@@ -123,11 +211,97 @@ check_existing_setup() {
     fi
 }
 
+is_decimal() {
+    [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]
+}
+
+compare_decimal() {
+    awk -v left="$1" -v right="$2" -v op="$3" 'BEGIN {
+        if (op == "gt") exit !(left > right)
+        if (op == "ge") exit !(left >= right)
+        if (op == "lt") exit !(left < right)
+        exit 1
+    }'
+}
+
+validate_config() {
+    local has_error=false
+
+    case "${TRAFFIC_MODE:-}" in
+        out|in|total|max) ;;
+        *)
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：TRAFFIC_MODE 无效：${TRAFFIC_MODE:-空}" | tee -a "$LOG_FILE"
+            has_error=true
+            ;;
+    esac
+
+    case "${TRAFFIC_PERIOD:-}" in
+        monthly|quarterly|yearly) ;;
+        *)
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：TRAFFIC_PERIOD 无效：${TRAFFIC_PERIOD:-空}" | tee -a "$LOG_FILE"
+            has_error=true
+            ;;
+    esac
+
+    if ! is_decimal "${TRAFFIC_LIMIT:-}" || ! compare_decimal "$TRAFFIC_LIMIT" "0" "gt"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：TRAFFIC_LIMIT 必须大于 0。" | tee -a "$LOG_FILE"
+        has_error=true
+    fi
+
+    TRAFFIC_TOLERANCE="${TRAFFIC_TOLERANCE:-0}"
+    if ! is_decimal "$TRAFFIC_TOLERANCE"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：TRAFFIC_TOLERANCE 必须是非负数字。" | tee -a "$LOG_FILE"
+        has_error=true
+    fi
+
+    if ! [[ "${PERIOD_START_DAY:-1}" =~ ^[0-9]+$ ]]; then
+        PERIOD_START_DAY=1
+    fi
+    PERIOD_START_DAY=$((10#$PERIOD_START_DAY))
+    if [ "$PERIOD_START_DAY" -lt 1 ] || [ "$PERIOD_START_DAY" -gt 31 ]; then
+        PERIOD_START_DAY=1
+    fi
+
+    if ! [[ "${PERIOD_START_MONTH:-1}" =~ ^[0-9]+$ ]]; then
+        PERIOD_START_MONTH=1
+    fi
+    PERIOD_START_MONTH=$((10#$PERIOD_START_MONTH))
+    if [ "$PERIOD_START_MONTH" -lt 1 ] || [ "$PERIOD_START_MONTH" -gt 12 ]; then
+        PERIOD_START_MONTH=1
+    fi
+
+    if ! [[ "${LIMIT_SPEED:-20}" =~ ^[1-9][0-9]*$ ]]; then
+        LIMIT_SPEED=20
+    fi
+
+    if [ -z "${MAIN_INTERFACE:-}" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：MAIN_INTERFACE 为空。" | tee -a "$LOG_FILE"
+        has_error=true
+    elif command_exists ip && ! ip link show "$MAIN_INTERFACE" >/dev/null 2>&1; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：网络接口不存在：$MAIN_INTERFACE" | tee -a "$LOG_FILE"
+        has_error=true
+    fi
+
+    case "${LIMIT_MODE:-}" in
+        tc|shutdown) ;;
+        *)
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：LIMIT_MODE 无效：${LIMIT_MODE:-空}" | tee -a "$LOG_FILE"
+            has_error=true
+            ;;
+    esac
+
+    if $has_error; then
+        return 1
+    fi
+    return 0
+}
+
 # 读取配置
 read_config() {
     if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-        return 0
+        # shellcheck disable=SC1090
+        source "$CONFIG_FILE" || return 1
+        validate_config
     else
         return 1
     fi
@@ -440,51 +614,60 @@ get_period_end_date() {
 
 # 获取流量使用情况
 get_traffic_usage() {
-    local start_date=$(get_period_start_date)
-    local end_date=$(get_period_end_date)
+    local start_date end_date
+    local start_num end_num vnstat_json usage_bytes rx_bytes tx_bytes usage_gib
+
+    start_date=$(get_period_start_date)
+    end_date=$(get_period_end_date)
     
     echo "$(date '+%Y-%m-%d %H:%M:%S') 周期开始日期: $start_date, 周期结束日期: $end_date" >&2
     
     # 使用 vnstat JSON API 获取每日流量数据
-    local vnstat_json=$(vnstat -i "$MAIN_INTERFACE" --json 2>/dev/null)
+    if ! vnstat_json=$(vnstat -i "$MAIN_INTERFACE" --json 2>/dev/null); then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: vnstat 执行失败，跳过本轮限速检查" >&2
+        return 1
+    fi
     
     if [ -z "$vnstat_json" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: 无法获取 vnstat JSON 数据" >&2
-        echo "0.000"
         return 1
     fi
     
     # 将日期转换为 YYYYMMDD 整数用于比较（兼容 vnstat 2.x 的 date 对象格式）
-    local start_num=$(echo "$start_date" | tr -d '-')
-    local end_num=$(echo "$end_date" | tr -d '-')
+    start_num=$(echo "$start_date" | tr -d '-')
+    end_num=$(echo "$end_date" | tr -d '-')
     
     # 根据 TRAFFIC_MODE 累加对应的流量
-    local usage_bytes
     case $TRAFFIC_MODE in
         out)
             usage_bytes=$(echo "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
-                '[.interfaces[0].traffic.day[] | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .tx] | add // 0')
+                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .tx] | add // 0') || return 1
             ;;
         in)
             usage_bytes=$(echo "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
-                '[.interfaces[0].traffic.day[] | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .rx] | add // 0')
+                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .rx] | add // 0') || return 1
             ;;
         total)
             usage_bytes=$(echo "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
-                '[.interfaces[0].traffic.day[] | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | (.rx + .tx)] | add // 0')
+                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | (.rx + .tx)] | add // 0') || return 1
             ;;
         max)
-            local rx_bytes=$(echo "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
-                '[.interfaces[0].traffic.day[] | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .rx] | add // 0')
-            local tx_bytes=$(echo "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
-                '[.interfaces[0].traffic.day[] | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .tx] | add // 0')
-            usage_bytes=$(printf '%s\n%s' "$rx_bytes" "$tx_bytes" | sort -rn | head -n1)
+            rx_bytes=$(echo "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
+                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .rx] | add // 0') || return 1
+            tx_bytes=$(echo "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
+                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .tx] | add // 0') || return 1
+            usage_bytes=$(awk -v rx="$rx_bytes" -v tx="$tx_bytes" 'BEGIN { if (rx >= tx) print rx; else print tx }')
             ;;
     esac
 
-    if [ -n "$usage_bytes" ] && [ "$usage_bytes" != "null" ] && [ "$usage_bytes" != "0" ]; then
+    if ! [[ "$usage_bytes" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: jq 返回了无效流量数据：${usage_bytes:-空}" >&2
+        return 1
+    fi
+
+    if [ "$usage_bytes" != "0" ]; then
         # 将字节转换为 GiB，使用 printf 确保格式正确
-        local usage_gib=$(echo "scale=3; $usage_bytes/1024/1024/1024" | bc 2>/dev/null || echo "0.000")
+        usage_gib=$(echo "scale=3; $usage_bytes/1024/1024/1024" | bc 2>/dev/null) || return 1
         # 确保小数点前至少有一个0
         printf "%.3f\n" "$usage_gib" 2>/dev/null || echo "0.000"
     else
@@ -492,11 +675,121 @@ get_traffic_usage() {
     fi
 }
 
+tc_root_qdisc() {
+    "$TC_BIN" qdisc show dev "$1" root 2>/dev/null | head -n 1
+}
+
+is_default_qdisc_line() {
+    local qdisc_line="$1"
+    case "$qdisc_line" in
+        ""|*" qdisc noqueue "*|*" qdisc fq_codel "*|*" qdisc pfifo_fast "*|*" qdisc mq "*|*" qdisc fq "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+tc_state_interface() {
+    if [ -f "$TC_STATE_FILE" ]; then
+        grep '^INTERFACE=' "$TC_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-
+    fi
+}
+
+write_tc_state() {
+    local interface="$1"
+    local speed="$2"
+    local period_start
+
+    period_start=$(get_period_start_date)
+    {
+        printf 'INTERFACE=%s\n' "$interface"
+        printf 'LIMIT_SPEED=%s\n' "$speed"
+        printf 'PERIOD_START=%s\n' "$period_start"
+        printf 'APPLIED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    } > "$TC_STATE_FILE"
+    chmod 600 "$TC_STATE_FILE" 2>/dev/null || true
+}
+
+apply_tc_limit() {
+    local speed="$1"
+    local existing_qdisc state_interface
+
+    if [ -z "$TC_BIN" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 未找到系统 tc 命令，无法执行限速" | tee -a "$LOG_FILE"
+        return 1
+    fi
+
+    existing_qdisc=$(tc_root_qdisc "$MAIN_INTERFACE")
+    state_interface=$(tc_state_interface)
+
+    if [ -n "$state_interface" ] && [ "$state_interface" != "$MAIN_INTERFACE" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') TC 状态文件属于接口 $state_interface，当前配置接口为 $MAIN_INTERFACE，将先清理旧接口限速。" | tee -a "$LOG_FILE"
+        clear_owned_tc_rules "配置接口已变更"
+        existing_qdisc=$(tc_root_qdisc "$MAIN_INTERFACE")
+        state_interface=""
+    fi
+
+    if [ -z "$state_interface" ]; then
+        if echo "$existing_qdisc" | grep -q " tbf "; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到接口 $MAIN_INTERFACE 已存在 tbf 规则且无本脚本状态标记，跳过限速以避免覆盖系统原有限速。" | tee -a "$LOG_FILE"
+            return 1
+        fi
+        if ! is_default_qdisc_line "$existing_qdisc"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到接口 $MAIN_INTERFACE 已存在非默认 qdisc：$existing_qdisc，跳过限速以避免覆盖系统网络策略。" | tee -a "$LOG_FILE"
+            return 1
+        fi
+    fi
+
+    if "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root tbf rate "${speed}kbit" burst 32kbit latency 400ms; then
+        write_tc_state "$MAIN_INTERFACE" "$speed"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则已应用/更新" | tee -a "$LOG_FILE"
+        return 0
+    fi
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则应用失败，请检查接口或 tc 状态" | tee -a "$LOG_FILE"
+    return 1
+}
+
+clear_owned_tc_rules() {
+    local reason="$1"
+    local state_interface qdisc_line
+
+    if [ ! -f "$TC_STATE_FILE" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：未发现本脚本 TC 状态标记，保留现有 qdisc。" | tee -a "$LOG_FILE"
+        return 0
+    fi
+
+    state_interface=$(tc_state_interface)
+    if [ -z "$state_interface" ]; then
+        rm -f "$TC_STATE_FILE"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：TC 状态文件无效，已移除状态文件。" | tee -a "$LOG_FILE"
+        return 0
+    fi
+
+    if [ -z "$TC_BIN" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：未找到系统 tc 命令，无法清理本脚本限速。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+
+    qdisc_line=$(tc_root_qdisc "$state_interface")
+    if echo "$qdisc_line" | grep -q " tbf "; then
+        "$TC_BIN" qdisc del dev "$state_interface" root 2>/dev/null || true
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：已清理本脚本在接口 $state_interface 上应用的 TC 限速。" | tee -a "$LOG_FILE"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：接口 $state_interface 当前没有 tbf 规则，仅移除本脚本状态文件。" | tee -a "$LOG_FILE"
+    fi
+    rm -f "$TC_STATE_FILE"
+}
+
 
 # 修改 check_and_limit_traffic 函数
 check_and_limit_traffic() {
-    local current_usage=$(get_traffic_usage)
-    local limit_threshold=$(echo "$TRAFFIC_LIMIT - $TRAFFIC_TOLERANCE" | bc 2>/dev/null || echo "0")
+    local current_usage limit_threshold
+
+    if ! current_usage=$(get_traffic_usage); then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 无法可靠读取当前流量，本轮跳过限速判断并保留现有限速状态。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+
+    limit_threshold=$(echo "$TRAFFIC_LIMIT - $TRAFFIC_TOLERANCE" | bc 2>/dev/null || echo "0")
 
     if (( $(echo "$limit_threshold < 0" | bc -l 2>/dev/null || echo "0") )); then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到配置异常：容错范围大于流量限制，已将限制阈值按 0 GB 处理" | tee -a "$LOG_FILE"
@@ -509,28 +802,19 @@ check_and_limit_traffic() {
         echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制" | tee -a "$LOG_FILE"
         if [ "$LIMIT_MODE" = "tc" ]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 使用 TC 模式限速" | tee -a "$LOG_FILE"
-            if [ -n "$TC_BIN" ]; then
-                local safe_limit_speed="${LIMIT_SPEED:-20}"
-                if ! [[ "$safe_limit_speed" =~ ^[1-9][0-9]*$ ]]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到限速值异常：$safe_limit_speed，已使用默认值 20 kbit/s" | tee -a "$LOG_FILE"
-                    safe_limit_speed=20
-                fi
-
-                if "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root tbf rate "${safe_limit_speed}kbit" burst 32kbit latency 400ms; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则已应用/更新" | tee -a "$LOG_FILE"
-                else
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则应用失败，请检查接口或 tc 状态" | tee -a "$LOG_FILE"
-                fi
-            else
-                echo "$(date '+%Y-%m-%d %H:%M:%S') 未找到系统 tc 命令，无法执行限速" | tee -a "$LOG_FILE"
+            local safe_limit_speed="${LIMIT_SPEED:-20}"
+            if ! [[ "$safe_limit_speed" =~ ^[1-9][0-9]*$ ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到限速值异常：$safe_limit_speed，已使用默认值 20 kbit/s" | tee -a "$LOG_FILE"
+                safe_limit_speed=20
             fi
+            apply_tc_limit "$safe_limit_speed"
         elif [ "$LIMIT_MODE" = "shutdown" ]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制，系统将在 1 分钟后关机" | tee -a "$LOG_FILE"
             shutdown -h +1 "流量超出限制，系统将在 1 分钟后关机"
         fi
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 流量正常，清除所有限制" | tee -a "$LOG_FILE"
-        [ -n "$TC_BIN" ] && "$TC_BIN" qdisc del dev "$MAIN_INTERFACE" root 2>/dev/null
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 流量正常，检查是否需要清理本脚本限速" | tee -a "$LOG_FILE"
+        clear_owned_tc_rules "流量正常"
     fi
 }
 
@@ -542,7 +826,7 @@ check_reset_limit() {
     
     if [[ "$current_date" == "$period_start" ]]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 新的流量周期开始，重置限制"| tee -a "$LOG_FILE"
-        [ -n "$TC_BIN" ] && "$TC_BIN" qdisc del dev "$MAIN_INTERFACE" root 2>/dev/null
+        clear_owned_tc_rules "新的流量周期开始"
     fi
 }
 
@@ -594,7 +878,10 @@ main() {
 
  # 非 --run 模式下的操作
   # 首先检查并安装必要的软件包
-    check_and_install_packages
+    if ! check_and_install_packages; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 依赖检查未通过，已停止后续配置和限速检查。" | tee -a "$LOG_FILE"
+        return 1
+    fi
     if check_existing_setup; then
         read_config
         show_current_config
@@ -636,9 +923,9 @@ fi
     # 显示当前流量使用情况和限制状态
     if read_config; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 当前流量使用情况：" | tee -a "$LOG_FILE"
-        local current_usage=$(get_traffic_usage)
+        local current_usage
         #echo "Debug: Current usage from get_traffic_usage: $current_usage" | tee -a "$LOG_FILE"
-        if [ "$current_usage" != "0" ]; then
+        if current_usage=$(get_traffic_usage); then
             local start_date=$(get_period_start_date)
             echo "$(date '+%Y-%m-%d %H:%M:%S') 当前统计周期: $TRAFFIC_PERIOD (从 $start_date 开始)" | tee -a "$LOG_FILE"
             echo "$(date '+%Y-%m-%d %H:%M:%S') 统计模式: $TRAFFIC_MODE" | tee -a "$LOG_FILE"
@@ -646,7 +933,7 @@ fi
             echo "$(date '+%Y-%m-%d %H:%M:%S') 检查并限制流量：" | tee -a "$LOG_FILE"
             check_and_limit_traffic
         else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 无法获取流量数据，请检查 vnstat 配置" | tee -a "$LOG_FILE"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 无法可靠获取流量数据，请检查 vnstat 配置；本轮不会清除现有限速。" | tee -a "$LOG_FILE"
         fi
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') 配置文件读取失败，请检查配置" | tee -a "$LOG_FILE"

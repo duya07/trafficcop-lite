@@ -15,7 +15,39 @@ LOG_FILE="$WORK_DIR/traffic_monitor.log"
 LAST_NOTIFICATION_FILE="$WORK_DIR/last_traffic_notification"
 SCRIPT_PATH="$WORK_DIR/trafficcop-lite-telegram.sh"
 CRON_LOG="$WORK_DIR/tg_notifier_cron.log"
-SCRIPT_VERSION="1.0.1"
+CRON_LOG_MAX_LINES="${CRON_LOG_MAX_LINES:-2000}"
+TG_DEBUG="${TG_DEBUG:-false}"
+SCRIPT_VERSION="1.0.2"
+
+trim_log_file() {
+    local file="$1"
+    local max_lines="$2"
+    local tmp_file
+
+    if [ ! -f "$file" ]; then
+        return
+    fi
+    if ! [[ "$max_lines" =~ ^[1-9][0-9]*$ ]]; then
+        max_lines=2000
+    fi
+    if [ "$(wc -l < "$file" 2>/dev/null || echo 0)" -le "$max_lines" ]; then
+        return
+    fi
+
+    tmp_file="${file}.tmp.$$"
+    tail -n "$max_lines" "$file" > "$tmp_file" 2>/dev/null && mv -f "$tmp_file" "$file"
+    rm -f "$tmp_file" 2>/dev/null || true
+}
+
+log_cron() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') : $*" >> "$CRON_LOG"
+}
+
+debug_log() {
+    if [ "$TG_DEBUG" = "true" ]; then
+        log_cron "[调试] $*"
+    fi
+}
 
 # 文件迁移函数
 migrate_files() {
@@ -28,6 +60,7 @@ migrate_files
 
 # 切换到工作目录
 cd "$WORK_DIR" || exit 1
+trap 'trim_log_file "$CRON_LOG" "$CRON_LOG_MAX_LINES"' EXIT
 
 # 设置时区为上海（东八区）
 export TZ='Asia/Shanghai'
@@ -514,7 +547,7 @@ update_cron_time() {
 daily_report() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 开始生成每日报告"| tee -a "$CRON_LOG"
     echo "$(date '+%Y-%m-%d %H:%M:%S') : DAILY_REPORT_TIME=$DAILY_REPORT_TIME"| tee -a "$CRON_LOG"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') : BOT_TOKEN=${BOT_TOKEN:0:5}... CHAT_ID=$CHAT_ID"| tee -a "$CRON_LOG"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') : Telegram 配置已加载，机器名=$MACHINE_NAME"| tee -a "$CRON_LOG"
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 日志文件路径: $LOG_FILE"| tee -a "$CRON_LOG"
 
     # 反向读取日志文件，查找第一个同时包含"当前使用流量"和"限制流量"的行
@@ -550,11 +583,7 @@ daily_report() {
             # 尝试从缓存加载准确的端口数据
             local port_data=$(load_port_traffic_data)
             
-            # 调试：显示获取到的端口数据（只显示前100个字符避免日志过长）
-            echo "$(date '+%Y-%m-%d %H:%M:%S') : [调试] 获取到的端口数据长度: ${#port_data}字符"| tee -a "$CRON_LOG"
-            if [ -n "$port_data" ]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') : [调试] 数据预览: $(echo "$port_data" | head -c 100)..."| tee -a "$CRON_LOG"
-            fi
+            debug_log "获取到的端口数据长度: ${#port_data}字符"
             
             if [ -n "$port_data" ] && echo "$port_data" | jq -e '.ports' >/dev/null 2>&1; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') : 使用缓存的端口流量数据"| tee -a "$CRON_LOG"
@@ -571,8 +600,7 @@ daily_report() {
                         local port_usage=$(echo "$port_data" | jq -r ".ports[$i].usage" 2>/dev/null)
                         local port_limit=$(echo "$port_data" | jq -r ".ports[$i].limit" 2>/dev/null)
                         
-                        # 调试：显示每个端口的原始数据
-                        echo "$(date '+%Y-%m-%d %H:%M:%S') : [调试] 端口[$i] port=$port, desc=$port_desc, usage=$port_usage, limit=$port_limit"| tee -a "$CRON_LOG"
+                        debug_log "端口[$i] port=$port, desc=$port_desc, usage=$port_usage, limit=$port_limit"
                         
                         if [ -n "$port" ] && [ "$port" != "null" ] && [ "$port_usage" != "null" ]; then
                             # 格式化流量显示（保留2位小数）
@@ -660,9 +688,7 @@ daily_report() {
     
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 准备发送消息"| tee -a "$CRON_LOG"
     
-    # 调试：显示即将发送的消息内容
-    echo "$(date '+%Y-%m-%d %H:%M:%S') : [调试] 发送到TG的消息内容:"| tee -a "$CRON_LOG"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') : [调试] $message"| tee -a "$CRON_LOG"
+    debug_log "发送到TG的消息长度: ${#message}字符"
 
     local url="https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
     local response
@@ -684,36 +710,33 @@ daily_report() {
 
 # 主任务
 main() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') : 进入主任务" >> "$CRON_LOG"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') : 参数数量: $#" >> "$CRON_LOG"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') : 所有参数: $*" >> "$CRON_LOG"
+    debug_log "进入主任务，参数数量=$#，参数=$*"
     
     check_running
     
 if [[ "$*" == *"-cron"* ]]; then
-    echo "$(date '+%Y-%m-%d %H:%M:%S') : 检测到-cron参数, 进入cron模式" >> "$CRON_LOG"
+    log_cron "进入cron模式"
     if read_config; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') : 成功读取配置文件" >> "$CRON_LOG"
+        debug_log "成功读取配置文件"
         # 继续执行其他操作
         check_and_notify "false"
         
     # 检查是否需要发送每日报告
-    # 先刷新缓存，保证定时发送时有最新的端口数据（在cron环境下主动生成缓存）
-    save_port_traffic_data 2>/dev/null || true
     current_time=$(TZ='Asia/Shanghai' date +%H:%M)
-        echo "$(date '+%Y-%m-%d %H:%M:%S') : 当前时间: $current_time, 设定的报告时间: $DAILY_REPORT_TIME" >> "$CRON_LOG"
+        debug_log "当前时间: $current_time, 设定的报告时间: $DAILY_REPORT_TIME"
         if [ "$current_time" == "$DAILY_REPORT_TIME" ]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') : 时间匹配，准备发送每日报告" >> "$CRON_LOG"
+            log_cron "时间匹配，准备发送每日报告"
+            save_port_traffic_data 2>/dev/null || true
             if daily_report; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') : 每日报告发送成功" >> "$CRON_LOG"
+                log_cron "每日报告发送成功"
             else
-                echo "$(date '+%Y-%m-%d %H:%M:%S') : 每日报告发送失败" >> "$CRON_LOG"
+                log_cron "每日报告发送失败"
             fi
         else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') : 当前时间与报告时间不匹配，不发送报告" >> "$CRON_LOG"
+            debug_log "当前时间与报告时间不匹配，不发送报告"
         fi
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') : 配置文件不存在或不完整，跳过检查" >> "$CRON_LOG"
+        log_cron "配置文件不存在或不完整，跳过检查"
         exit 1
     fi
 

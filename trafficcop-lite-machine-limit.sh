@@ -1,12 +1,13 @@
 #!/bin/bash
 
-# TrafficCop 机器限速管理脚本 v2.0
+# TrafficCop 机器限速管理脚本 v2.1
 # 提供完整的启用/禁用/恢复机器限速功能
 
 WORK_DIR="/etc/trafficcop-lite"
 CONFIG_FILE="$WORK_DIR/traffic_monitor_config.txt"
 BACKUP_CONFIG_FILE="$CONFIG_FILE.disabled.backup"
 SCRIPT_PATH="$WORK_DIR/trafficcop-lite-monitor.sh"
+TC_STATE_FILE="$WORK_DIR/tc_limit_state"
 CRON_COMMENT="# TrafficCop-Lite Monitor"
 
 find_tc_bin() {
@@ -44,17 +45,36 @@ get_main_interface() {
 
 # 清除TC限速规则
 clear_tc_rules() {
-    local interface=$(get_main_interface)
-    if [ -n "$interface" ]; then
-        if [ -z "$TC_BIN" ]; then
-            echo "未找到系统 tc 命令，跳过TC规则清理"
-        elif "$TC_BIN" qdisc show dev "$interface" 2>/dev/null | grep -q "tbf"; then
-            echo "清除网络接口 $interface 的TC限速规则..."
-            "$TC_BIN" qdisc del dev "$interface" root 2>/dev/null || true
-            echo "✓ TC限速规则已清除"
-        else
-            echo "✓ 未发现需要清除的TC限速规则"
+    local interface state_interface qdisc_line
+
+    interface=$(get_main_interface)
+    if [ -z "$TC_BIN" ]; then
+        echo "未找到系统 tc 命令，跳过TC规则清理"
+        return
+    fi
+
+    if [ -f "$TC_STATE_FILE" ]; then
+        state_interface="$(grep '^INTERFACE=' "$TC_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-)"
+        if [ -z "$state_interface" ]; then
+            rm -f "$TC_STATE_FILE"
+            echo "✓ TC状态文件无效，已清理状态文件"
+            return
         fi
+
+        qdisc_line="$("$TC_BIN" qdisc show dev "$state_interface" root 2>/dev/null | head -n 1)"
+        if echo "$qdisc_line" | grep -q " tbf "; then
+            echo "清除本脚本在网络接口 $state_interface 上应用的TC限速规则..."
+            "$TC_BIN" qdisc del dev "$state_interface" root 2>/dev/null || true
+            echo "✓ 本脚本TC限速规则已清除"
+        else
+            echo "✓ 接口 $state_interface 当前没有 tbf 限速规则"
+        fi
+        rm -f "$TC_STATE_FILE"
+    elif [ -n "$interface" ] && "$TC_BIN" qdisc show dev "$interface" root 2>/dev/null | grep -q " tbf "; then
+        echo "检测到网络接口 $interface 存在 tbf 规则，但没有本脚本状态标记。"
+        echo "为避免误删系统原有限速，已保留该 TC 规则。"
+    else
+        echo "✓ 未发现需要清除的TC限速规则"
     fi
 }
 

@@ -3,13 +3,14 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.0.2"
-LAST_UPDATE="2026-06-27"
+SCRIPT_VERSION="1.0.3"
+LAST_UPDATE="2026-06-28"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
 TELEGRAM_SCRIPT="trafficcop-lite-telegram.sh"
 MACHINE_LIMIT_SCRIPT="trafficcop-lite-machine-limit.sh"
+TC_STATE_FILE="$WORK_DIR/tc_limit_state"
 SHORTCUT_PATH="/usr/local/bin/ntc"
 LEGACY_NCL_SHORTCUT_PATH="/usr/local/bin/ncl"
 LEGACY_TC_SHORTCUT_PATH="/usr/local/bin/tc"
@@ -782,19 +783,40 @@ clear_lite_tc_rules_interactive() {
     local config="$WORK_DIR/traffic_monitor_config.txt"
     local interface=""
     local limit_mode=""
+    local state_interface=""
+    local qdisc_line=""
 
     if [ -f "$config" ]; then
         interface="$(grep '^MAIN_INTERFACE=' "$config" | tail -1 | cut -d'=' -f2-)"
         limit_mode="$(grep '^LIMIT_MODE=' "$config" | tail -1 | cut -d'=' -f2-)"
     fi
 
-    if [ "$limit_mode" != "tc" ] || [ -z "$interface" ]; then
+    if { [ "$limit_mode" != "tc" ] || [ -z "$interface" ]; } && [ ! -f "$TC_STATE_FILE" ]; then
         echo "✓ 未检测到独立版 TC 限速配置"
         return
     fi
 
     if [ -z "$TC_BIN" ]; then
         echo -e "${YELLOW}未找到系统 tc 命令，跳过 TC 规则检查。${NC}"
+        return
+    fi
+
+    if [ -f "$TC_STATE_FILE" ]; then
+        state_interface="$(grep '^INTERFACE=' "$TC_STATE_FILE" 2>/dev/null | tail -1 | cut -d'=' -f2-)"
+        if [ -z "$state_interface" ]; then
+            rm -f "$TC_STATE_FILE"
+            echo "✓ 已清理无效 TC 状态文件"
+            return
+        fi
+
+        qdisc_line="$("$TC_BIN" qdisc show dev "$state_interface" root 2>/dev/null | head -n 1)"
+        if echo "$qdisc_line" | grep -q " tbf "; then
+            "$TC_BIN" qdisc del dev "$state_interface" root 2>/dev/null || true
+            echo "✓ 已清理本脚本在接口 $state_interface 上应用的 TC 限速"
+        else
+            echo "✓ 接口 $state_interface 当前没有本脚本可清理的 tbf 规则"
+        fi
+        rm -f "$TC_STATE_FILE"
         return
     fi
 

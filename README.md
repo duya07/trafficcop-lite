@@ -178,7 +178,8 @@ sudo bash /etc/trafficcop-lite/trafficcop-lite.sh --uninstall
 ├── traffic_monitor_config.txt
 ├── tg_notifier_config.txt
 ├── traffic_monitor.log
-└── tg_notifier_cron.log
+├── tg_notifier_cron.log
+└── tc_limit_state
 ```
 
 快捷命令:
@@ -196,5 +197,7 @@ sudo /usr/sbin/tc qdisc show
 ## 注意事项
 
 - 脚本会安装依赖、写入 crontab，并可能配置 TC 限速或关机模式，请先在测试机确认。
-- 停止服务/卸载时，TC 规则和计划关机会要求确认后才处理。
+- TC 模式会用 `/etc/trafficcop-lite/tc_limit_state` 标记本脚本应用过的限速；自动恢复只清理带有该标记的规则，未标记的系统原有 `tbf` 规则会被保留或要求确认。
+- 停止服务/卸载时，未标记的 TC 规则和计划关机会要求确认后才处理。
+- Telegram cron 日志默认保留最近 2000 行；如需详细调试，可临时设置 `TG_DEBUG=true`。
 - 网络受限时，优先使用带 `v6.gh-proxy.org` 的命令。

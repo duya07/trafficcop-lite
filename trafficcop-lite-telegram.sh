@@ -447,7 +447,7 @@ check_and_notify() {
     local relevant_log=""
     
     # 从后往前读取日志文件，找到第一个包含相关信息的行
-    relevant_log=$(tac "$LOG_FILE" | grep -m 1 -E "流量超出限制|使用 TC 模式限速|新的流量周期开始|流量正常，清除所有限制")
+    relevant_log=$(tac "$LOG_FILE" | grep -m 1 -E "流量超出限制|使用 TC 模式限速|新的流量周期开始|流量正常")
     
     # 记录相关的日志内容
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 相关的日志内容: $relevant_log"| tee -a "$CRON_LOG"
@@ -459,7 +459,7 @@ check_and_notify() {
         current_status="限速"
     elif echo "$relevant_log" | grep -q "新的流量周期开始，重置限制"; then
         current_status="新周期"
-    elif echo "$relevant_log" | grep -q "流量正常，清除所有限制"; then
+    elif echo "$relevant_log" | grep -q "流量正常"; then
         current_status="正常"
     fi
     

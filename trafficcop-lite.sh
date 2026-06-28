@@ -785,6 +785,8 @@ clear_lite_tc_rules_interactive() {
     local limit_mode=""
     local state_interface=""
     local qdisc_line=""
+    local state_qdisc_line=""
+    local state_speed=""
 
     if [ -f "$config" ]; then
         interface="$(grep '^MAIN_INTERFACE=' "$config" | tail -1 | cut -d'=' -f2-)"
@@ -811,6 +813,25 @@ clear_lite_tc_rules_interactive() {
 
         qdisc_line="$("$TC_BIN" qdisc show dev "$state_interface" root 2>/dev/null | head -n 1)"
         if echo "$qdisc_line" | grep -q " tbf "; then
+            state_qdisc_line="$(grep '^QDISC_LINE=' "$TC_STATE_FILE" 2>/dev/null | tail -1 | cut -d'=' -f2-)"
+            state_speed="$(grep '^LIMIT_SPEED=' "$TC_STATE_FILE" 2>/dev/null | tail -1 | cut -d'=' -f2-)"
+            if [ -n "$state_qdisc_line" ] && [ "$qdisc_line" != "$state_qdisc_line" ]; then
+                echo "检测到当前 tbf 与本脚本状态记录不一致，已保留现有规则并清理状态标记。"
+                rm -f "$TC_STATE_FILE"
+                return
+            fi
+            if [ -z "$state_qdisc_line" ]; then
+                if ! echo "$state_speed" | grep -Eq '^[0-9]+$'; then
+                    echo "检测到旧状态记录缺失限速速率，已保留现有规则并清理状态标记。"
+                    rm -f "$TC_STATE_FILE"
+                    return
+                fi
+                if ! echo "$qdisc_line" | grep -Eq "rate[[:space:]]+${state_speed}[Kk]bit"; then
+                    echo "检测到当前 tbf 速率与旧状态记录不一致，已保留现有规则并清理状态标记。"
+                    rm -f "$TC_STATE_FILE"
+                    return
+                fi
+            fi
             "$TC_BIN" qdisc del dev "$state_interface" root 2>/dev/null || true
             echo "✓ 已清理本脚本在接口 $state_interface 上应用的 TC 限速"
         else

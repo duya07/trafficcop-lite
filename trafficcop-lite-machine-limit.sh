@@ -23,6 +23,20 @@ find_tc_bin() {
 
 TC_BIN="$(find_tc_bin)"
 
+tc_state_value() {
+    local key="$1"
+    if [ -f "$TC_STATE_FILE" ]; then
+        grep "^${key}=" "$TC_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-
+    fi
+}
+
+tc_root_qdisc() {
+    local interface="$1"
+    if [ -n "$TC_BIN" ] && [ -n "$interface" ]; then
+        "$TC_BIN" qdisc show dev "$interface" root 2>/dev/null | head -n 1
+    fi
+}
+
 # 颜色定义
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -45,7 +59,7 @@ get_main_interface() {
 
 # 清除TC限速规则
 clear_tc_rules() {
-    local interface state_interface qdisc_line
+    local interface state_interface qdisc_line state_qdisc_line state_speed
 
     interface=$(get_main_interface)
     if [ -z "$TC_BIN" ]; then
@@ -54,15 +68,34 @@ clear_tc_rules() {
     fi
 
     if [ -f "$TC_STATE_FILE" ]; then
-        state_interface="$(grep '^INTERFACE=' "$TC_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-)"
+        state_interface="$(tc_state_value "INTERFACE")"
         if [ -z "$state_interface" ]; then
             rm -f "$TC_STATE_FILE"
             echo "✓ TC状态文件无效，已清理状态文件"
             return
         fi
 
-        qdisc_line="$("$TC_BIN" qdisc show dev "$state_interface" root 2>/dev/null | head -n 1)"
+        qdisc_line="$(tc_root_qdisc "$state_interface")"
         if echo "$qdisc_line" | grep -q " tbf "; then
+            state_qdisc_line="$(tc_state_value "QDISC_LINE")"
+            state_speed="$(tc_state_value "LIMIT_SPEED")"
+            if [ -n "$state_qdisc_line" ] && [ "$qdisc_line" != "$state_qdisc_line" ]; then
+                echo "检测到当前 tbf 与本脚本状态记录不一致，已保留现有规则并清理状态标记。"
+                rm -f "$TC_STATE_FILE"
+                return
+            fi
+            if [ -z "$state_qdisc_line" ]; then
+                if ! echo "$state_speed" | grep -Eq '^[0-9]+$'; then
+                    echo "检测到旧状态记录缺失限速速率，已保留现有规则并清理状态标记。"
+                    rm -f "$TC_STATE_FILE"
+                    return
+                fi
+                if ! echo "$qdisc_line" | grep -Eq "rate[[:space:]]+${state_speed}[Kk]bit"; then
+                    echo "检测到当前 tbf 速率与旧状态记录不一致，已保留现有规则并清理状态标记。"
+                    rm -f "$TC_STATE_FILE"
+                    return
+                fi
+            fi
             echo "清除本脚本在网络接口 $state_interface 上应用的TC限速规则..."
             "$TC_BIN" qdisc del dev "$state_interface" root 2>/dev/null || true
             echo "✓ 本脚本TC限速规则已清除"
@@ -250,9 +283,27 @@ show_status() {
     fi
     
     # 检查TC规则
-    local interface=$(get_main_interface)
-    if [ -n "$interface" ] && [ -n "$TC_BIN" ] && "$TC_BIN" qdisc show dev "$interface" | grep -q "tbf"; then
-        echo -e "TC限速: ${YELLOW}已激活${NC}"
+    local interface state_interface qdisc_line
+    interface=$(get_main_interface)
+    state_interface="$(tc_state_value "INTERFACE")"
+    if [ -z "$TC_BIN" ]; then
+        echo -e "TC限速: ${YELLOW}无法检测（未找到 tc）${NC}"
+    elif [ -n "$state_interface" ]; then
+        qdisc_line="$(tc_root_qdisc "$state_interface")"
+        if echo "$qdisc_line" | grep -q " tbf "; then
+            echo -e "TC限速: ${YELLOW}已激活（本脚本）${NC}"
+        else
+            echo -e "TC限速: ${YELLOW}状态标记存在，但当前未检测到 tbf${NC}"
+        fi
+    elif [ -f "$TC_STATE_FILE" ]; then
+        echo -e "TC限速: ${YELLOW}状态标记无效（未记录接口）${NC}"
+    elif [ -n "$interface" ]; then
+        qdisc_line="$(tc_root_qdisc "$interface")"
+        if echo "$qdisc_line" | grep -q " tbf "; then
+            echo -e "TC限速: ${YELLOW}检测到外部 tbf（非本脚本）${NC}"
+        else
+            echo -e "TC限速: ${GREEN}未激活${NC}"
+        fi
     else
         echo -e "TC限速: ${GREEN}未激活${NC}"
     fi

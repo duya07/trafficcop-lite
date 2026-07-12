@@ -3,14 +3,38 @@
 # 设置 PATH 确保 cron 环境能找到所有命令
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
+if [ "$(id -u)" -ne 0 ]; then
+    echo "请使用 root 权限运行此脚本。"
+    exit 1
+fi
+
 WORK_DIR="/etc/trafficcop-lite"
 CONFIG_FILE="$WORK_DIR/traffic_monitor_config.txt"
 LOG_FILE="$WORK_DIR/traffic_monitor.log"
 SCRIPT_PATH="$WORK_DIR/trafficcop-lite-monitor.sh"
 LOCK_FILE="$WORK_DIR/traffic_monitor.lock"
 TC_STATE_FILE="$WORK_DIR/tc_limit_state"
-SCRIPT_VERSION="1.0.2"
+PERIOD_STATE_FILE="$WORK_DIR/last_reset_period"
+LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
+SCRIPT_VERSION="1.0.3"
 mkdir -p "$WORK_DIR"
+chmod 700 "$WORK_DIR" 2>/dev/null || true
+
+trim_log_file() {
+    local file="$1"
+    local max_lines="$2"
+    local tmp_file
+
+    [ -f "$file" ] || return 0
+    [[ "$max_lines" =~ ^[1-9][0-9]*$ ]] || max_lines=5000
+    [ "$(wc -l < "$file" 2>/dev/null || echo 0)" -le "$max_lines" ] && return 0
+
+    tmp_file="${file}.tmp.$$"
+    tail -n "$max_lines" "$file" > "$tmp_file" 2>/dev/null && mv -f "$tmp_file" "$file"
+    rm -f "$tmp_file" 2>/dev/null || true
+}
+
+trim_log_file "$LOG_FILE" "$LOG_MAX_LINES"
 
 find_tc_bin() {
     local candidate
@@ -72,12 +96,20 @@ add_package_for_command() {
     case "$PACKAGE_MANAGER:$missing_command" in
         apt:ip) add_package_once "iproute2" ;;
         apt:crontab) add_package_once "cron" ;;
+        apt:flock) add_package_once "util-linux" ;;
+        apt:tac) add_package_once "coreutils" ;;
         dnf:ip|yum:ip) add_package_once "iproute" ;;
         dnf:crontab|yum:crontab) add_package_once "cronie" ;;
+        dnf:flock|yum:flock) add_package_once "util-linux" ;;
+        dnf:tac|yum:tac) add_package_once "coreutils" ;;
         apk:ip) add_package_once "iproute2" ;;
         apk:crontab) add_package_once "dcron" ;;
+        apk:flock) add_package_once "util-linux-misc" ;;
+        apk:tac) add_package_once "coreutils" ;;
         pacman:ip) add_package_once "iproute2" ;;
         pacman:crontab) add_package_once "cronie" ;;
+        pacman:flock) add_package_once "util-linux" ;;
+        pacman:tac) add_package_once "coreutils" ;;
         *) add_package_once "$missing_command" ;;
     esac
 }
@@ -115,7 +147,7 @@ install_packages() {
             run_privileged apk add --no-cache "$@"
             ;;
         pacman)
-            run_privileged pacman -Sy --noconfirm "$@"
+            run_privileged pacman -S --needed --noconfirm "$@"
             ;;
         *)
             return 1
@@ -123,11 +155,45 @@ install_packages() {
     esac
 }
 
+ensure_service_running() {
+    local display_name="$1"
+    shift
+    local service_name
+
+    if command_exists systemctl; then
+        for service_name in "$@"; do
+            if systemctl list-unit-files "${service_name}.service" --no-legend 2>/dev/null | grep -q "^${service_name}\.service"; then
+                if run_privileged systemctl enable --now "${service_name}.service" >/dev/null 2>&1; then
+                    return 0
+                fi
+            fi
+        done
+    elif command_exists rc-service; then
+        for service_name in "$@"; do
+            if [ -x "/etc/init.d/$service_name" ]; then
+                command_exists rc-update && run_privileged rc-update add "$service_name" default >/dev/null 2>&1 || true
+                if run_privileged rc-service "$service_name" start >/dev/null 2>&1 || rc-service "$service_name" status >/dev/null 2>&1; then
+                    return 0
+                fi
+            fi
+        done
+    elif command_exists service; then
+        for service_name in "$@"; do
+            if [ -x "/etc/init.d/$service_name" ] && { run_privileged service "$service_name" start >/dev/null 2>&1 || service "$service_name" status >/dev/null 2>&1; }; then
+                return 0
+            fi
+        done
+    fi
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') 提示：无法自动确认 $display_name 服务状态，请确保对应服务正在运行。" | tee -a "$LOG_FILE"
+    return 0
+}
+
 
 
 
 check_and_install_packages() {
-    local required_commands=("vnstat" "jq" "bc" "ip" "crontab")
+    local required_commands=("vnstat" "jq" "bc" "ip" "crontab" "flock" "curl" "tac")
     local command_name
     local missing_commands=()
     local packages_to_install=()
@@ -165,6 +231,9 @@ check_and_install_packages() {
             fi
         done
     fi
+
+    ensure_service_running "cron" cron crond
+    ensure_service_running "vnStat" vnstat vnstatd
 
     # 验证系统 tc 命令是否可用；独立版的 tc 快捷命令不会用于限速。
     if [ -z "$TC_BIN" ]; then
@@ -299,6 +368,7 @@ validate_config() {
 # 读取配置
 read_config() {
     if [ -f "$CONFIG_FILE" ]; then
+        chmod 600 "$CONFIG_FILE" 2>/dev/null || true
         # shellcheck disable=SC1090
         source "$CONFIG_FILE" || return 1
         validate_config
@@ -320,6 +390,7 @@ LIMIT_SPEED=${LIMIT_SPEED:-20}
 MAIN_INTERFACE=$MAIN_INTERFACE
 LIMIT_MODE=$LIMIT_MODE
 EOF
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
     echo "$(date '+%Y-%m-%d %H:%M:%S') 配置已更新"| tee -a "$LOG_FILE"
 }
 
@@ -701,6 +772,10 @@ tc_state_interface() {
     tc_state_value "INTERFACE"
 }
 
+current_boot_id() {
+    cat /proc/sys/kernel/random/boot_id 2>/dev/null || true
+}
+
 write_tc_state() {
     local interface="$1"
     local speed="$2"
@@ -712,6 +787,7 @@ write_tc_state() {
         printf 'INTERFACE=%s\n' "$interface"
         printf 'LIMIT_SPEED=%s\n' "$speed"
         printf 'QDISC_LINE=%s\n' "$qdisc_line"
+        printf 'BOOT_ID=%s\n' "$(current_boot_id)"
         printf 'PERIOD_START=%s\n' "$period_start"
         printf 'APPLIED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     } > "$TC_STATE_FILE"
@@ -720,7 +796,7 @@ write_tc_state() {
 
 apply_tc_limit() {
     local speed="$1"
-    local existing_qdisc state_interface
+    local existing_qdisc state_interface state_qdisc_line state_speed state_boot_id boot_id
 
     if [ -z "$TC_BIN" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 未找到系统 tc 命令，无法执行限速" | tee -a "$LOG_FILE"
@@ -732,12 +808,36 @@ apply_tc_limit() {
 
     if [ -n "$state_interface" ] && [ "$state_interface" != "$MAIN_INTERFACE" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') TC 状态文件属于接口 $state_interface，当前配置接口为 $MAIN_INTERFACE，将先清理旧接口限速。" | tee -a "$LOG_FILE"
-        clear_owned_tc_rules "配置接口已变更"
+        if ! clear_owned_tc_rules "配置接口已变更"; then
+            return 1
+        fi
         existing_qdisc=$(tc_root_qdisc "$MAIN_INTERFACE")
         state_interface=""
     fi
 
-    if [ -z "$state_interface" ]; then
+    if [ -n "$state_interface" ]; then
+        if echo "$existing_qdisc" | grep -q " tbf "; then
+            state_qdisc_line=$(tc_state_value "QDISC_LINE")
+            state_speed=$(tc_state_value "LIMIT_SPEED")
+            if [ -n "$state_qdisc_line" ] && [ "$existing_qdisc" != "$state_qdisc_line" ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 当前 tbf 与本脚本状态记录不一致，保留现有规则和状态标记并停止自动覆盖。" | tee -a "$LOG_FILE"
+                return 1
+            fi
+            if [ -z "$state_qdisc_line" ] && { ! [[ "$state_speed" =~ ^[0-9]+$ ]] || ! echo "$existing_qdisc" | grep -Eq "rate[[:space:]]+${state_speed}[Kk]bit"; }; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 当前 tbf 与旧状态记录不一致，保留现有规则和状态标记并停止自动覆盖。" | tee -a "$LOG_FILE"
+                return 1
+            fi
+        else
+            state_boot_id=$(tc_state_value "BOOT_ID")
+            boot_id=$(current_boot_id)
+            if ! is_default_qdisc_line "$existing_qdisc" \
+                || { [ -n "$state_boot_id" ] && [ -n "$boot_id" ] && [ "$state_boot_id" = "$boot_id" ]; }; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 本脚本应用限速后 qdisc 已被外部修改：$existing_qdisc，保留现有网络策略和状态标记并停止自动覆盖。" | tee -a "$LOG_FILE"
+                return 1
+            fi
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到系统已重启且本脚本旧 tbf 不再存在，将按当前周期重新应用限速。" | tee -a "$LOG_FILE"
+        fi
+    else
         if echo "$existing_qdisc" | grep -q " tbf "; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到接口 $MAIN_INTERFACE 已存在 tbf 规则且无本脚本状态标记，跳过限速以避免覆盖系统原有限速。" | tee -a "$LOG_FILE"
             return 1
@@ -800,8 +900,16 @@ clear_owned_tc_rules() {
                 return 0
             fi
         fi
-        "$TC_BIN" qdisc del dev "$state_interface" root 2>/dev/null || true
-        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：已清理本脚本在接口 $state_interface 上应用的 TC 限速。" | tee -a "$LOG_FILE"
+        if "$TC_BIN" qdisc del dev "$state_interface" root 2>/dev/null; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：已清理本脚本在接口 $state_interface 上应用的 TC 限速。" | tee -a "$LOG_FILE"
+        else
+            qdisc_line=$(tc_root_qdisc "$state_interface")
+            if echo "$qdisc_line" | grep -q " tbf "; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：TC 限速清理失败，保留状态文件以便下次重试。" | tee -a "$LOG_FILE"
+                return 1
+            fi
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：接口已不存在 tbf 规则。" | tee -a "$LOG_FILE"
+        fi
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：接口 $state_interface 当前没有 tbf 规则，仅移除本脚本状态文件。" | tee -a "$LOG_FILE"
     fi
@@ -842,29 +950,51 @@ check_and_limit_traffic() {
             shutdown -h +1 "流量超出限制，系统将在 1 分钟后关机"
         fi
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 流量正常，检查是否需要清理本脚本限速" | tee -a "$LOG_FILE"
-        clear_owned_tc_rules "流量正常"
+        if ! clear_owned_tc_rules "流量正常"; then
+            return 1
+        fi
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 流量正常，已完成限速状态检查" | tee -a "$LOG_FILE"
     fi
 }
 
 
 # 检查是否需要重置限制
 check_reset_limit() {
-    local current_date=$(date +%Y-%m-%d)
-    local period_start=$(get_period_start_date)
-    
+    local current_date period_start last_reset_period tmp_file
+
+    current_date=$(date +%Y-%m-%d)
+    period_start=$(get_period_start_date)
+
     if [[ "$current_date" == "$period_start" ]]; then
+        last_reset_period=$(cat "$PERIOD_STATE_FILE" 2>/dev/null || true)
+        if [ "$last_reset_period" = "$period_start" ]; then
+            return 0
+        fi
+
+        if ! clear_owned_tc_rules "新的流量周期开始"; then
+            return 1
+        fi
+
+        tmp_file="${PERIOD_STATE_FILE}.tmp.$$"
+        printf '%s\n' "$period_start" > "$tmp_file" || return 1
+        chmod 600 "$tmp_file" 2>/dev/null || true
+        mv -f "$tmp_file" "$PERIOD_STATE_FILE"
         echo "$(date '+%Y-%m-%d %H:%M:%S') 新的流量周期开始，重置限制"| tee -a "$LOG_FILE"
-        clear_owned_tc_rules "新的流量周期开始"
     fi
+    return 0
 }
 
 setup_crontab() {
-    # 删除旧的脚本任务（如果存在）
-    crontab -l 2>/dev/null | grep -v -F "$SCRIPT_PATH" | crontab -
+    local current_crontab new_crontab cron_entry
 
-    # 添加新的脚本任务
-    (crontab -l 2>/dev/null; echo "* * * * * $SCRIPT_PATH --run # TrafficCop-Lite Monitor") | crontab -
+    current_crontab="$(crontab -l 2>/dev/null || true)"
+    new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
+    cron_entry="* * * * * $SCRIPT_PATH --run # TrafficCop-Lite Monitor"
+
+    if ! { printf '%s\n' "$new_crontab"; printf '%s\n' "$cron_entry"; } | sed '/^[[:space:]]*$/d' | crontab -; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') Crontab 设置失败" | tee -a "$LOG_FILE"
+        return 1
+    fi
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') Crontab 已设置，每分钟运行一次"| tee -a "$LOG_FILE"
 }
@@ -880,6 +1010,7 @@ main() {
 
     # 创建锁文件（如果不存在）
     touch "${LOCK_FILE}"
+    chmod 600 "$LOCK_FILE" 2>/dev/null || true
 
     # 尝试获取文件锁。cron 模式拿不到锁直接退出，避免打断正在进行的交互配置。
     exec 9>"${LOCK_FILE}"
@@ -887,7 +1018,7 @@ main() {
         echo "$(date '+%Y-%m-%d %H:%M:%S') 另一个脚本实例正在运行，退出。" | tee -a "$LOG_FILE"
         exit 1
     fi
-    trap 'flock -u 9 2>/dev/null || true; rm -f "$LOCK_FILE"' EXIT
+    trap 'trim_log_file "$LOG_FILE" "$LOG_MAX_LINES"; flock -u 9 2>/dev/null || true' EXIT
 
     # 检查是否以 --run 模式运行
     if [ "$1" = "--run" ] || [ "$1" = "--cron" ]; then
@@ -897,10 +1028,11 @@ main() {
                 echo "$(date '+%Y-%m-%d %H:%M:%S') 监控已标记为禁用，跳过自动检查" | tee -a "$LOG_FILE"
                 return
             fi
-            check_reset_limit
+            check_reset_limit || return 1
             check_and_limit_traffic
         else
             echo "$(date '+%Y-%m-%d %H:%M:%S') 配置文件读取失败，请检查配置" | tee -a "$LOG_FILE"
+            return 1
         fi
         return
     fi
@@ -931,7 +1063,7 @@ main() {
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') 开始修改配置..." | tee -a "$LOG_FILE"
         initial_config
-        setup_crontab
+        setup_crontab || return 1
         echo "$(date '+%Y-%m-%d %H:%M:%S') 配置已更新，脚本将每分钟自动运行一次" | tee -a "$LOG_FILE"
     fi
 else
@@ -945,7 +1077,7 @@ fi
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') 开始初始化配置..." | tee -a "$LOG_FILE"
         initial_config
-        setup_crontab
+        setup_crontab || return 1
         echo "$(date '+%Y-%m-%d %H:%M:%S') 初始配置完成，脚本将每分钟自动运行一次" | tee -a "$LOG_FILE"
     fi
 
@@ -966,6 +1098,7 @@ fi
         fi
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') 配置文件读取失败，请检查配置" | tee -a "$LOG_FILE"
+        return 1
     fi
 }
 
@@ -973,7 +1106,6 @@ fi
 
 # 执行主函数
 main "$@"
-
-
-
+exit_code=$?
 echo "-----------------------------------------------------"| tee -a "$LOG_FILE"
+exit "$exit_code"

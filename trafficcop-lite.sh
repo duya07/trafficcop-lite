@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.0.3"
-LAST_UPDATE="2026-06-28"
+SCRIPT_VERSION="1.0.4"
+LAST_UPDATE="2026-07-12"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
@@ -63,6 +63,12 @@ check_root() {
 
 ensure_work_dir() {
     mkdir -p "$WORK_DIR"
+    chmod 700 "$WORK_DIR" 2>/dev/null || true
+    [ ! -f "$WORK_DIR/traffic_monitor_config.txt" ] || chmod 600 "$WORK_DIR/traffic_monitor_config.txt" 2>/dev/null || true
+    [ ! -f "$WORK_DIR/tg_notifier_config.txt" ] || chmod 600 "$WORK_DIR/tg_notifier_config.txt" 2>/dev/null || true
+    [ ! -f "$TC_STATE_FILE" ] || chmod 600 "$TC_STATE_FILE" 2>/dev/null || true
+    [ ! -f "$WORK_DIR/last_reset_period" ] || chmod 600 "$WORK_DIR/last_reset_period" 2>/dev/null || true
+    [ ! -f "$WORK_DIR/last_traffic_notification" ] || chmod 600 "$WORK_DIR/last_traffic_notification" 2>/dev/null || true
 }
 
 copy_self_if_needed() {
@@ -251,7 +257,7 @@ update_scripts() {
     local update_base="${1:-$RAW_BASE}"
     local scripts=("trafficcop-lite.sh" "$MONITOR_SCRIPT" "$TELEGRAM_SCRIPT" "$MACHINE_LIMIT_SCRIPT")
     local temp_files=()
-    local script_name tmp_file url backup_dir
+    local script_name restore_name tmp_file url backup_dir
 
     ensure_work_dir
     echo -e "${CYAN}正在更新 TrafficCop-Lite 脚本...${NC}"
@@ -286,18 +292,32 @@ update_scripts() {
     done
 
     backup_dir="$WORK_DIR/backups/scripts-$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$backup_dir"
+    if ! mkdir -p "$backup_dir"; then
+        echo -e "${RED}无法创建脚本备份目录，已取消更新。${NC}"
+        rm -f "${temp_files[@]}" 2>/dev/null || true
+        return 1
+    fi
 
     for script_name in "${scripts[@]}"; do
         if [ -f "$WORK_DIR/$script_name" ]; then
-            cp -a "$WORK_DIR/$script_name" "$backup_dir/"
+            if ! cp -a "$WORK_DIR/$script_name" "$backup_dir/"; then
+                echo -e "${RED}备份 $script_name 失败，已取消更新。${NC}"
+                rm -f "${temp_files[@]}" 2>/dev/null || true
+                return 1
+            fi
         fi
     done
 
     for script_name in "${scripts[@]}"; do
         tmp_file="$WORK_DIR/.${script_name}.new.$$"
-        chmod +x "$tmp_file"
-        mv -f "$tmp_file" "$WORK_DIR/$script_name"
+        if ! chmod +x "$tmp_file" || ! mv -f "$tmp_file" "$WORK_DIR/$script_name"; then
+            echo -e "${RED}替换 $script_name 失败，正在恢复更新前脚本。${NC}"
+            for restore_name in "${scripts[@]}"; do
+                [ ! -f "$backup_dir/$restore_name" ] || cp -a "$backup_dir/$restore_name" "$WORK_DIR/$restore_name"
+            done
+            rm -f "${temp_files[@]}" 2>/dev/null || true
+            return 1
+        fi
         echo -e "${GREEN}✓ 已更新 $script_name${NC}"
     done
 
@@ -764,14 +784,18 @@ view_config() {
 }
 
 remove_lite_cron() {
-    local current_crontab
+    local current_crontab filtered_crontab
     current_crontab="$(crontab -l 2>/dev/null || true)"
     if [ -n "$current_crontab" ]; then
-        printf '%s\n' "$current_crontab" \
+        filtered_crontab="$(printf '%s\n' "$current_crontab" \
             | grep -v -F "$WORK_DIR/$MONITOR_SCRIPT" \
-            | grep -v -F "$WORK_DIR/$TELEGRAM_SCRIPT" \
-            | crontab - 2>/dev/null || true
+            | grep -v -F "$WORK_DIR/$TELEGRAM_SCRIPT" || true)"
+        if ! printf '%s\n' "$filtered_crontab" | crontab - 2>/dev/null; then
+            echo -e "${RED}移除独立版 crontab 条目失败，已保留安装目录。${NC}"
+            return 1
+        fi
     fi
+    return 0
 }
 
 stop_lite_processes() {
@@ -800,7 +824,8 @@ clear_lite_tc_rules_interactive() {
 
     if [ -z "$TC_BIN" ]; then
         echo -e "${YELLOW}未找到系统 tc 命令，跳过 TC 规则检查。${NC}"
-        return
+        [ -f "$TC_STATE_FILE" ] && return 1
+        return 0
     fi
 
     if [ -f "$TC_STATE_FILE" ]; then
@@ -832,8 +857,16 @@ clear_lite_tc_rules_interactive() {
                     return
                 fi
             fi
-            "$TC_BIN" qdisc del dev "$state_interface" root 2>/dev/null || true
-            echo "✓ 已清理本脚本在接口 $state_interface 上应用的 TC 限速"
+            if "$TC_BIN" qdisc del dev "$state_interface" root 2>/dev/null; then
+                echo "✓ 已清理本脚本在接口 $state_interface 上应用的 TC 限速"
+            else
+                qdisc_line="$("$TC_BIN" qdisc show dev "$state_interface" root 2>/dev/null | head -n 1)"
+                if echo "$qdisc_line" | grep -q " tbf "; then
+                    echo -e "${RED}清理接口 $state_interface 的 TC 限速失败，已保留状态文件以便重试。${NC}"
+                    return 1
+                fi
+                echo "✓ 接口 $state_interface 已不存在 tbf 规则"
+            fi
         else
             echo "✓ 接口 $state_interface 当前没有本脚本可清理的 tbf 规则"
         fi
@@ -850,8 +883,12 @@ clear_lite_tc_rules_interactive() {
     echo -e "${YELLOW}Linux 无法可靠区分该规则是否由本脚本创建，默认不清除以免影响系统其他限速。${NC}"
     read -r -p "确认清除该接口 root TC 规则？[y/N]: " confirm
     if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        "$TC_BIN" qdisc del dev "$interface" root 2>/dev/null || true
-        echo "✓ 已尝试清除 TC 规则"
+        if "$TC_BIN" qdisc del dev "$interface" root 2>/dev/null; then
+            echo "✓ 已清除 TC 规则"
+        else
+            echo -e "${RED}清除 TC 规则失败，请检查接口和系统 tc 状态。${NC}"
+            return 1
+        fi
     else
         echo "已保留 TC 规则"
     fi
@@ -870,18 +907,29 @@ cancel_shutdown_interactive() {
 }
 
 stop_all_services() {
+    local has_error=false
+
     echo -e "${CYAN}正在停止 TrafficCop-Lite 服务...${NC}"
     stop_lite_processes
     echo "✓ 已停止独立版监控/通知进程"
 
-    remove_lite_cron
-    echo "✓ 已移除独立版 crontab 条目"
+    if remove_lite_cron; then
+        echo "✓ 已移除独立版 crontab 条目"
+    else
+        has_error=true
+    fi
 
-    clear_lite_tc_rules_interactive
+    clear_lite_tc_rules_interactive || has_error=true
     cancel_shutdown_interactive
 
-    echo -e "${GREEN}独立版服务停止流程完成。${NC}"
+    if $has_error; then
+        echo -e "${RED}停止流程未完全成功；安装目录和状态文件已保留，请查看上方错误。${NC}"
+    else
+        echo -e "${GREEN}独立版服务停止流程完成。${NC}"
+    fi
     pause
+    $has_error && return 1
+    return 0
 }
 
 uninstall_lite() {
@@ -899,8 +947,16 @@ uninstall_lite() {
     fi
 
     stop_lite_processes
-    remove_lite_cron
-    clear_lite_tc_rules_interactive
+    if ! remove_lite_cron; then
+        echo -e "${RED}卸载已中止：无法移除独立版 crontab 条目。${NC}"
+        pause
+        return 1
+    fi
+    if ! clear_lite_tc_rules_interactive; then
+        echo -e "${RED}卸载已中止：TC 限速未能安全清理，状态文件已保留。${NC}"
+        pause
+        return 1
+    fi
     cancel_shutdown_interactive
 
     if [ -d "$WORK_DIR" ]; then
@@ -908,10 +964,24 @@ uninstall_lite() {
         if [[ ! "$keep_backup" =~ ^[Nn]$ ]]; then
             local backup_dir
             backup_dir="/etc/trafficcop-lite-backup-$(date +%Y%m%d-%H%M%S)"
-            cp -a "$WORK_DIR" "$backup_dir"
+            mkdir -m 700 "$backup_dir" || {
+                echo -e "${RED}创建备份目录失败，卸载已中止。${NC}"
+                pause
+                return 1
+            }
+            if ! cp -a "$WORK_DIR/." "$backup_dir/"; then
+                echo -e "${RED}配置和日志备份失败，卸载已中止；未删除工作目录。${NC}"
+                pause
+                return 1
+            fi
+            chmod 700 "$backup_dir" 2>/dev/null || true
             echo "✓ 已备份到 $backup_dir"
         fi
-        rm -rf "$WORK_DIR"
+        if ! rm -rf "$WORK_DIR"; then
+            echo -e "${RED}删除 $WORK_DIR 失败，请检查文件系统状态。${NC}"
+            pause
+            return 1
+        fi
         echo "✓ 已删除 $WORK_DIR"
     else
         echo "独立版工作目录不存在，无需删除。"
@@ -964,16 +1034,18 @@ main() {
     case "${1:-}" in
         --install)
             install_shortcut
+            install_status=$?
+            [ "$install_status" -eq 0 ] || exit "$install_status"
             echo -e "${GREEN}安装完成。以后可执行：sudo ntc${NC}"
             exit 0
             ;;
         --uninstall)
             uninstall_lite
-            exit 0
+            exit $?
             ;;
         --stop)
             stop_all_services
-            exit 0
+            exit $?
             ;;
         --logs)
             view_logs
@@ -995,7 +1067,7 @@ main() {
             ;;
     esac
 
-    install_shortcut
+    install_shortcut || exit 1
 
     while true; do
         show_main_menu

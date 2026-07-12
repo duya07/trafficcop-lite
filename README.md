@@ -15,12 +15,15 @@
 ## 本仓库主要改动
 
 1. 独立工作目录改为 `/etc/trafficcop-lite`。
-2. 主菜单仅保留流量监控、Telegram 通知、机器限速、日志、配置、停止服务和卸载。
+2. 主菜单仅保留流量监控、Telegram 通知、机器限速、日志、配置、停止服务、更新和卸载。
 3. 年度统计周期支持选择起始月份，不再只能从每年 1 月开始。
 4. 安装后提供快捷命令 `ntc`，可直接执行 `sudo ntc` 打开管理菜单。
 5. 脚本内部调用系统限速命令时使用 `/usr/sbin/tc` 等原始路径，避免与 Linux 自带 `tc` 限速命令冲突。
 6. 停止服务和卸载时只处理 `/etc/trafficcop-lite` 相关进程、crontab 和文件，不删除上游默认目录 `/root/TrafficCop`。
 7. 卸载会先按配置检查 TC 限速和计划关机，再备份配置和日志到 `/etc/trafficcop-lite-backup-时间戳/`。
+8. TC 规则只有在当前状态与本脚本记录一致时才会自动更新或删除；清理失败会保留状态并中止卸载。
+9. Telegram 配置和状态文件使用 `600` 权限，通知发送失败会保留旧状态并在下次任务重试。
+10. 周期重置每个周期只执行一次，监控日志默认保留最近 5000 行。
 
 ## 下载方式说明
 
@@ -28,6 +31,8 @@
   使用 `https://raw.githubusercontent.com/...`
 - 国内优先（代理加速）  
   使用 `https://v6.gh-proxy.org/https://raw.githubusercontent.com/...`
+
+国内优先线路由第三方代理提供。脚本将以 root 权限运行，安全性要求较高时请优先使用 GitHub 直连。
 
 ---
 
@@ -126,6 +131,7 @@ sudo env RAW_BASE="https://v6.gh-proxy.org/https://raw.githubusercontent.com/duy
 
 - 只覆盖 `/etc/trafficcop-lite` 下的脚本文件。
 - 不覆盖 `traffic_monitor_config.txt`、`tg_notifier_config.txt`、日志和 crontab。
+- 兼容旧配置；旧配置没有 `PERIOD_START_MONTH` 时仍按 1 月起算。
 - 下载到临时文件并通过 `bash -n` 语法检查后才替换。
 - 旧脚本会备份到 `/etc/trafficcop-lite/backups/scripts-时间戳/`。
 - 更新完成后建议重新执行 `sudo ntc` 进入新版菜单。
@@ -161,6 +167,7 @@ sudo bash /etc/trafficcop-lite/trafficcop-lite.sh --uninstall
 - 清理旧版 `/usr/local/bin/ncl` 和 `/usr/local/bin/tc` 快捷命令（仅当它们指向本脚本时）。
 - 清理独立版 crontab 条目。
 - 删除目录前会按当前配置检查 TC 限速规则和计划关机，并要求确认后处理。
+- TC 或 crontab 清理失败时会中止删除目录，避免留下失去状态记录的限速或定时任务。
 - 默认备份配置和日志到 `/etc/trafficcop-lite-backup-时间戳/`。
 - 不卸载系统依赖包。
 - 不删除上游默认目录 `/root/TrafficCop`。
@@ -179,7 +186,11 @@ sudo bash /etc/trafficcop-lite/trafficcop-lite.sh --uninstall
 ├── tg_notifier_config.txt
 ├── traffic_monitor.log
 ├── tg_notifier_cron.log
-└── tc_limit_state
+├── traffic_monitor.lock
+├── tg_notifier.lock
+├── tc_limit_state
+├── last_reset_period
+└── last_traffic_notification
 ```
 
 快捷命令:
@@ -198,6 +209,9 @@ sudo /usr/sbin/tc qdisc show
 
 - 脚本会安装依赖、写入 crontab，并可能配置 TC 限速或关机模式，请先在测试机确认。
 - TC 模式会用 `/etc/trafficcop-lite/tc_limit_state` 标记本脚本应用过的限速；自动恢复只清理带有该标记的规则，未标记的系统原有 `tbf` 规则会被保留或要求确认。
+- 若状态记录与当前 qdisc 不一致，脚本会按外部规则处理并停止自动覆盖。
 - 停止服务/卸载时，未标记的 TC 规则和计划关机会要求确认后才处理。
 - Telegram cron 日志默认保留最近 2000 行；如需详细调试，可临时设置 `TG_DEBUG=true`。
+- 流量监控日志默认保留最近 5000 行，可通过 `LOG_MAX_LINES` 调整。
+- Debian/Ubuntu、RHEL 系、Alpine 和 Arch 系会按已识别的包管理器尝试安装依赖；无法自动启动 cron 或 vnStat 服务时会给出明确提示，请按系统服务管理方式确认其已运行。
 - 网络受限时，优先使用带 `v6.gh-proxy.org` 的命令。

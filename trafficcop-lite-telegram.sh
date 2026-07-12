@@ -1,8 +1,14 @@
 #!/bin/bash
 
+if [ "$(id -u)" -ne 0 ]; then
+    echo "请使用 root 权限运行此脚本。"
+    exit 1
+fi
+
 # 设置新的工作目录
 WORK_DIR="/etc/trafficcop-lite"
 mkdir -p "$WORK_DIR"
+chmod 700 "$WORK_DIR" 2>/dev/null || true
 
 # 导入端口流量辅助函数
 if [ -f "$WORK_DIR/port_traffic_helper.sh" ]; then
@@ -13,11 +19,13 @@ fi
 CONFIG_FILE="$WORK_DIR/tg_notifier_config.txt"
 LOG_FILE="$WORK_DIR/traffic_monitor.log"
 LAST_NOTIFICATION_FILE="$WORK_DIR/last_traffic_notification"
+PERIOD_STATE_FILE="$WORK_DIR/last_reset_period"
 SCRIPT_PATH="$WORK_DIR/trafficcop-lite-telegram.sh"
 CRON_LOG="$WORK_DIR/tg_notifier_cron.log"
+TG_LOCK_FILE="$WORK_DIR/tg_notifier.lock"
 CRON_LOG_MAX_LINES="${CRON_LOG_MAX_LINES:-2000}"
 TG_DEBUG="${TG_DEBUG:-false}"
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 
 trim_log_file() {
     local file="$1"
@@ -73,16 +81,31 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') : 当前版本：$SCRIPT_VERSION" | tee -a "$
 
 # 检查是否有同名的 crontab 正在执行:
 check_running() {
-    # 新增：添加日志
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 开始检查是否有其他实例运行" >> "$CRON_LOG"
-    if pidof -x "$(basename "$0")" -o $$ > /dev/null; then
-        # 新增：添加日志
+    exec 8>"$TG_LOCK_FILE"
+    chmod 600 "$TG_LOCK_FILE" 2>/dev/null || true
+    if ! flock -n 8; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') : 另一个脚本实例正在运行，退出脚本" >> "$CRON_LOG"
         echo "另一个脚本实例正在运行，退出脚本"
         exit 1
     fi
-    # 新增：添加日志
+    trap 'flock -u 8 2>/dev/null || true; trim_log_file "$CRON_LOG" "$CRON_LOG_MAX_LINES"' EXIT
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 没有其他实例运行，继续执行" >> "$CRON_LOG"
+}
+
+check_runtime_dependencies() {
+    local command_name
+    local missing_commands=()
+
+    for command_name in curl crontab flock tac sed awk; do
+        command -v "$command_name" >/dev/null 2>&1 || missing_commands+=("$command_name")
+    done
+    if [ "${#missing_commands[@]}" -gt 0 ]; then
+        echo "缺少运行依赖：${missing_commands[*]}"
+        echo "请先通过主菜单选项 1 完成流量监控依赖安装。"
+        return 1
+    fi
+    return 0
 }
 
 
@@ -204,6 +227,8 @@ read_config() {
         return 1
     fi
 
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+
     # 读取配置文件
     source "$CONFIG_FILE"
 
@@ -232,6 +257,7 @@ write_config() {
         write_config_value "DAILY_REPORT_TIME" "$DAILY_REPORT_TIME"
         write_config_value "MACHINE_NAME" "$MACHINE_NAME"
     } > "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
     echo "配置已保存到 $CONFIG_FILE"
 }
 
@@ -331,12 +357,24 @@ initial_config() {
     read_config
 }
 
+telegram_send_message() {
+    local message="$1"
+    local response
+
+    if ! response=$(curl -fsS --connect-timeout 10 --max-time 30 -X POST \
+        "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+        -d "chat_id=$CHAT_ID" \
+        -d "text=$message" 2>/dev/null); then
+        return 1
+    fi
+    echo "$response" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'
+}
+
 # 发送限速警告
 send_throttle_warning() {
-    local url="https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
     local port_summary=$(get_port_traffic_summary_for_tg)
     local message="⚠️ [${MACHINE_NAME}]限速警告：流量已达到限制，已启动 TC 模式限速。${port_summary}"
-    curl -s -X POST "$url" -d "chat_id=$CHAT_ID" -d "text=$message"
+    telegram_send_message "$message"
 }
 
 # 获取端口流量摘要（专为Telegram格式化）
@@ -400,25 +438,22 @@ get_port_traffic_summary_for_tg() {
 
 # 发送限速解除通知
 send_throttle_lifted() {
-    local url="https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
     local port_summary=$(get_port_traffic_summary_for_tg)
     local message="✅ [${MACHINE_NAME}]限速解除：流量已恢复正常，所有限制已清除。${port_summary}"
-    curl -s -X POST "$url" -d "chat_id=$CHAT_ID" -d "text=$message"
+    telegram_send_message "$message"
 }
 
 # 发送新周期开始通知
 send_new_cycle_notification() {
-    local url="https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
     local message="🔄 [${MACHINE_NAME}]新周期开始：新的流量统计周期已开始，之前的限速（如果有）已自动解除。"
-    curl -s -X POST "$url" -d "chat_id=$CHAT_ID" -d "text=$message"
+    telegram_send_message "$message"
 }
 
 # 发送关机警告
 send_shutdown_warning() {
-    local url="https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
     local port_summary=$(get_port_traffic_summary_for_tg)
     local message="🚨 [${MACHINE_NAME}]关机警告：流量已达到严重限制，系统将在 1 分钟后关机！${port_summary}"
-    curl -s -X POST "$url" -d "chat_id=$CHAT_ID" -d "text=$message"
+    telegram_send_message "$message"
 }
 
 
@@ -426,75 +461,128 @@ send_shutdown_warning() {
 
 test_telegram_notification() {
     local message="🔔 [${MACHINE_NAME}]这是一条测试消息。如果您收到这条消息，说明Telegram通知功能正常工作。"
-    local response
-    response=$(curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-        -d "chat_id=${CHAT_ID}" \
-        -d "text=${message}" \
-        -d "disable_notification=true")
-    
-    if echo "$response" | grep -q '"ok":true'; then
+
+    if telegram_send_message "$message"; then
         echo "✅ [${MACHINE_NAME}]测试消息已成功发送，请检查您的Telegram。"
     else
         echo "❌ [${MACHINE_NAME}]发送测试消息失败。请检查您的BOT_TOKEN和CHAT_ID设置。"
     fi
 }
 
-check_and_notify() { 
-    echo "$(date '+%Y-%m-%d %H:%M:%S') : 开始检查流量状态..."| tee -a "$CRON_LOG"
-    
+read_notification_state() {
+    LAST_STATUS=""
+    LAST_CYCLE_EVENT=""
+
+    [ -f "$LAST_NOTIFICATION_FILE" ] || return 0
+    if grep -q '^STATUS=' "$LAST_NOTIFICATION_FILE" 2>/dev/null; then
+        LAST_STATUS=$(grep '^STATUS=' "$LAST_NOTIFICATION_FILE" | tail -n 1 | cut -d'=' -f2-)
+        LAST_CYCLE_EVENT=$(grep '^CYCLE_EVENT=' "$LAST_NOTIFICATION_FILE" | tail -n 1 | cut -d'=' -f2-)
+    else
+        LAST_STATUS=$(tail -n 1 "$LAST_NOTIFICATION_FILE" | cut -d' ' -f3-)
+    fi
+}
+
+write_notification_state() {
+    local status="$1"
+    local cycle_event="$2"
+    local tmp_file="${LAST_NOTIFICATION_FILE}.tmp.$$"
+
+    {
+        printf 'STATUS=%s\n' "$status"
+        printf 'CYCLE_EVENT=%s\n' "$cycle_event"
+        printf 'UPDATED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    } > "$tmp_file" || return 1
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$LAST_NOTIFICATION_FILE"
+}
+
+check_and_notify() {
     local current_status="未知"
-    local current_time=$(date '+%Y-%m-%d %H:%M:%S')
     local relevant_log=""
-    
-    # 从后往前读取日志文件，找到第一个包含相关信息的行
-    relevant_log=$(tac "$LOG_FILE" | grep -m 1 -E "流量超出限制|使用 TC 模式限速|新的流量周期开始|流量正常")
-    
-    # 记录相关的日志内容
-    echo "$(date '+%Y-%m-%d %H:%M:%S') : 相关的日志内容: $relevant_log"| tee -a "$CRON_LOG"
-    
-    # 确定当前状态
+    local cycle_event=""
+    local next_status next_cycle effective_last_status
+    local cycle_failed=false
+    local had_notification_state=false
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') : 开始检查流量状态..."| tee -a "$CRON_LOG"
+
+    relevant_log=$(tac "$LOG_FILE" 2>/dev/null | grep -m 1 -E "TC 限速规则已应用/更新|流量超出限制，系统将在 1 分钟后关机|流量正常")
+    cycle_event=$(cat "$PERIOD_STATE_FILE" 2>/dev/null || true)
+
     if echo "$relevant_log" | grep -q "流量超出限制，系统将在 1 分钟后关机"; then
         current_status="关机"
-    elif echo "$relevant_log" | grep -q "流量超出限制"; then
+    elif echo "$relevant_log" | grep -q "TC 限速规则已应用/更新"; then
         current_status="限速"
-    elif echo "$relevant_log" | grep -q "新的流量周期开始，重置限制"; then
-        current_status="新周期"
     elif echo "$relevant_log" | grep -q "流量正常"; then
         current_status="正常"
     fi
-    
-    echo "$(date '+%Y-%m-%d %H:%M:%S') : 当前检测到的状态: $current_status"| tee -a "$CRON_LOG"
-    
-    local last_status=""
-    if [ -f "$LAST_NOTIFICATION_FILE" ]; then
-        last_status=$(tail -n 1 "$LAST_NOTIFICATION_FILE" | cut -d' ' -f3-)
+
+    [ -f "$LAST_NOTIFICATION_FILE" ] && had_notification_state=true
+    read_notification_state
+    next_status="$LAST_STATUS"
+    next_cycle="$LAST_CYCLE_EVENT"
+    effective_last_status="$LAST_STATUS"
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') : 当前状态=$current_status，上次状态=${LAST_STATUS:-空}" | tee -a "$CRON_LOG"
+
+    if ! $had_notification_state && [ -n "$cycle_event" ]; then
+        next_cycle="$cycle_event"
+    elif [ -n "$cycle_event" ] && [ "$cycle_event" != "$LAST_CYCLE_EVENT" ]; then
+        if send_new_cycle_notification; then
+            next_cycle="$cycle_event"
+            next_status="正常"
+            effective_last_status="正常"
+            log_cron "新周期通知发送成功"
+        else
+            cycle_failed=true
+            log_cron "新周期通知发送失败，将在下次任务重试"
+        fi
     fi
-    
-    echo "$(date '+%Y-%m-%d %H:%M:%S') : 上次记录的状态: $last_status"| tee -a "$CRON_LOG"
-    
-    # 根据状态调用相应的通知函数
-    if [ "$current_status" = "限速" ] && [ "$last_status" != "限速" ]; then
-        send_throttle_warning
-        echo "$(date '+%Y-%m-%d %H:%M:%S') : 已调用 send_throttle_warning"| tee -a "$CRON_LOG"
-    elif [ "$current_status" = "正常" ] && [ "$last_status" = "限速" ]; then
-        send_throttle_lifted
-        echo "$(date '+%Y-%m-%d %H:%M:%S') : 已调用 send_throttle_lifted"| tee -a "$CRON_LOG"
-    elif [ "$current_status" = "新周期" ]; then
-        send_new_cycle_notification
-        echo "$(date '+%Y-%m-%d %H:%M:%S') : 已调用 send_new_cycle_notification"| tee -a "$CRON_LOG"
-    elif [ "$current_status" = "关机" ]; then
-        send_shutdown_warning
-        echo "$(date '+%Y-%m-%d %H:%M:%S') : 已调用 send_shutdown_warning"| tee -a "$CRON_LOG"
-    elif [ "$current_status" = "未知" ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') : 无法识别当前状态，不发送通知"| tee -a "$CRON_LOG"
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') : 无需发送通知"| tee -a "$CRON_LOG"
+
+    if ! $cycle_failed; then
+        case "$current_status" in
+            限速)
+                if [ "$effective_last_status" != "限速" ]; then
+                    if send_throttle_warning; then
+                        next_status="限速"
+                        log_cron "限速通知发送成功"
+                    else
+                        log_cron "限速通知发送失败，将在下次任务重试"
+                    fi
+                fi
+                ;;
+            关机)
+                if [ "$effective_last_status" != "关机" ]; then
+                    if send_shutdown_warning; then
+                        next_status="关机"
+                        log_cron "关机通知发送成功"
+                    else
+                        log_cron "关机通知发送失败，将在下次任务重试"
+                    fi
+                fi
+                ;;
+            正常)
+                if [ "$effective_last_status" = "限速" ] || [ "$effective_last_status" = "关机" ]; then
+                    if send_throttle_lifted; then
+                        next_status="正常"
+                        log_cron "限速解除通知发送成功"
+                    else
+                        log_cron "限速解除通知发送失败，将在下次任务重试"
+                    fi
+                elif [ -z "$effective_last_status" ]; then
+                    next_status="正常"
+                fi
+                ;;
+            *)
+                log_cron "无法识别当前状态，不发送通知"
+                ;;
+        esac
     fi
-    
-    # 追加新状态到状态文件
-    echo "$current_time $current_status" >> "$LAST_NOTIFICATION_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') : 已追加新状态到状态文件"| tee -a "$CRON_LOG"
-    
+
+    if ! write_notification_state "$next_status" "$next_cycle"; then
+        log_cron "通知状态文件写入失败"
+        return 1
+    fi
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 流量检查完成。"| tee -a "$CRON_LOG"
 }
 
@@ -504,25 +592,16 @@ check_and_notify() {
 # 设置定时任务
 setup_cron() {
     local correct_entry="* * * * * $SCRIPT_PATH -cron # TrafficCop-Lite Telegram"
-    local current_crontab=$(crontab -l 2>/dev/null)
-    local tg_notifier_entries=$(echo "$current_crontab" | grep -F "$SCRIPT_PATH")
-    local correct_entries_count=$(echo "$tg_notifier_entries" | grep -F "$correct_entry" | wc -l)
+    local current_crontab new_crontab
 
-    if [ "$correct_entries_count" -eq 1 ]; then
-        echo "正确的 crontab 项已存在且只有一个，无需修改。"
-    else
-        # 只删除独立版 Telegram 通知脚本的条目
-        new_crontab=$(echo "$current_crontab" | grep -v -F "$SCRIPT_PATH")
-        
-        # 添加一个正确的条目
-        new_crontab="${new_crontab}
-$correct_entry"
+    current_crontab="$(crontab -l 2>/dev/null || true)"
+    new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
 
-        # 更新 crontab
-        echo "$new_crontab" | crontab -
-
-        echo "已更新 crontab。删除了独立版 Telegram 通知旧条目，并添加了一个每分钟执行的条目。"
+    if ! { printf '%s\n' "$new_crontab"; printf '%s\n' "$correct_entry"; } | sed '/^[[:space:]]*$/d' | crontab -; then
+        echo "更新 Telegram crontab 失败。"
+        return 1
     fi
+    echo "已清理旧条目并设置唯一的 Telegram 每分钟任务。"
 
     # 显示当前的 crontab 内容
     echo "当前的 crontab 内容："
@@ -538,7 +617,7 @@ update_cron_time() {
     read_config
     
     # 重新设置cron任务
-    setup_cron
+    setup_cron || return 1
     
     echo "cron任务时间已更新"
 }
@@ -558,8 +637,13 @@ daily_report() {
         return 1
     fi
 
-    local current_usage=$(echo "$usage_line" | grep -oP '当前使用流量:\s*\K[0-9.]+ [GBMKgbmk]+')
-    local limit=$(echo "$usage_line" | grep -oP '限制流量:\s*\K[0-9.]+ [GBMKgbmk]+')
+    local current_usage limit configured_limit
+    current_usage=$(echo "$usage_line" | sed -n 's/.*当前使用流量:[[:space:]]*\([0-9.][0-9.]*[[:space:]][GBMKgbmk][GBMKgbmk]*\).*/\1/p')
+    limit=$(echo "$usage_line" | sed -n 's/.*限制流量:[[:space:]]*\([0-9.][0-9.]*[[:space:]][GBMKgbmk][GBMKgbmk]*\).*/\1/p')
+    configured_limit=$(grep '^TRAFFIC_LIMIT=' "$WORK_DIR/traffic_monitor_config.txt" 2>/dev/null | tail -n 1 | cut -d'=' -f2-)
+    if [[ "$configured_limit" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        limit="$configured_limit GB"
+    fi
 
     if [[ -z "$current_usage" || -z "$limit" ]]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') : 无法从行中提取流量信息"| tee -a "$CRON_LOG"
@@ -690,18 +774,13 @@ daily_report() {
     
     debug_log "发送到TG的消息长度: ${#message}字符"
 
-    local url="https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
-    local response
-
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 尝试发送Telegram消息"| tee -a "$CRON_LOG"
 
-    response=$(curl -s -X POST "$url" -d "chat_id=$CHAT_ID" -d "text=$message")
-
-    if echo "$response" | grep -q '"ok":true'; then
+    if telegram_send_message "$message"; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') : 每日报告发送成功"| tee -a "$CRON_LOG"
         return 0
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') : 每日报告发送失败. 响应: $response"| tee -a "$CRON_LOG"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') : 每日报告发送失败"| tee -a "$CRON_LOG"
         return 1
     fi
 }
@@ -712,6 +791,7 @@ daily_report() {
 main() {
     debug_log "进入主任务，参数数量=$#，参数=$*"
     
+    check_runtime_dependencies || return 1
     check_running
     
 if [[ "$*" == *"-cron"* ]]; then
@@ -719,7 +799,7 @@ if [[ "$*" == *"-cron"* ]]; then
     if read_config; then
         debug_log "成功读取配置文件"
         # 继续执行其他操作
-        check_and_notify "false"
+        check_and_notify || log_cron "状态检查未完整成功"
         
     # 检查是否需要发送每日报告
     current_time=$(TZ='Asia/Shanghai' date +%H:%M)
@@ -747,7 +827,9 @@ if [[ "$*" == *"-cron"* ]]; then
             initial_config
         fi
         
-        setup_cron
+        if ! setup_cron; then
+            return 1
+        fi
         
         # 显示菜单
         while true; do
@@ -816,6 +898,7 @@ if [[ "$*" == *"-cron"* ]]; then
                         /^DAILY_REPORT_TIME=/ { print "DAILY_REPORT_TIME=" new_time; next }
                         { print }
                         ' "$CONFIG_FILE.backup" > "$CONFIG_FILE"
+                        chmod 600 "$CONFIG_FILE" "$CONFIG_FILE.backup" 2>/dev/null || true
                         
                         echo "每日报告时间已更新为 $new_time"
                         # 更新 cron 任务
@@ -853,4 +936,6 @@ if [[ "$*" == *"-cron"* ]]; then
 
 # 执行主函数
 main "$@"
+exit_code=$?
 echo "----------------------------------------------"| tee -a "$CRON_LOG"
+exit "$exit_code"

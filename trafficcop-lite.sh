@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.0.4"
-LAST_UPDATE="2026-07-12"
+SCRIPT_VERSION="1.0.5"
+LAST_UPDATE="2026-07-13"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
@@ -594,7 +594,8 @@ lite_usage_bar() {
 lite_current_usage_gb() {
     local start_date="$1"
     local end_date="$2"
-    local start_num end_num vnstat_json usage_bytes rx_bytes tx_bytes
+    local start_num end_num vnstat_json usage_bytes rx_bytes tx_bytes divisor
+    local created_num earliest_num daily_days required_days
 
     if [ -z "${MAIN_INTERFACE:-}" ]; then
         return 1
@@ -610,6 +611,20 @@ lite_current_usage_gb() {
 
     start_num=$(lite_date_num "$start_date")
     end_num=$(lite_date_num "$end_date")
+
+    created_num=$(printf '%s' "$vnstat_json" | jq -r '.interfaces[0].created.date | (.year * 10000 + .month * 100 + .day)' 2>/dev/null) || return 1
+    earliest_num=$(printf '%s' "$vnstat_json" | jq -r '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day)] | min // 0' 2>/dev/null) || return 1
+    case "${TRAFFIC_PERIOD:-monthly}" in
+        monthly) required_days=40 ;;
+        quarterly) required_days=100 ;;
+        yearly) required_days=400 ;;
+    esac
+    daily_days=$(vnstat --showconfig 2>/dev/null | awk '$1 == "DailyDays" { print $NF; exit }')
+    if ! [[ "$created_num" =~ ^[0-9]+$ ]] || ! [[ "$earliest_num" =~ ^[0-9]+$ ]] \
+        || ! [[ "$daily_days" =~ ^[0-9]+$ ]] || [ "$daily_days" -lt "$required_days" ] \
+        || [ "$created_num" -gt "$start_num" ] || [ "$earliest_num" -eq 0 ] || [ "$earliest_num" -gt "$start_num" ]; then
+        return 2
+    fi
 
     case "${TRAFFIC_MODE:-total}" in
         out)
@@ -637,21 +652,29 @@ lite_current_usage_gb() {
         return 1
     fi
 
-    awk -v bytes="$usage_bytes" 'BEGIN { printf "%.3f", bytes / 1024 / 1024 / 1024 }'
+    [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && divisor=1000000000 || divisor=1073741824
+    awk -v bytes="$usage_bytes" -v divisor="$divisor" 'BEGIN { printf "%.3f", bytes / divisor }'
 }
 
 show_traffic_overview() {
     local config_file="$WORK_DIR/traffic_monitor_config.txt"
-    local start_date end_date period_label mode_label usage_gb percent usage_color bar limit_text
+    local start_date end_date period_label mode_label usage_gb percent usage_color bar limit_text unit_label usage_status
 
     if [ ! -s "$config_file" ]; then
         echo -e "${CYAN}流量概览:${NC} ${YELLOW}未配置${NC}"
         return
     fi
 
+    if command -v vnstat >/dev/null 2>&1 && [ "$(vnstat --showconfig 2>/dev/null | awk '$1 == "UseUTC" { print $NF; exit }')" = "1" ]; then
+        export TZ=UTC
+    else
+        unset TZ
+    fi
+
     local TRAFFIC_MODE="total"
     local TRAFFIC_PERIOD="monthly"
     local TRAFFIC_LIMIT=""
+    local TRAFFIC_UNIT="binary"
     local PERIOD_START_DAY="1"
     local PERIOD_START_MONTH="1"
     local MAIN_INTERFACE=""
@@ -677,6 +700,7 @@ show_traffic_overview() {
     end_date=$(lite_period_end_date)
     period_label=$(lite_period_label "$TRAFFIC_PERIOD")
     mode_label=$(lite_mode_label "$TRAFFIC_MODE")
+    [ "$TRAFFIC_UNIT" = "decimal" ] && unit_label="GB" || unit_label="GiB"
 
     echo -e "${CYAN}流量周期:${NC} ${WHITE}${period_label} · ${mode_label}${NC}  ${WHITE}${start_date} ~ ${end_date}${NC}"
 
@@ -686,8 +710,14 @@ show_traffic_overview() {
     fi
 
     limit_text=$(awk -v limit="$TRAFFIC_LIMIT" 'BEGIN { printf "%.3f", limit }')
-    if ! usage_gb=$(lite_current_usage_gb "$start_date" "$end_date"); then
-        echo -e "${CYAN}已用/总量:${NC} ${YELLOW}暂无法读取${NC} / ${WHITE}${limit_text} GB${NC}"
+    usage_gb=$(lite_current_usage_gb "$start_date" "$end_date")
+    usage_status=$?
+    if [ "$usage_status" -ne 0 ]; then
+        if [ "$usage_status" -eq 2 ]; then
+            echo -e "${CYAN}已用/总量:${NC} ${YELLOW}历史日数据覆盖不足${NC} / ${WHITE}${limit_text} $unit_label${NC}"
+        else
+            echo -e "${CYAN}已用/总量:${NC} ${YELLOW}暂无法读取${NC} / ${WHITE}${limit_text} $unit_label${NC}"
+        fi
         return
     fi
 
@@ -700,7 +730,7 @@ show_traffic_overview() {
     fi
     bar=$(lite_usage_bar "$percent" "$usage_color")
 
-    echo -e "${CYAN}已用/总量:${NC} ${usage_color}${usage_gb} GB${NC} / ${WHITE}${limit_text} GB${NC}  ${usage_color}${percent}%${NC} ${bar}"
+    echo -e "${CYAN}已用/总量:${NC} ${usage_color}${usage_gb} $unit_label${NC} / ${WHITE}${limit_text} $unit_label${NC}  ${usage_color}${percent}%${NC} ${bar}"
 }
 
 menu_item() {

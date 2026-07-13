@@ -16,7 +16,7 @@ LOCK_FILE="$WORK_DIR/traffic_monitor.lock"
 TC_STATE_FILE="$WORK_DIR/tc_limit_state"
 PERIOD_STATE_FILE="$WORK_DIR/last_reset_period"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 mkdir -p "$WORK_DIR"
 chmod 700 "$WORK_DIR" 2>/dev/null || true
 
@@ -27,7 +27,8 @@ trim_log_file() {
 
     [ -f "$file" ] || return 0
     [[ "$max_lines" =~ ^[1-9][0-9]*$ ]] || max_lines=5000
-    [ "$(wc -l < "$file" 2>/dev/null || echo 0)" -le "$max_lines" ] && return 0
+    local trim_at=$((max_lines + max_lines / 5))
+    [ "$(wc -l < "$file" 2>/dev/null || echo 0)" -le "$trim_at" ] && return 0
 
     tmp_file="${file}.tmp.$$"
     tail -n "$max_lines" "$file" > "$tmp_file" 2>/dev/null && mv -f "$tmp_file" "$file"
@@ -49,9 +50,6 @@ find_tc_bin() {
 
 TC_BIN="$(find_tc_bin)"
 
-# 设置时区为上海（东八区）
-export TZ='Asia/Shanghai'
-
 echo "-----------------------------------------------------"| tee -a "$LOG_FILE"
 echo "$(date '+%Y-%m-%d %H:%M:%S') 当前版本：$SCRIPT_VERSION"| tee -a "$LOG_FILE"
 
@@ -66,6 +64,76 @@ migrate_files() {
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+align_timezone_with_vnstat() {
+    local use_utc
+    use_utc=$(vnstat --showconfig 2>/dev/null | awk '$1 == "UseUTC" { print $NF; exit }')
+    if [ "$use_utc" = "1" ]; then
+        export TZ=UTC
+    else
+        unset TZ
+    fi
+}
+
+ensure_vnstat_interface() {
+    local interface="$1"
+    if vnstat -i "$interface" --json >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "$(date '+%Y-%m-%d %H:%M:%S') vnStat 尚未监控接口 $interface，正在添加。" | tee -a "$LOG_FILE"
+    if ! vnstat --add -i "$interface" >/dev/null 2>&1; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 无法将接口 $interface 添加到 vnStat 数据库。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+    ensure_service_running "vnStat" vnstat vnstatd
+}
+
+ensure_vnstat_daily_retention() {
+    local required_days current_days config_path answer tmp_file
+    case "$TRAFFIC_PERIOD" in
+        monthly) required_days=40 ;;
+        quarterly) required_days=100 ;;
+        yearly) required_days=400 ;;
+    esac
+    current_days=$(vnstat --showconfig 2>/dev/null | awk '$1 == "DailyDays" { print $NF; exit }')
+    if [[ "$current_days" =~ ^[0-9]+$ ]] && [ "$current_days" -ge "$required_days" ]; then
+        return 0
+    fi
+
+    echo "当前 vnStat DailyDays=${current_days:-未知}，${TRAFFIC_PERIOD} 周期建议至少保留 $required_days 天日数据。"
+    read -r -p "是否由脚本调整 vnStat 日数据保留期？[Y/n]: " answer
+    case "$answer" in n|N) return 0 ;; esac
+
+    for config_path in /etc/vnstat.conf /etc/vnstat/vnstat.conf; do
+        [ -f "$config_path" ] && break
+    done
+    if [ ! -f "$config_path" ]; then
+        echo "未找到 vnStat 配置文件，请手动将 DailyDays 调整为至少 $required_days。"
+        return 1
+    fi
+    if [ ! -f "$WORK_DIR/vnstat.conf.before-trafficcop-lite" ]; then
+        cp -p "$config_path" "$WORK_DIR/vnstat.conf.before-trafficcop-lite" || return 1
+        chmod 600 "$WORK_DIR/vnstat.conf.before-trafficcop-lite" 2>/dev/null || true
+    fi
+    tmp_file="${config_path}.trafficcop-lite.$$"
+    awk -v days="$required_days" '
+        BEGIN { updated=0 }
+        /^[[:space:]]*DailyDays[[:space:]]+/ { print "DailyDays " days; updated=1; next }
+        { print }
+        END { if (!updated) print "DailyDays " days }
+    ' "$config_path" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    chmod 644 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$config_path" || return 1
+    if command_exists systemctl; then
+        systemctl restart vnstat.service >/dev/null 2>&1 || systemctl restart vnstatd.service >/dev/null 2>&1 || true
+    elif command_exists rc-service; then
+        rc-service vnstat restart >/dev/null 2>&1 || rc-service vnstatd restart >/dev/null 2>&1 || true
+    elif command_exists service; then
+        service vnstat restart >/dev/null 2>&1 || service vnstatd restart >/dev/null 2>&1 || true
+    fi
+    ensure_service_running "vnStat" vnstat vnstatd
+    echo "vnStat DailyDays 已调整为 $required_days；原配置备份在 $WORK_DIR/vnstat.conf.before-trafficcop-lite。"
 }
 
 run_privileged() {
@@ -232,7 +300,7 @@ check_and_install_packages() {
         done
     fi
 
-    ensure_service_running "cron" cron crond
+    ensure_service_running "cron" cron crond dcron cronie
     ensure_service_running "vnStat" vnstat vnstatd
 
     # 验证系统 tc 命令是否可用；独立版的 tc 快捷命令不会用于限速。
@@ -241,8 +309,14 @@ check_and_install_packages() {
     fi
 
     # 获取 vnstat 版本
-    local vnstat_version=$(vnstat --version 2>&1 | head -n 1)
+    local vnstat_version vnstat_major
+    vnstat_version=$(vnstat --version 2>&1 | head -n 1)
     echo "$(date '+%Y-%m-%d %H:%M:%S') vnstat 版本: $vnstat_version" | tee -a "$LOG_FILE"
+    vnstat_major=$(printf '%s\n' "$vnstat_version" | sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p')
+    if ! [[ "$vnstat_major" =~ ^[0-9]+$ ]] || [ "$vnstat_major" -lt 2 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 错误：需要 vnStat 2.x 或更高版本。" | tee -a "$LOG_FILE"
+        return 1
+    fi
 
     # 获取主要网络接口
     local main_interface=$(ip route | grep default | sed -e 's/^.*dev \([^ ]*\).*$/\1/' | head -n 1)
@@ -323,6 +397,15 @@ validate_config() {
         has_error=true
     fi
 
+    TRAFFIC_UNIT="${TRAFFIC_UNIT:-binary}"
+    case "$TRAFFIC_UNIT" in
+        decimal|binary) ;;
+        *)
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：TRAFFIC_UNIT 无效：$TRAFFIC_UNIT" | tee -a "$LOG_FILE"
+            has_error=true
+            ;;
+    esac
+
     if ! [[ "${PERIOD_START_DAY:-1}" =~ ^[0-9]+$ ]]; then
         PERIOD_START_DAY=1
     fi
@@ -384,6 +467,7 @@ TRAFFIC_MODE=$TRAFFIC_MODE
 TRAFFIC_PERIOD=$TRAFFIC_PERIOD
 TRAFFIC_LIMIT=$TRAFFIC_LIMIT
 TRAFFIC_TOLERANCE=$TRAFFIC_TOLERANCE
+TRAFFIC_UNIT=${TRAFFIC_UNIT:-binary}
 PERIOD_START_DAY=${PERIOD_START_DAY:-1}
 PERIOD_START_MONTH=${PERIOD_START_MONTH:-1}
 LIMIT_SPEED=${LIMIT_SPEED:-20}
@@ -397,6 +481,8 @@ EOF
 
 # 显示当前配置
 show_current_config() {
+    local unit_label
+    [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && unit_label="GB" || unit_label="GiB"
     echo "$(date '+%Y-%m-%d %H:%M:%S') 当前配置:"| tee -a "$LOG_FILE"
     echo "$(date '+%Y-%m-%d %H:%M:%S') 流量统计模式: $TRAFFIC_MODE"| tee -a "$LOG_FILE"
     echo "$(date '+%Y-%m-%d %H:%M:%S') 流量统计周期: $TRAFFIC_PERIOD"| tee -a "$LOG_FILE"
@@ -404,8 +490,8 @@ show_current_config() {
         echo "$(date '+%Y-%m-%d %H:%M:%S') 年度起始月份: ${PERIOD_START_MONTH:-1}"| tee -a "$LOG_FILE"
     fi
     echo "$(date '+%Y-%m-%d %H:%M:%S') 周期起始日: ${PERIOD_START_DAY:-1}"| tee -a "$LOG_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 流量限制: $TRAFFIC_LIMIT GB"| tee -a "$LOG_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 容错范围: $TRAFFIC_TOLERANCE GB"| tee -a "$LOG_FILE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') 流量限制: $TRAFFIC_LIMIT $unit_label"| tee -a "$LOG_FILE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') 容错范围: $TRAFFIC_TOLERANCE $unit_label"| tee -a "$LOG_FILE"
     echo "$(date '+%Y-%m-%d %H:%M:%S') 限速: ${LIMIT_SPEED:-20} kbit/s"| tee -a "$LOG_FILE"
     echo "$(date '+%Y-%m-%d %H:%M:%S') 主要网络接口: $MAIN_INTERFACE"| tee -a "$LOG_FILE"
     echo "$(date '+%Y-%m-%d %H:%M:%S') 限制模式: $LIMIT_MODE"| tee -a "$LOG_FILE"
@@ -452,6 +538,7 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') 开始初始化配置"| tee -a "$LOG_FILE"
 initial_config() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') 正在检测主要网络接口..."| tee -a "$LOG_FILE"
     MAIN_INTERFACE=$(get_main_interface)
+    ensure_vnstat_interface "$MAIN_INTERFACE" || return 1
 
     while true; do
         echo "$(date '+%Y-%m-%d %H:%M:%S') 请选择流量统计模式："| tee -a "$LOG_FILE"
@@ -476,6 +563,17 @@ initial_config() {
         m|"") TRAFFIC_PERIOD="monthly" ;;
         *) echo "无效输入，使用默认值：monthly"; TRAFFIC_PERIOD="monthly" ;;
     esac
+    ensure_vnstat_daily_retention || return 1
+
+    echo "请选择流量单位："
+    echo "1. GB（十进制，1 GB = 1000^3 字节，推荐用于服务商配额）"
+    echo "2. GiB（二进制，1 GiB = 1024^3 字节，兼容旧版）"
+    read -r -p "请输入选择 (1-2，默认为1): " unit_choice
+    case "$unit_choice" in
+        2) TRAFFIC_UNIT="binary" ;;
+        1|"") TRAFFIC_UNIT="decimal" ;;
+        *) echo "无效输入，使用默认值：GB"; TRAFFIC_UNIT="decimal" ;;
+    esac
 
     PERIOD_START_MONTH=1
     if [ "$TRAFFIC_PERIOD" = "yearly" ]; then
@@ -497,7 +595,7 @@ initial_config() {
     fi
 
     while true; do
-        read -r -p "请输入流量限制 (GB): " TRAFFIC_LIMIT
+        read -r -p "请输入流量限制 ($([ "$TRAFFIC_UNIT" = "decimal" ] && echo GB || echo GiB)): " TRAFFIC_LIMIT
         if [[ "$TRAFFIC_LIMIT" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(echo "$TRAFFIC_LIMIT > 0" | bc -l 2>/dev/null || echo "0") )); then
             break
         else
@@ -506,7 +604,7 @@ initial_config() {
     done
 
     while true; do
-        read -r -p "请输入容错范围 (GB): " TRAFFIC_TOLERANCE
+        read -r -p "请输入容错范围 ($([ "$TRAFFIC_UNIT" = "decimal" ] && echo GB || echo GiB)): " TRAFFIC_TOLERANCE
         if [[ "$TRAFFIC_TOLERANCE" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(echo "$TRAFFIC_TOLERANCE < $TRAFFIC_LIMIT" | bc -l 2>/dev/null || echo "0") )); then
             break
         else
@@ -686,7 +784,8 @@ get_period_end_date() {
 # 获取流量使用情况
 get_traffic_usage() {
     local start_date end_date
-    local start_num end_num vnstat_json usage_bytes rx_bytes tx_bytes usage_gib
+    local start_num end_num vnstat_json usage_bytes rx_bytes tx_bytes divisor
+    local created_num earliest_num daily_days required_days
 
     start_date=$(get_period_start_date)
     end_date=$(get_period_end_date)
@@ -707,6 +806,24 @@ get_traffic_usage() {
     # 将日期转换为 YYYYMMDD 整数用于比较（兼容 vnstat 2.x 的 date 对象格式）
     start_num=$(echo "$start_date" | tr -d '-')
     end_num=$(echo "$end_date" | tr -d '-')
+
+    created_num=$(echo "$vnstat_json" | jq -r '.interfaces[0].created.date | (.year * 10000 + .month * 100 + .day)' 2>/dev/null) || return 1
+    earliest_num=$(echo "$vnstat_json" | jq -r '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day)] | min // 0' 2>/dev/null) || return 1
+    case "$TRAFFIC_PERIOD" in
+        monthly) required_days=40 ;;
+        quarterly) required_days=100 ;;
+        yearly) required_days=400 ;;
+    esac
+    daily_days=$(vnstat --showconfig 2>/dev/null | awk '$1 == "DailyDays" { print $NF; exit }')
+    if ! [[ "$daily_days" =~ ^[0-9]+$ ]] || [ "$daily_days" -lt "$required_days" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: vnStat DailyDays=${daily_days:-未知}，不足以可靠统计当前周期（建议至少 $required_days）" >&2
+        return 1
+    fi
+    if ! [[ "$created_num" =~ ^[0-9]+$ ]] || ! [[ "$earliest_num" =~ ^[0-9]+$ ]] \
+        || [ "$created_num" -gt "$start_num" ] || [ "$earliest_num" -eq 0 ] || [ "$earliest_num" -gt "$start_num" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: vnStat 日数据未完整覆盖周期起点 $start_date，拒绝按不完整数据限速" >&2
+        return 1
+    fi
     
     # 根据 TRAFFIC_MODE 累加对应的流量
     case $TRAFFIC_MODE in
@@ -737,10 +854,8 @@ get_traffic_usage() {
     fi
 
     if [ "$usage_bytes" != "0" ]; then
-        # 将字节转换为 GiB，使用 printf 确保格式正确
-        usage_gib=$(echo "scale=3; $usage_bytes/1024/1024/1024" | bc 2>/dev/null) || return 1
-        # 确保小数点前至少有一个0
-        printf "%.3f\n" "$usage_gib" 2>/dev/null || echo "0.000"
+        [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && divisor=1000000000 || divisor=1073741824
+        awk -v bytes="$usage_bytes" -v divisor="$divisor" 'BEGIN { printf "%.3f\n", bytes / divisor }'
     else
         echo "0.000"
     fi
@@ -826,6 +941,10 @@ apply_tc_limit() {
             if [ -z "$state_qdisc_line" ] && { ! [[ "$state_speed" =~ ^[0-9]+$ ]] || ! echo "$existing_qdisc" | grep -Eq "rate[[:space:]]+${state_speed}[Kk]bit"; }; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') 当前 tbf 与旧状态记录不一致，保留现有规则和状态标记并停止自动覆盖。" | tee -a "$LOG_FILE"
                 return 1
+            fi
+            if [ "$state_speed" = "$speed" ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则保持生效" | tee -a "$LOG_FILE"
+                return 0
             fi
         else
             state_boot_id=$(tc_state_value "BOOT_ID")
@@ -919,7 +1038,8 @@ clear_owned_tc_rules() {
 
 # 修改 check_and_limit_traffic 函数
 check_and_limit_traffic() {
-    local current_usage limit_threshold
+    local current_usage limit_threshold unit_label
+    [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && unit_label="GB" || unit_label="GiB"
 
     if ! current_usage=$(get_traffic_usage); then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 无法可靠读取当前流量，本轮跳过限速判断并保留现有限速状态。" | tee -a "$LOG_FILE"
@@ -929,13 +1049,13 @@ check_and_limit_traffic() {
     limit_threshold=$(echo "$TRAFFIC_LIMIT - $TRAFFIC_TOLERANCE" | bc 2>/dev/null || echo "0")
 
     if (( $(echo "$limit_threshold < 0" | bc -l 2>/dev/null || echo "0") )); then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到配置异常：容错范围大于流量限制，已将限制阈值按 0 GB 处理" | tee -a "$LOG_FILE"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到配置异常：容错范围大于流量限制，已将限制阈值按 0 $unit_label 处理" | tee -a "$LOG_FILE"
         limit_threshold=0
     fi
     
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 当前使用流量: $current_usage GB，限制流量: $limit_threshold GB" | tee -a "$LOG_FILE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') 当前使用流量: $current_usage $unit_label，限制流量: $limit_threshold $unit_label" | tee -a "$LOG_FILE"
     
-    if (( $(echo "$current_usage > $limit_threshold" | bc -l 2>/dev/null || echo "0") )); then
+    if (( $(echo "$current_usage >= $limit_threshold" | bc -l 2>/dev/null || echo "0") )); then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制" | tee -a "$LOG_FILE"
         if [ "$LIMIT_MODE" = "tc" ]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 使用 TC 模式限速" | tee -a "$LOG_FILE"
@@ -1019,6 +1139,7 @@ main() {
         exit 1
     fi
     trap 'trim_log_file "$LOG_FILE" "$LOG_MAX_LINES"; flock -u 9 2>/dev/null || true' EXIT
+    command_exists vnstat && align_timezone_with_vnstat
 
     # 检查是否以 --run 模式运行
     if [ "$1" = "--run" ] || [ "$1" = "--cron" ]; then
@@ -1084,13 +1205,14 @@ fi
     # 显示当前流量使用情况和限制状态
     if read_config; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 当前流量使用情况：" | tee -a "$LOG_FILE"
-        local current_usage
+        local current_usage unit_label
         #echo "Debug: Current usage from get_traffic_usage: $current_usage" | tee -a "$LOG_FILE"
         if current_usage=$(get_traffic_usage); then
             local start_date=$(get_period_start_date)
             echo "$(date '+%Y-%m-%d %H:%M:%S') 当前统计周期: $TRAFFIC_PERIOD (从 $start_date 开始)" | tee -a "$LOG_FILE"
             echo "$(date '+%Y-%m-%d %H:%M:%S') 统计模式: $TRAFFIC_MODE" | tee -a "$LOG_FILE"
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 当前使用流量: $current_usage GB" | tee -a "$LOG_FILE"
+            [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && unit_label="GB" || unit_label="GiB"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 当前使用流量: $current_usage $unit_label" | tee -a "$LOG_FILE"
             echo "$(date '+%Y-%m-%d %H:%M:%S') 检查并限制流量：" | tee -a "$LOG_FILE"
             check_and_limit_traffic
         else

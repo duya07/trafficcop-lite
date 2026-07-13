@@ -19,13 +19,14 @@ fi
 CONFIG_FILE="$WORK_DIR/tg_notifier_config.txt"
 LOG_FILE="$WORK_DIR/traffic_monitor.log"
 LAST_NOTIFICATION_FILE="$WORK_DIR/last_traffic_notification"
+LAST_DAILY_REPORT_FILE="$WORK_DIR/last_daily_report"
 PERIOD_STATE_FILE="$WORK_DIR/last_reset_period"
 SCRIPT_PATH="$WORK_DIR/trafficcop-lite-telegram.sh"
 CRON_LOG="$WORK_DIR/tg_notifier_cron.log"
 TG_LOCK_FILE="$WORK_DIR/tg_notifier.lock"
 CRON_LOG_MAX_LINES="${CRON_LOG_MAX_LINES:-2000}"
 TG_DEBUG="${TG_DEBUG:-false}"
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 
 trim_log_file() {
     local file="$1"
@@ -38,7 +39,8 @@ trim_log_file() {
     if ! [[ "$max_lines" =~ ^[1-9][0-9]*$ ]]; then
         max_lines=2000
     fi
-    if [ "$(wc -l < "$file" 2>/dev/null || echo 0)" -le "$max_lines" ]; then
+    local trim_at=$((max_lines + max_lines / 5))
+    if [ "$(wc -l < "$file" 2>/dev/null || echo 0)" -le "$trim_at" ]; then
         return
     fi
 
@@ -69,9 +71,6 @@ migrate_files
 # 切换到工作目录
 cd "$WORK_DIR" || exit 1
 trap 'trim_log_file "$CRON_LOG" "$CRON_LOG_MAX_LINES"' EXIT
-
-# 设置时区为上海（东八区）
-export TZ='Asia/Shanghai'
 
 # 端口流量数据缓存文件
 PORT_DATA_CACHE="/tmp/port_traffic_cache.json"
@@ -231,10 +230,15 @@ read_config() {
 
     # 读取配置文件
     source "$CONFIG_FILE"
+    REPORT_TIMEZONE="${REPORT_TIMEZONE:-Asia/Shanghai}"
 
     # 检查必要的配置项是否都存在
     if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ] || [ -z "$MACHINE_NAME" ] || [ -z "$DAILY_REPORT_TIME" ]; then
         echo "配置文件不完整，需要重新进行配置。"
+        return 1
+    fi
+    if ! TZ="$REPORT_TIMEZONE" date +%H:%M >/dev/null 2>&1; then
+        echo "报告时区无效：$REPORT_TIMEZONE"
         return 1
     fi
 
@@ -255,6 +259,7 @@ write_config() {
         write_config_value "BOT_TOKEN" "$BOT_TOKEN"
         write_config_value "CHAT_ID" "$CHAT_ID"
         write_config_value "DAILY_REPORT_TIME" "$DAILY_REPORT_TIME"
+        write_config_value "REPORT_TIMEZONE" "${REPORT_TIMEZONE:-Asia/Shanghai}"
         write_config_value "MACHINE_NAME" "$MACHINE_NAME"
     } > "$CONFIG_FILE"
     chmod 600 "$CONFIG_FILE" 2>/dev/null || true
@@ -271,7 +276,7 @@ initial_config() {
     echo "提示：按 Enter 保留当前配置，输入新值则更新配置"
     echo ""
     
-    local new_token new_chat_id new_machine_name new_daily_report_time
+    local new_token new_chat_id new_machine_name new_daily_report_time new_report_timezone
 
     # Bot Token
     if [ -n "$BOT_TOKEN" ]; then
@@ -341,11 +346,21 @@ initial_config() {
         read -r new_daily_report_time
     done
 
+    REPORT_TIMEZONE="${REPORT_TIMEZONE:-Asia/Shanghai}"
+    echo "请输入每日报告时区 [当前: $REPORT_TIMEZONE，例如 Asia/Shanghai 或 UTC]: "
+    read -r new_report_timezone
+    new_report_timezone="${new_report_timezone:-$REPORT_TIMEZONE}"
+    while ! TZ="$new_report_timezone" date +%H:%M >/dev/null 2>&1; do
+        echo "时区无效，请重新输入: "
+        read -r new_report_timezone
+    done
+
     # 更新配置文件（使用引号防止空格等特殊字符问题）
     BOT_TOKEN="$new_token"
     CHAT_ID="$new_chat_id"
     MACHINE_NAME="$new_machine_name"
     DAILY_REPORT_TIME="$new_daily_report_time"
+    REPORT_TIMEZONE="$new_report_timezone"
     
     write_config
     
@@ -361,10 +376,12 @@ telegram_send_message() {
     local message="$1"
     local response
 
+    message="${message//%0A/$'\n'}"
+
     if ! response=$(curl -fsS --connect-timeout 10 --max-time 30 -X POST \
         "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-        -d "chat_id=$CHAT_ID" \
-        -d "text=$message" 2>/dev/null); then
+        --data-urlencode "chat_id=$CHAT_ID" \
+        --data-urlencode "text=$message" 2>/dev/null); then
         return 1
     fi
     echo "$response" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'
@@ -496,6 +513,15 @@ write_notification_state() {
     mv -f "$tmp_file" "$LAST_NOTIFICATION_FILE"
 }
 
+write_daily_report_state() {
+    local report_date="$1"
+    local tmp_file="${LAST_DAILY_REPORT_FILE}.tmp.$$"
+
+    printf '%s\n' "$report_date" > "$tmp_file" || return 1
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$LAST_DAILY_REPORT_FILE"
+}
+
 check_and_notify() {
     local current_status="未知"
     local relevant_log=""
@@ -506,12 +532,12 @@ check_and_notify() {
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 开始检查流量状态..."| tee -a "$CRON_LOG"
 
-    relevant_log=$(tac "$LOG_FILE" 2>/dev/null | grep -m 1 -E "TC 限速规则已应用/更新|流量超出限制，系统将在 1 分钟后关机|流量正常")
+    relevant_log=$(tac "$LOG_FILE" 2>/dev/null | grep -m 1 -E "TC 限速规则(已应用/更新|保持生效)|流量超出限制，系统将在 1 分钟后关机|流量正常")
     cycle_event=$(cat "$PERIOD_STATE_FILE" 2>/dev/null || true)
 
     if echo "$relevant_log" | grep -q "流量超出限制，系统将在 1 分钟后关机"; then
         current_status="关机"
-    elif echo "$relevant_log" | grep -q "TC 限速规则已应用/更新"; then
+    elif echo "$relevant_log" | grep -Eq "TC 限速规则(已应用/更新|保持生效)"; then
         current_status="限速"
     elif echo "$relevant_log" | grep -q "流量正常"; then
         current_status="正常"
@@ -579,9 +605,12 @@ check_and_notify() {
         esac
     fi
 
-    if ! write_notification_state "$next_status" "$next_cycle"; then
-        log_cron "通知状态文件写入失败"
-        return 1
+    if ! $had_notification_state || ! grep -q '^STATUS=' "$LAST_NOTIFICATION_FILE" 2>/dev/null \
+        || [ "$next_status" != "$LAST_STATUS" ] || [ "$next_cycle" != "$LAST_CYCLE_EVENT" ]; then
+        if ! write_notification_state "$next_status" "$next_cycle"; then
+            log_cron "通知状态文件写入失败"
+            return 1
+        fi
     fi
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 流量检查完成。"| tee -a "$CRON_LOG"
 }
@@ -637,12 +666,14 @@ daily_report() {
         return 1
     fi
 
-    local current_usage limit configured_limit
-    current_usage=$(echo "$usage_line" | sed -n 's/.*当前使用流量:[[:space:]]*\([0-9.][0-9.]*[[:space:]][GBMKgbmk][GBMKgbmk]*\).*/\1/p')
-    limit=$(echo "$usage_line" | sed -n 's/.*限制流量:[[:space:]]*\([0-9.][0-9.]*[[:space:]][GBMKgbmk][GBMKgbmk]*\).*/\1/p')
+    local current_usage limit configured_limit traffic_unit unit_label
+    current_usage=$(echo "$usage_line" | sed -n 's/.*当前使用流量:[[:space:]]*\([0-9.][0-9.]*[[:space:]][A-Za-z][A-Za-z]*\).*/\1/p')
+    limit=$(echo "$usage_line" | sed -n 's/.*限制流量:[[:space:]]*\([0-9.][0-9.]*[[:space:]][A-Za-z][A-Za-z]*\).*/\1/p')
     configured_limit=$(grep '^TRAFFIC_LIMIT=' "$WORK_DIR/traffic_monitor_config.txt" 2>/dev/null | tail -n 1 | cut -d'=' -f2-)
+    traffic_unit=$(grep '^TRAFFIC_UNIT=' "$WORK_DIR/traffic_monitor_config.txt" 2>/dev/null | tail -n 1 | cut -d'=' -f2-)
+    [ "$traffic_unit" = "decimal" ] && unit_label="GB" || unit_label="GiB"
     if [[ "$configured_limit" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-        limit="$configured_limit GB"
+        limit="$configured_limit $unit_label"
     fi
 
     if [[ -z "$current_usage" || -z "$limit" ]]; then
@@ -802,18 +833,24 @@ if [[ "$*" == *"-cron"* ]]; then
         check_and_notify || log_cron "状态检查未完整成功"
         
     # 检查是否需要发送每日报告
-    current_time=$(TZ='Asia/Shanghai' date +%H:%M)
-        debug_log "当前时间: $current_time, 设定的报告时间: $DAILY_REPORT_TIME"
-        if [ "$current_time" == "$DAILY_REPORT_TIME" ]; then
-            log_cron "时间匹配，准备发送每日报告"
+        current_time=$(TZ="$REPORT_TIMEZONE" date +%H:%M)
+        current_date=$(TZ="$REPORT_TIMEZONE" date +%Y-%m-%d)
+        last_report_date=$(cat "$LAST_DAILY_REPORT_FILE" 2>/dev/null || true)
+        debug_log "当前时间: $current_time, 设定的报告时间: $DAILY_REPORT_TIME, 时区: $REPORT_TIMEZONE"
+        if [[ "$current_time" > "$DAILY_REPORT_TIME" || "$current_time" == "$DAILY_REPORT_TIME" ]] && [ "$last_report_date" != "$current_date" ]; then
+            log_cron "已到报告时间且今日尚未发送，准备发送每日报告"
             save_port_traffic_data 2>/dev/null || true
             if daily_report; then
-                log_cron "每日报告发送成功"
+                if write_daily_report_state "$current_date"; then
+                    log_cron "每日报告发送成功"
+                else
+                    log_cron "每日报告已发送，但状态文件写入失败；请检查目录权限以避免重复发送"
+                fi
             else
                 log_cron "每日报告发送失败"
             fi
         else
-            debug_log "当前时间与报告时间不匹配，不发送报告"
+            debug_log "尚未到报告时间或今日已经发送，不发送报告"
         fi
     else
         log_cron "配置文件不存在或不完整，跳过检查"
@@ -840,6 +877,7 @@ if [[ "$*" == *"-cron"* ]]; then
             echo "当前配置摘要："
             echo "机器名称: $MACHINE_NAME"
             echo "每日报告时间: $DAILY_REPORT_TIME"
+            echo "报告时区: ${REPORT_TIMEZONE:-Asia/Shanghai}"
             echo "Bot Token: ${BOT_TOKEN:0:10}..." # 只显示前10个字符
             echo "Chat ID: $CHAT_ID"
             echo "======================================"

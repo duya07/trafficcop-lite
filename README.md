@@ -132,6 +132,7 @@ sudo env RAW_BASE="https://v6.gh-proxy.org/https://raw.githubusercontent.com/duy
 - 只覆盖 `/etc/trafficcop-lite` 下的脚本文件。
 - 不覆盖 `traffic_monitor_config.txt`、`tg_notifier_config.txt`、日志和 crontab。
 - 兼容旧配置；旧配置没有 `PERIOD_START_MONTH` 时仍按 1 月起算。
+- 旧配置没有 `TRAFFIC_UNIT` 时继续按 GiB 计算，不会因更新改变原配额含义。
 - 下载到临时文件并通过 `bash -n` 语法检查后才替换。
 - 旧脚本会备份到 `/etc/trafficcop-lite/backups/scripts-时间戳/`。
 - 更新完成后建议重新执行 `sudo ntc` 进入新版菜单。
@@ -145,6 +146,8 @@ sudo env RAW_BASE="https://v6.gh-proxy.org/https://raw.githubusercontent.com/duy
 ```
 
 例如输入 `6`，年度统计周期会按每年 6 月的指定起始日开始计算。
+
+配置时还可选择流量单位：`GB` 使用十进制（1000³ 字节，适合服务商配额），`GiB` 使用二进制（1024³ 字节，兼容旧版）。季度和年度统计依赖 vnStat 的每日历史；脚本可调整 `DailyDays` 并将原配置备份到 `/etc/trafficcop-lite/vnstat.conf.before-trafficcop-lite`。已有历史不足时会明确提示并跳过限速，不会按不完整数据误判。
 
 ## 5) 卸载
 
@@ -190,7 +193,9 @@ sudo bash /etc/trafficcop-lite/trafficcop-lite.sh --uninstall
 ├── tg_notifier.lock
 ├── tc_limit_state
 ├── last_reset_period
-└── last_traffic_notification
+├── last_traffic_notification
+├── last_daily_report
+└── vnstat.conf.before-trafficcop-lite
 ```
 
 快捷命令:
@@ -213,5 +218,7 @@ sudo /usr/sbin/tc qdisc show
 - 停止服务/卸载时，未标记的 TC 规则和计划关机会要求确认后才处理。
 - Telegram cron 日志默认保留最近 2000 行；如需详细调试，可临时设置 `TG_DEBUG=true`。
 - 流量监控日志默认保留最近 5000 行，可通过 `LOG_MAX_LINES` 调整。
+- Telegram 报告时区可独立配置；旧配置默认使用 `Asia/Shanghai`。到达设定时间后当天只发送一次，任务短暂中断时会在恢复后补发。
+- 需要 vnStat 2.x 或更高版本。脚本只修改 vnStat 的 `DailyDays` 保留期且保留原配置备份；卸载时不会自动恢复全局 vnStat 配置，以免覆盖用户后续修改。
 - Debian/Ubuntu、RHEL 系、Alpine 和 Arch 系会按已识别的包管理器尝试安装依赖；无法自动启动 cron 或 vnStat 服务时会给出明确提示，请按系统服务管理方式确认其已运行。
 - 网络受限时，优先使用带 `v6.gh-proxy.org` 的命令。

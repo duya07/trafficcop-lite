@@ -11,6 +11,7 @@ MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
 TELEGRAM_SCRIPT="trafficcop-lite-telegram.sh"
 MACHINE_LIMIT_SCRIPT="trafficcop-lite-machine-limit.sh"
 TC_STATE_FILE="$WORK_DIR/tc_limit_state"
+MONITOR_LOCK_FILE="$WORK_DIR/traffic_monitor.lock"
 SHORTCUT_PATH="/usr/local/bin/ntc"
 LEGACY_NCL_SHORTCUT_PATH="/usr/local/bin/ncl"
 LEGACY_TC_SHORTCUT_PATH="/usr/local/bin/tc"
@@ -69,6 +70,27 @@ ensure_work_dir() {
     [ ! -f "$TC_STATE_FILE" ] || chmod 600 "$TC_STATE_FILE" 2>/dev/null || true
     [ ! -f "$WORK_DIR/last_reset_period" ] || chmod 600 "$WORK_DIR/last_reset_period" 2>/dev/null || true
     [ ! -f "$WORK_DIR/last_traffic_notification" ] || chmod 600 "$WORK_DIR/last_traffic_notification" 2>/dev/null || true
+}
+
+read_current_crontab() {
+    local error_file="$WORK_DIR/.crontab-read-error.$$"
+    local current_crontab status
+
+    current_crontab=$(LC_ALL=C crontab -l 2>"$error_file")
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        rm -f "$error_file"
+        printf '%s\n' "$current_crontab"
+        return 0
+    fi
+    if grep -Eqi 'no crontab for|no such file or directory' "$error_file" 2>/dev/null; then
+        rm -f "$error_file"
+        return 0
+    fi
+
+    echo -e "${RED}读取当前 crontab 失败，已中止操作：$(cat "$error_file" 2>/dev/null)${NC}" >&2
+    rm -f "$error_file"
+    return 1
 }
 
 copy_self_if_needed() {
@@ -815,7 +837,9 @@ view_config() {
 
 remove_lite_cron() {
     local current_crontab filtered_crontab
-    current_crontab="$(crontab -l 2>/dev/null || true)"
+    if ! current_crontab="$(read_current_crontab)"; then
+        return 1
+    fi
     if [ -n "$current_crontab" ]; then
         filtered_crontab="$(printf '%s\n' "$current_crontab" \
             | grep -v -F "$WORK_DIR/$MONITOR_SCRIPT" \
@@ -831,6 +855,21 @@ remove_lite_cron() {
 stop_lite_processes() {
     pkill -f "$WORK_DIR/$MONITOR_SCRIPT" 2>/dev/null || true
     pkill -f "$WORK_DIR/$TELEGRAM_SCRIPT" 2>/dev/null || true
+}
+
+acquire_monitor_cleanup_lock() {
+    touch "$MONITOR_LOCK_FILE" || return 1
+    chmod 600 "$MONITOR_LOCK_FILE" 2>/dev/null || true
+    exec 9>"$MONITOR_LOCK_FILE"
+    if ! flock -w 15 9; then
+        exec 9>&-
+        return 1
+    fi
+}
+
+release_monitor_cleanup_lock() {
+    flock -u 9 2>/dev/null || true
+    exec 9>&-
 }
 
 clear_lite_tc_rules_interactive() {
@@ -940,17 +979,25 @@ stop_all_services() {
     local has_error=false
 
     echo -e "${CYAN}正在停止 TrafficCop-Lite 服务...${NC}"
+    if ! remove_lite_cron; then
+        echo -e "${RED}无法安全移除定时任务，本次未清理 TC 规则。${NC}"
+        pause
+        return 1
+    fi
+    echo "✓ 已移除独立版 crontab 条目"
+
+    stop_lite_processes
+    if ! acquire_monitor_cleanup_lock; then
+        echo -e "${RED}无法取得监控锁，本次未清理 TC 规则。${NC}"
+        pause
+        return 1
+    fi
     stop_lite_processes
     echo "✓ 已停止独立版监控/通知进程"
 
-    if remove_lite_cron; then
-        echo "✓ 已移除独立版 crontab 条目"
-    else
-        has_error=true
-    fi
-
     clear_lite_tc_rules_interactive || has_error=true
     cancel_shutdown_interactive
+    release_monitor_cleanup_lock
 
     if $has_error; then
         echo -e "${RED}停止流程未完全成功；安装目录和状态文件已保留，请查看上方错误。${NC}"
@@ -976,13 +1023,20 @@ uninstall_lite() {
         return
     fi
 
-    stop_lite_processes
     if ! remove_lite_cron; then
         echo -e "${RED}卸载已中止：无法移除独立版 crontab 条目。${NC}"
         pause
         return 1
     fi
+    stop_lite_processes
+    if ! acquire_monitor_cleanup_lock; then
+        echo -e "${RED}卸载已中止：无法取得监控锁。${NC}"
+        pause
+        return 1
+    fi
+    stop_lite_processes
     if ! clear_lite_tc_rules_interactive; then
+        release_monitor_cleanup_lock
         echo -e "${RED}卸载已中止：TC 限速未能安全清理，状态文件已保留。${NC}"
         pause
         return 1
@@ -995,11 +1049,13 @@ uninstall_lite() {
             local backup_dir
             backup_dir="/etc/trafficcop-lite-backup-$(date +%Y%m%d-%H%M%S)"
             mkdir -m 700 "$backup_dir" || {
+                release_monitor_cleanup_lock
                 echo -e "${RED}创建备份目录失败，卸载已中止。${NC}"
                 pause
                 return 1
             }
             if ! cp -a "$WORK_DIR/." "$backup_dir/"; then
+                release_monitor_cleanup_lock
                 echo -e "${RED}配置和日志备份失败，卸载已中止；未删除工作目录。${NC}"
                 pause
                 return 1
@@ -1008,6 +1064,7 @@ uninstall_lite() {
             echo "✓ 已备份到 $backup_dir"
         fi
         if ! rm -rf "$WORK_DIR"; then
+            release_monitor_cleanup_lock
             echo -e "${RED}删除 $WORK_DIR 失败，请检查文件系统状态。${NC}"
             pause
             return 1
@@ -1016,6 +1073,8 @@ uninstall_lite() {
     else
         echo "独立版工作目录不存在，无需删除。"
     fi
+
+    release_monitor_cleanup_lock
 
     if [ "$(readlink "$SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
         rm -f "$SHORTCUT_PATH"

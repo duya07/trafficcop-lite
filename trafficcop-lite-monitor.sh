@@ -66,6 +66,27 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+read_current_crontab() {
+    local error_file="$WORK_DIR/.crontab-read-error.$$"
+    local current_crontab status
+
+    current_crontab=$(LC_ALL=C crontab -l 2>"$error_file")
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        rm -f "$error_file"
+        printf '%s\n' "$current_crontab"
+        return 0
+    fi
+    if grep -Eqi 'no crontab for|no such file or directory' "$error_file" 2>/dev/null; then
+        rm -f "$error_file"
+        return 0
+    fi
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') 读取当前 crontab 失败：$(cat "$error_file" 2>/dev/null)" | tee -a "$LOG_FILE" >&2
+    rm -f "$error_file"
+    return 1
+}
+
 align_timezone_with_vnstat() {
     local use_utc
     use_utc=$(vnstat --showconfig 2>/dev/null | awk '$1 == "UseUTC" { print $NF; exit }')
@@ -895,9 +916,10 @@ write_tc_state() {
     local interface="$1"
     local speed="$2"
     local qdisc_line="$3"
-    local period_start
+    local period_start tmp_file
 
     period_start=$(get_period_start_date)
+    tmp_file="${TC_STATE_FILE}.tmp.$$"
     {
         printf 'INTERFACE=%s\n' "$interface"
         printf 'LIMIT_SPEED=%s\n' "$speed"
@@ -905,13 +927,15 @@ write_tc_state() {
         printf 'BOOT_ID=%s\n' "$(current_boot_id)"
         printf 'PERIOD_START=%s\n' "$period_start"
         printf 'APPLIED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
-    } > "$TC_STATE_FILE"
-    chmod 600 "$TC_STATE_FILE" 2>/dev/null || true
+    } > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$TC_STATE_FILE"
 }
 
 apply_tc_limit() {
     local speed="$1"
-    local existing_qdisc state_interface state_qdisc_line state_speed state_boot_id boot_id
+    local existing_qdisc state_interface state_qdisc_line state_speed state_boot_id boot_id new_qdisc
+    local previous_owned_speed=""
 
     if [ -z "$TC_BIN" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 未找到系统 tc 命令，无法执行限速" | tee -a "$LOG_FILE"
@@ -942,6 +966,11 @@ apply_tc_limit() {
                 echo "$(date '+%Y-%m-%d %H:%M:%S') 当前 tbf 与旧状态记录不一致，保留现有规则和状态标记并停止自动覆盖。" | tee -a "$LOG_FILE"
                 return 1
             fi
+            if ! [[ "$state_speed" =~ ^[1-9][0-9]*$ ]]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') TC 状态记录缺少有效速率，保留现有规则并停止自动覆盖。" | tee -a "$LOG_FILE"
+                return 1
+            fi
+            previous_owned_speed="$state_speed"
             if [ "$state_speed" = "$speed" ]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则保持生效" | tee -a "$LOG_FILE"
                 return 0
@@ -968,9 +997,19 @@ apply_tc_limit() {
     fi
 
     if "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root tbf rate "${speed}kbit" burst 32kbit latency 400ms; then
-        write_tc_state "$MAIN_INTERFACE" "$speed" "$(tc_root_qdisc "$MAIN_INTERFACE")"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则已应用/更新" | tee -a "$LOG_FILE"
-        return 0
+        new_qdisc=$(tc_root_qdisc "$MAIN_INTERFACE")
+        if write_tc_state "$MAIN_INTERFACE" "$speed" "$new_qdisc"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则已应用/更新" | tee -a "$LOG_FILE"
+            return 0
+        fi
+
+        echo "$(date '+%Y-%m-%d %H:%M:%S') TC 规则已修改但状态写入失败，正在回滚。" | tee -a "$LOG_FILE"
+        if [[ "$previous_owned_speed" =~ ^[1-9][0-9]*$ ]]; then
+            "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root tbf rate "${previous_owned_speed}kbit" burst 32kbit latency 400ms 2>/dev/null || true
+        else
+            "$TC_BIN" qdisc del dev "$MAIN_INTERFACE" root 2>/dev/null || true
+        fi
+        return 1
     fi
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则应用失败，请检查接口或 tc 状态" | tee -a "$LOG_FILE"
@@ -1107,7 +1146,9 @@ check_reset_limit() {
 setup_crontab() {
     local current_crontab new_crontab cron_entry
 
-    current_crontab="$(crontab -l 2>/dev/null || true)"
+    if ! current_crontab="$(read_current_crontab)"; then
+        return 1
+    fi
     new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
     cron_entry="* * * * * $SCRIPT_PATH --run # TrafficCop-Lite Monitor"
 

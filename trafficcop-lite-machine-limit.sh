@@ -69,11 +69,12 @@ NC='\033[0m'
 
 # 检查网络接口
 get_main_interface() {
+    local main_interface
     if [ -f "$CONFIG_FILE" ]; then
         chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-        . "$CONFIG_FILE" 2>/dev/null || true
-        if [ -n "$MAIN_INTERFACE" ]; then
-            echo "$MAIN_INTERFACE"
+        main_interface=$(grep '^MAIN_INTERFACE=' "$CONFIG_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-)
+        if [ -n "$main_interface" ]; then
+            echo "$main_interface"
             return
         fi
     fi
@@ -198,7 +199,7 @@ add_cron_job() {
         return 1
     fi
     new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
-    cron_entry="* * * * * $SCRIPT_PATH --run $CRON_COMMENT"
+    cron_entry="* * * * * $SCRIPT_PATH --run >/dev/null 2>&1 $CRON_COMMENT"
     if ! { printf '%s\n' "$new_crontab"; printf '%s\n' "$cron_entry"; } | sed '/^[[:space:]]*$/d' | crontab -; then
         echo "✗ 定时任务添加失败"
         return 1
@@ -209,7 +210,7 @@ add_cron_job() {
 
 # 完全禁用机器限速
 disable_machine_limit() {
-    local has_error=false
+    local has_error=false config_tmp
 
     echo -e "${YELLOW}==================== 禁用机器限速 ====================${NC}"
     echo ""
@@ -230,15 +231,28 @@ disable_machine_limit() {
     
     # 2. 备份并标记配置文件
     if [ -f "$CONFIG_FILE" ]; then
-        echo "备份当前配置..."
-        cp "$CONFIG_FILE" "$BACKUP_CONFIG_FILE"
-        chmod 600 "$BACKUP_CONFIG_FILE" 2>/dev/null || true
-        grep -v -E '^(DISABLED|DISABLED_TIME)=' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" || true
-        mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-        echo "DISABLED=true" >> "$CONFIG_FILE"
-        echo "DISABLED_TIME=$(date '+%Y-%m-%d %H:%M:%S')" >> "$CONFIG_FILE"
-        chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-        echo "✓ 配置已备份并标记为禁用"
+        if grep -q '^DISABLED=true$' "$CONFIG_FILE" 2>/dev/null; then
+            echo "✓ 配置已经处于禁用状态，保留原备份"
+        else
+            echo "备份当前配置..."
+            config_tmp="${CONFIG_FILE}.tmp.$$"
+            if cp "$CONFIG_FILE" "$BACKUP_CONFIG_FILE" \
+                && grep -v -E '^(DISABLED|DISABLED_TIME)=' "$CONFIG_FILE" > "$config_tmp" \
+                && { printf 'DISABLED=true\n'; printf 'DISABLED_TIME=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"; } >> "$config_tmp"; then
+                chmod 600 "$BACKUP_CONFIG_FILE" "$config_tmp" 2>/dev/null || true
+                if mv -f "$config_tmp" "$CONFIG_FILE"; then
+                    echo "✓ 配置已备份并标记为禁用"
+                else
+                    rm -f "$config_tmp"
+                    echo "✗ 配置禁用标记写入失败"
+                    has_error=true
+                fi
+            else
+                rm -f "$config_tmp"
+                echo "✗ 配置备份或禁用标记写入失败"
+                has_error=true
+            fi
+        fi
     fi
     
     # 3. 取消可能的关机计划
@@ -262,6 +276,7 @@ disable_machine_limit() {
 # 启用机器限速
 enable_machine_limit() {
     local enable_backup="$CONFIG_FILE.enable-backup.$$"
+    local config_tmp="${CONFIG_FILE}.tmp.$$"
     local had_tc_state=false
 
     echo -e "${YELLOW}==================== 启用机器限速 ====================${NC}"
@@ -280,8 +295,14 @@ enable_machine_limit() {
     # 1. 恢复配置文件（移除DISABLED标记）
     if grep -q "DISABLED=true" "$CONFIG_FILE" 2>/dev/null; then
         echo "恢复配置文件..."
-        grep -v -E '^(DISABLED|DISABLED_TIME)=' "$CONFIG_FILE" > "$CONFIG_FILE.tmp"
-        mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+        if ! grep -v -E '^(DISABLED|DISABLED_TIME)=' "$CONFIG_FILE" > "$config_tmp" \
+            || ! chmod 600 "$config_tmp" 2>/dev/null \
+            || ! mv -f "$config_tmp" "$CONFIG_FILE"; then
+            rm -f "$config_tmp"
+            rm -f "$enable_backup"
+            echo -e "${RED}配置文件恢复失败，未启动监控。${NC}"
+            return 1
+        fi
         chmod 600 "$CONFIG_FILE" 2>/dev/null || true
         echo "✓ 配置文件已恢复"
     fi
@@ -290,20 +311,26 @@ enable_machine_limit() {
     echo "启动TrafficCop监控测试..."
     if ! cd "$WORK_DIR" || ! bash "$SCRIPT_PATH" --run; then
         $had_tc_state || clear_tc_rules || true
-        cp "$enable_backup" "$CONFIG_FILE"
-        chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-        rm -f "$enable_backup"
-        echo -e "${RED}监控测试失败，已恢复启用前配置且未添加定时任务。${NC}"
+        if cp "$enable_backup" "$CONFIG_FILE"; then
+            chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+            rm -f "$enable_backup"
+            echo -e "${RED}监控测试失败，已恢复启用前配置且未添加定时任务。${NC}"
+        else
+            echo -e "${RED}监控测试失败，且配置恢复失败；备份保留在 $enable_backup。${NC}"
+        fi
         return 1
     fi
 
     # 3. 测试成功后再添加定时任务
     if ! add_cron_job; then
         $had_tc_state || clear_tc_rules || true
-        cp "$enable_backup" "$CONFIG_FILE"
-        chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-        rm -f "$enable_backup"
-        echo -e "${RED}定时任务添加失败，已恢复启用前配置。${NC}"
+        if cp "$enable_backup" "$CONFIG_FILE"; then
+            chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+            rm -f "$enable_backup"
+            echo -e "${RED}定时任务添加失败，已恢复启用前配置。${NC}"
+        else
+            echo -e "${RED}定时任务添加失败，且配置恢复失败；备份保留在 $enable_backup。${NC}"
+        fi
         return 1
     fi
     rm -f "$enable_backup"
@@ -316,6 +343,7 @@ enable_machine_limit() {
 
 # 恢复之前的配置
 restore_machine_limit() {
+    local restore_tmp="${CONFIG_FILE}.tmp.$$"
     echo -e "${YELLOW}==================== 恢复机器限速 ====================${NC}"
     echo ""
     
@@ -327,7 +355,11 @@ restore_machine_limit() {
     
     # 恢复配置文件
     echo "恢复备份配置..."
-    cp "$BACKUP_CONFIG_FILE" "$CONFIG_FILE"
+    if ! cp "$BACKUP_CONFIG_FILE" "$restore_tmp" || ! chmod 600 "$restore_tmp" 2>/dev/null || ! mv -f "$restore_tmp" "$CONFIG_FILE"; then
+        rm -f "$restore_tmp"
+        echo -e "${RED}配置恢复失败，未启动监控。${NC}"
+        return 1
+    fi
     chmod 600 "$CONFIG_FILE" 2>/dev/null || true
     echo "✓ 配置已恢复"
     

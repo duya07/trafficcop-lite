@@ -107,6 +107,27 @@ check_runtime_dependencies() {
     return 0
 }
 
+read_current_crontab() {
+    local error_file="$WORK_DIR/.crontab-read-error.$$"
+    local current_crontab status
+
+    current_crontab=$(LC_ALL=C crontab -l 2>"$error_file")
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        rm -f "$error_file"
+        printf '%s\n' "$current_crontab"
+        return 0
+    fi
+    if grep -Eqi 'no crontab for|no such file or directory' "$error_file" 2>/dev/null; then
+        rm -f "$error_file"
+        return 0
+    fi
+
+    log_cron "读取当前 crontab 失败：$(cat "$error_file" 2>/dev/null)"
+    rm -f "$error_file"
+    return 1
+}
+
 
 # 函数：获取非空输入
 get_valid_input() {
@@ -623,7 +644,10 @@ setup_cron() {
     local correct_entry="* * * * * $SCRIPT_PATH -cron # TrafficCop-Lite Telegram"
     local current_crontab new_crontab
 
-    current_crontab="$(crontab -l 2>/dev/null || true)"
+    if ! current_crontab="$(read_current_crontab)"; then
+        echo "读取当前 crontab 失败，未修改定时任务。"
+        return 1
+    fi
     new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
 
     if ! { printf '%s\n' "$new_crontab"; printf '%s\n' "$correct_entry"; } | sed '/^[[:space:]]*$/d' | crontab -; then

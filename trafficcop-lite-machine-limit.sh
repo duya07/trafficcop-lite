@@ -8,6 +8,7 @@ CONFIG_FILE="$WORK_DIR/traffic_monitor_config.txt"
 BACKUP_CONFIG_FILE="$CONFIG_FILE.disabled.backup"
 SCRIPT_PATH="$WORK_DIR/trafficcop-lite-monitor.sh"
 TC_STATE_FILE="$WORK_DIR/tc_limit_state"
+MONITOR_LOCK_FILE="$WORK_DIR/traffic_monitor.lock"
 CRON_COMMENT="# TrafficCop-Lite Monitor"
 
 find_tc_bin() {
@@ -22,6 +23,27 @@ find_tc_bin() {
 }
 
 TC_BIN="$(find_tc_bin)"
+
+read_current_crontab() {
+    local error_file="$WORK_DIR/.crontab-read-error.$$"
+    local current_crontab status
+
+    current_crontab=$(LC_ALL=C crontab -l 2>"$error_file")
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        rm -f "$error_file"
+        printf '%s\n' "$current_crontab"
+        return 0
+    fi
+    if grep -Eqi 'no crontab for|no such file or directory' "$error_file" 2>/dev/null; then
+        rm -f "$error_file"
+        return 0
+    fi
+
+    echo "读取当前 crontab 失败：$(cat "$error_file" 2>/dev/null)" >&2
+    rm -f "$error_file"
+    return 1
+}
 
 tc_state_value() {
     local key="$1"
@@ -131,13 +153,31 @@ stop_monitor_process() {
     echo "✓ 监控进程已停止"
 }
 
+acquire_monitor_cleanup_lock() {
+    touch "$MONITOR_LOCK_FILE" || return 1
+    chmod 600 "$MONITOR_LOCK_FILE" 2>/dev/null || true
+    exec 9>"$MONITOR_LOCK_FILE"
+    if ! flock -w 15 9; then
+        exec 9>&-
+        return 1
+    fi
+}
+
+release_monitor_cleanup_lock() {
+    flock -u 9 2>/dev/null || true
+    exec 9>&-
+}
+
 # 移除定时任务
 remove_cron_job() {
     local current_crontab new_crontab
 
     echo "移除定时任务..."
 
-    current_crontab="$(crontab -l 2>/dev/null || true)"
+    if ! current_crontab="$(read_current_crontab)"; then
+        echo "✗ 读取当前定时任务失败，未作修改"
+        return 1
+    fi
     new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
     if ! printf '%s\n' "$new_crontab" | crontab - 2>/dev/null; then
         echo "✗ 定时任务移除失败"
@@ -153,7 +193,10 @@ add_cron_job() {
 
     echo "添加定时任务..."
 
-    current_crontab="$(crontab -l 2>/dev/null || true)"
+    if ! current_crontab="$(read_current_crontab)"; then
+        echo "✗ 读取当前定时任务失败，未作修改"
+        return 1
+    fi
     new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
     cron_entry="* * * * * $SCRIPT_PATH --run $CRON_COMMENT"
     if ! { printf '%s\n' "$new_crontab"; printf '%s\n' "$cron_entry"; } | sed '/^[[:space:]]*$/d' | crontab -; then
@@ -171,16 +214,21 @@ disable_machine_limit() {
     echo -e "${YELLOW}==================== 禁用机器限速 ====================${NC}"
     echo ""
     
-    # 1. 停止监控进程
-    stop_monitor_process
-    
-    # 2. 清除TC限速规则
-    clear_tc_rules || has_error=true
-    
-    # 3. 移除定时任务
+    # 1. 先阻止新任务，再等待正在运行的监控退出。
     remove_cron_job || has_error=true
+    stop_monitor_process
+    if ! $has_error; then
+        if acquire_monitor_cleanup_lock; then
+            stop_monitor_process
+            clear_tc_rules || has_error=true
+            release_monitor_cleanup_lock
+        else
+            echo "✗ 无法取得监控锁，未清理 TC 规则"
+            has_error=true
+        fi
+    fi
     
-    # 4. 备份并标记配置文件
+    # 2. 备份并标记配置文件
     if [ -f "$CONFIG_FILE" ]; then
         echo "备份当前配置..."
         cp "$CONFIG_FILE" "$BACKUP_CONFIG_FILE"
@@ -193,7 +241,7 @@ disable_machine_limit() {
         echo "✓ 配置已备份并标记为禁用"
     fi
     
-    # 5. 取消可能的关机计划
+    # 3. 取消可能的关机计划
     if grep -q "LIMIT_MODE=shutdown" "$CONFIG_FILE" 2>/dev/null; then
         read -r -p "检测到关机模式配置，是否取消当前系统计划关机？[y/N]: " cancel_shutdown
         if [[ $cancel_shutdown =~ ^[Yy]$ ]]; then

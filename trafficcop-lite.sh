@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.0.5"
-LAST_UPDATE="2026-07-13"
+SCRIPT_VERSION="1.0.6"
+LAST_UPDATE="2026-07-14"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
@@ -69,6 +69,8 @@ ensure_work_dir() {
     [ ! -f "$WORK_DIR/tg_notifier_config.txt" ] || chmod 600 "$WORK_DIR/tg_notifier_config.txt" 2>/dev/null || true
     [ ! -f "$TC_STATE_FILE" ] || chmod 600 "$TC_STATE_FILE" 2>/dev/null || true
     [ ! -f "$WORK_DIR/last_reset_period" ] || chmod 600 "$WORK_DIR/last_reset_period" 2>/dev/null || true
+    [ ! -f "$WORK_DIR/current_traffic_state" ] || chmod 600 "$WORK_DIR/current_traffic_state" 2>/dev/null || true
+    [ ! -f "$WORK_DIR/vnstat_daily_coverage_start" ] || chmod 600 "$WORK_DIR/vnstat_daily_coverage_start" 2>/dev/null || true
     [ ! -f "$WORK_DIR/last_traffic_notification" ] || chmod 600 "$WORK_DIR/last_traffic_notification" 2>/dev/null || true
 }
 
@@ -279,7 +281,7 @@ update_scripts() {
     local update_base="${1:-$RAW_BASE}"
     local scripts=("trafficcop-lite.sh" "$MONITOR_SCRIPT" "$TELEGRAM_SCRIPT" "$MACHINE_LIMIT_SCRIPT")
     local temp_files=()
-    local script_name restore_name tmp_file url backup_dir
+    local script_name restore_name tmp_file url backup_dir rollback_failed
 
     ensure_work_dir
     echo -e "${CYAN}正在更新 TrafficCop-Lite 脚本...${NC}"
@@ -334,10 +336,18 @@ update_scripts() {
         tmp_file="$WORK_DIR/.${script_name}.new.$$"
         if ! chmod +x "$tmp_file" || ! mv -f "$tmp_file" "$WORK_DIR/$script_name"; then
             echo -e "${RED}替换 $script_name 失败，正在恢复更新前脚本。${NC}"
+            rollback_failed=false
             for restore_name in "${scripts[@]}"; do
-                [ ! -f "$backup_dir/$restore_name" ] || cp -a "$backup_dir/$restore_name" "$WORK_DIR/$restore_name"
+                if [ -f "$backup_dir/$restore_name" ]; then
+                    cp -a "$backup_dir/$restore_name" "$WORK_DIR/$restore_name" || rollback_failed=true
+                else
+                    rm -f "$WORK_DIR/$restore_name" || rollback_failed=true
+                fi
             done
             rm -f "${temp_files[@]}" 2>/dev/null || true
+            if $rollback_failed; then
+                echo -e "${RED}部分脚本回滚失败，备份保留在：$backup_dir${NC}"
+            fi
             return 1
         fi
         echo -e "${GREEN}✓ 已更新 $script_name${NC}"
@@ -617,7 +627,7 @@ lite_current_usage_gb() {
     local start_date="$1"
     local end_date="$2"
     local start_num end_num vnstat_json usage_bytes rx_bytes tx_bytes divisor
-    local created_num earliest_num daily_days required_days
+    local created_num earliest_num daily_days required_days trafficless_entries retention_start retention_num
 
     if [ -z "${MAIN_INTERFACE:-}" ]; then
         return 1
@@ -642,9 +652,19 @@ lite_current_usage_gb() {
         yearly) required_days=400 ;;
     esac
     daily_days=$(vnstat --showconfig 2>/dev/null | awk '$1 == "DailyDays" { print $NF; exit }')
-    if ! [[ "$created_num" =~ ^[0-9]+$ ]] || ! [[ "$earliest_num" =~ ^[0-9]+$ ]] \
-        || ! [[ "$daily_days" =~ ^[0-9]+$ ]] || [ "$daily_days" -lt "$required_days" ] \
-        || [ "$created_num" -gt "$start_num" ] || [ "$earliest_num" -eq 0 ] || [ "$earliest_num" -gt "$start_num" ]; then
+    trafficless_entries=$(vnstat --showconfig 2>/dev/null | awk '$1 == "TrafficlessEntries" { print $NF; exit }')
+    trafficless_entries=${trafficless_entries:-1}
+    retention_start=$(cat "$WORK_DIR/vnstat_daily_coverage_start" 2>/dev/null || true)
+    retention_num=${retention_start//-/}
+    if [ -z "$retention_start" ] && [ -f "$WORK_DIR/vnstat.conf.before-trafficcop-lite" ] \
+        && [[ "$earliest_num" =~ ^[0-9]{8}$ ]] && [ "$earliest_num" -ne 0 ]; then
+        retention_start="$earliest_num"
+        retention_num="$earliest_num"
+    fi
+    if ! [[ "$created_num" =~ ^[0-9]+$ ]] || [ "$created_num" -gt "$start_num" ] \
+        || { [ "$daily_days" != "-1" ] && { ! [[ "$daily_days" =~ ^[0-9]+$ ]] || [ "$daily_days" -lt "$required_days" ]; }; } \
+        || { [ -n "$retention_start" ] && { ! [[ "$retention_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$start_num" ]; }; } \
+        || { [ "$trafficless_entries" != "0" ] && { ! [[ "$earliest_num" =~ ^[0-9]+$ ]] || [ "$earliest_num" -eq 0 ] || [ "$earliest_num" -gt "$start_num" ]; }; }; then
         return 2
     fi
 
@@ -700,12 +720,16 @@ show_traffic_overview() {
     local PERIOD_START_DAY="1"
     local PERIOD_START_MONTH="1"
     local MAIN_INTERFACE=""
+    local key value
 
-    # shellcheck disable=SC1090
-    if ! source "$config_file" 2>/dev/null; then
-        echo -e "${CYAN}流量概览:${NC} ${YELLOW}配置读取失败${NC}"
-        return
-    fi
+    while IFS='=' read -r key value; do
+        value=${value%$'\r'}
+        case "$key" in
+            TRAFFIC_MODE|TRAFFIC_PERIOD|TRAFFIC_LIMIT|TRAFFIC_UNIT|PERIOD_START_DAY|PERIOD_START_MONTH|MAIN_INTERFACE)
+                printf -v "$key" '%s' "$value"
+                ;;
+        esac
+    done < "$config_file"
 
     case "$TRAFFIC_PERIOD" in
         monthly|quarterly|yearly) ;;

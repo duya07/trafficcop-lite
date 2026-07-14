@@ -17,16 +17,16 @@ fi
 
 # 更新文件路径
 CONFIG_FILE="$WORK_DIR/tg_notifier_config.txt"
-LOG_FILE="$WORK_DIR/traffic_monitor.log"
 LAST_NOTIFICATION_FILE="$WORK_DIR/last_traffic_notification"
 LAST_DAILY_REPORT_FILE="$WORK_DIR/last_daily_report"
 PERIOD_STATE_FILE="$WORK_DIR/last_reset_period"
+USAGE_STATE_FILE="$WORK_DIR/current_traffic_state"
 SCRIPT_PATH="$WORK_DIR/trafficcop-lite-telegram.sh"
 CRON_LOG="$WORK_DIR/tg_notifier_cron.log"
 TG_LOCK_FILE="$WORK_DIR/tg_notifier.lock"
 CRON_LOG_MAX_LINES="${CRON_LOG_MAX_LINES:-2000}"
 TG_DEBUG="${TG_DEBUG:-false}"
-SCRIPT_VERSION="1.0.4"
+SCRIPT_VERSION="1.0.5"
 
 trim_log_file() {
     local file="$1"
@@ -240,6 +240,16 @@ load_port_traffic_data() {
     fi
 }
 
+is_valid_timezone() {
+    local timezone="$1"
+
+    case "$timezone" in
+        ""|/*|*..*) return 1 ;;
+        UTC|GMT) return 0 ;;
+    esac
+    [ -f "/usr/share/zoneinfo/$timezone" ]
+}
+
 # 读取配置
 read_config() {
     if [ ! -f "$CONFIG_FILE" ] || [ ! -s "$CONFIG_FILE" ]; then
@@ -250,7 +260,8 @@ read_config() {
     chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 
     # 读取配置文件
-    source "$CONFIG_FILE"
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE" || return 1
     REPORT_TIMEZONE="${REPORT_TIMEZONE:-Asia/Shanghai}"
 
     # 检查必要的配置项是否都存在
@@ -258,7 +269,7 @@ read_config() {
         echo "配置文件不完整，需要重新进行配置。"
         return 1
     fi
-    if ! TZ="$REPORT_TIMEZONE" date +%H:%M >/dev/null 2>&1; then
+    if ! is_valid_timezone "$REPORT_TIMEZONE"; then
         echo "报告时区无效：$REPORT_TIMEZONE"
         return 1
     fi
@@ -276,14 +287,19 @@ write_config_value() {
 }
 
 write_config() {
-    {
+    local tmp_file="${CONFIG_FILE}.tmp.$$"
+    if ! {
         write_config_value "BOT_TOKEN" "$BOT_TOKEN"
         write_config_value "CHAT_ID" "$CHAT_ID"
         write_config_value "DAILY_REPORT_TIME" "$DAILY_REPORT_TIME"
         write_config_value "REPORT_TIMEZONE" "${REPORT_TIMEZONE:-Asia/Shanghai}"
         write_config_value "MACHINE_NAME" "$MACHINE_NAME"
-    } > "$CONFIG_FILE"
-    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+    } > "$tmp_file"; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$CONFIG_FILE" || { rm -f "$tmp_file"; return 1; }
     echo "配置已保存到 $CONFIG_FILE"
 }
 
@@ -355,7 +371,7 @@ initial_config() {
     if [ -n "$DAILY_REPORT_TIME" ]; then
         echo "请输入每日报告时间 [当前: $DAILY_REPORT_TIME，格式 HH:MM]: "
     else
-        echo "请输入每日报告时间 (时区已经固定为东八区，输入格式为 HH:MM，例如 01:00): "
+        echo "请输入每日报告时间 (格式 HH:MM，例如 01:00): "
     fi
     read -r new_daily_report_time
     if [[ -z "$new_daily_report_time" ]] && [[ -n "$DAILY_REPORT_TIME" ]]; then
@@ -371,7 +387,7 @@ initial_config() {
     echo "请输入每日报告时区 [当前: $REPORT_TIMEZONE，例如 Asia/Shanghai 或 UTC]: "
     read -r new_report_timezone
     new_report_timezone="${new_report_timezone:-$REPORT_TIMEZONE}"
-    while ! TZ="$new_report_timezone" date +%H:%M >/dev/null 2>&1; do
+    while ! is_valid_timezone "$new_report_timezone"; do
         echo "时区无效，请重新输入: "
         read -r new_report_timezone
     done
@@ -383,7 +399,7 @@ initial_config() {
     DAILY_REPORT_TIME="$new_daily_report_time"
     REPORT_TIMEZONE="$new_report_timezone"
     
-    write_config
+    write_config || return 1
     
     echo ""
     echo "======================================"
@@ -543,9 +559,57 @@ write_daily_report_state() {
     mv -f "$tmp_file" "$LAST_DAILY_REPORT_FILE"
 }
 
+read_current_traffic_state() {
+    local key value now age period_state
+
+    CURRENT_TRAFFIC_STATUS=""
+    CURRENT_TRAFFIC_PERIOD_START=""
+    CURRENT_TRAFFIC_PERIOD_END=""
+    CURRENT_TRAFFIC_USAGE=""
+    CURRENT_TRAFFIC_LIMIT=""
+    CURRENT_TRAFFIC_THRESHOLD=""
+    CURRENT_TRAFFIC_UNIT=""
+    CURRENT_TRAFFIC_UPDATED_EPOCH=""
+
+    [ -s "$USAGE_STATE_FILE" ] || return 1
+    while IFS='=' read -r key value; do
+        value=${value%$'\r'}
+        case "$key" in
+            STATUS) CURRENT_TRAFFIC_STATUS="$value" ;;
+            PERIOD_START) CURRENT_TRAFFIC_PERIOD_START="$value" ;;
+            PERIOD_END) CURRENT_TRAFFIC_PERIOD_END="$value" ;;
+            USAGE) CURRENT_TRAFFIC_USAGE="$value" ;;
+            TRAFFIC_LIMIT) CURRENT_TRAFFIC_LIMIT="$value" ;;
+            LIMIT_THRESHOLD) CURRENT_TRAFFIC_THRESHOLD="$value" ;;
+            UNIT) CURRENT_TRAFFIC_UNIT="$value" ;;
+            UPDATED_EPOCH) CURRENT_TRAFFIC_UPDATED_EPOCH="$value" ;;
+        esac
+    done < "$USAGE_STATE_FILE"
+
+    case "$CURRENT_TRAFFIC_STATUS" in
+        normal|limited|shutdown) ;;
+        *) return 1 ;;
+    esac
+    [[ "$CURRENT_TRAFFIC_PERIOD_START" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    [[ "$CURRENT_TRAFFIC_PERIOD_END" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    [[ "$CURRENT_TRAFFIC_USAGE" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    [[ "$CURRENT_TRAFFIC_LIMIT" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    [[ "$CURRENT_TRAFFIC_THRESHOLD" =~ ^[0-9]+([.][0-9]+)?$ ]] || return 1
+    [[ "$CURRENT_TRAFFIC_UPDATED_EPOCH" =~ ^[0-9]+$ ]] || return 1
+    case "$CURRENT_TRAFFIC_UNIT" in
+        GB|GiB) ;;
+        *) return 1 ;;
+    esac
+
+    now=$(date +%s) || return 1
+    age=$((now - CURRENT_TRAFFIC_UPDATED_EPOCH))
+    [ "$age" -ge -60 ] && [ "$age" -le 300 ] || return 1
+    period_state=$(cat "$PERIOD_STATE_FILE" 2>/dev/null || true)
+    [ -z "$period_state" ] || [ "$period_state" = "$CURRENT_TRAFFIC_PERIOD_START" ]
+}
+
 check_and_notify() {
     local current_status="未知"
-    local relevant_log=""
     local cycle_event=""
     local next_status next_cycle effective_last_status
     local cycle_failed=false
@@ -553,15 +617,16 @@ check_and_notify() {
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 开始检查流量状态..."| tee -a "$CRON_LOG"
 
-    relevant_log=$(tac "$LOG_FILE" 2>/dev/null | grep -m 1 -E "TC 限速规则(已应用/更新|保持生效)|流量超出限制，系统将在 1 分钟后关机|流量正常")
     cycle_event=$(cat "$PERIOD_STATE_FILE" 2>/dev/null || true)
 
-    if echo "$relevant_log" | grep -q "流量超出限制，系统将在 1 分钟后关机"; then
-        current_status="关机"
-    elif echo "$relevant_log" | grep -Eq "TC 限速规则(已应用/更新|保持生效)"; then
-        current_status="限速"
-    elif echo "$relevant_log" | grep -q "流量正常"; then
-        current_status="正常"
+    if read_current_traffic_state; then
+        case "$CURRENT_TRAFFIC_STATUS" in
+            shutdown) current_status="关机" ;;
+            limited) current_status="限速" ;;
+            normal) current_status="正常" ;;
+        esac
+    else
+        log_cron "实时流量状态不存在、无效或已过期，不根据旧日志发送状态通知"
     fi
 
     [ -f "$LAST_NOTIFICATION_FILE" ] && had_notification_state=true
@@ -641,7 +706,7 @@ check_and_notify() {
 
 # 设置定时任务
 setup_cron() {
-    local correct_entry="* * * * * $SCRIPT_PATH -cron # TrafficCop-Lite Telegram"
+    local correct_entry="* * * * * $SCRIPT_PATH -cron >/dev/null 2>&1 # TrafficCop-Lite Telegram"
     local current_crontab new_crontab
 
     if ! current_crontab="$(read_current_crontab)"; then
@@ -667,7 +732,7 @@ update_cron_time() {
     echo "正在更新cron任务时间为: $new_time"
     
     # 重新读取配置以获取最新时间
-    read_config
+    read_config || return 1
     
     # 重新设置cron任务
     setup_cron || return 1
@@ -680,31 +745,13 @@ daily_report() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 开始生成每日报告"| tee -a "$CRON_LOG"
     echo "$(date '+%Y-%m-%d %H:%M:%S') : DAILY_REPORT_TIME=$DAILY_REPORT_TIME"| tee -a "$CRON_LOG"
     echo "$(date '+%Y-%m-%d %H:%M:%S') : Telegram 配置已加载，机器名=$MACHINE_NAME"| tee -a "$CRON_LOG"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') : 日志文件路径: $LOG_FILE"| tee -a "$CRON_LOG"
-
-    # 反向读取日志文件，查找第一个同时包含"当前使用流量"和"限制流量"的行
-    local usage_line=$(tac "$LOG_FILE" | grep -m 1 -E "当前使用流量:.*限制流量:")
-
-    if [[ -z "$usage_line" ]]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') : 无法在日志中找到同时包含当前使用流量和限制流量的行"| tee -a "$CRON_LOG"
+    if ! read_current_traffic_state; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') : 实时流量状态不存在、无效或已过期，稍后重试每日报告"| tee -a "$CRON_LOG"
         return 1
     fi
 
-    local current_usage limit configured_limit traffic_unit unit_label
-    current_usage=$(echo "$usage_line" | sed -n 's/.*当前使用流量:[[:space:]]*\([0-9.][0-9.]*[[:space:]][A-Za-z][A-Za-z]*\).*/\1/p')
-    limit=$(echo "$usage_line" | sed -n 's/.*限制流量:[[:space:]]*\([0-9.][0-9.]*[[:space:]][A-Za-z][A-Za-z]*\).*/\1/p')
-    configured_limit=$(grep '^TRAFFIC_LIMIT=' "$WORK_DIR/traffic_monitor_config.txt" 2>/dev/null | tail -n 1 | cut -d'=' -f2-)
-    traffic_unit=$(grep '^TRAFFIC_UNIT=' "$WORK_DIR/traffic_monitor_config.txt" 2>/dev/null | tail -n 1 | cut -d'=' -f2-)
-    [ "$traffic_unit" = "decimal" ] && unit_label="GB" || unit_label="GiB"
-    if [[ "$configured_limit" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-        limit="$configured_limit $unit_label"
-    fi
-
-    if [[ -z "$current_usage" || -z "$limit" ]]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') : 无法从行中提取流量信息"| tee -a "$CRON_LOG"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') : 问题行: $usage_line"| tee -a "$CRON_LOG"
-        return 1
-    fi
+    local current_usage="${CURRENT_TRAFFIC_USAGE} ${CURRENT_TRAFFIC_UNIT}"
+    local limit="${CURRENT_TRAFFIC_LIMIT} ${CURRENT_TRAFFIC_UNIT}"
 
     # 构建基础消息
     local message="📊 [${MACHINE_NAME}]每日流量报告%0A%0A🖥️ 机器总流量：%0A当前使用：$current_usage%0A流量限制：$limit"
@@ -885,7 +932,7 @@ if [[ "$*" == *"-cron"* ]]; then
         # 菜单模式 (替换原来的交互模式)
         if ! read_config; then
             echo "需要进行初始化配置。"
-            initial_config
+            initial_config || return 1
         fi
         
         if ! setup_cron; then
@@ -942,29 +989,41 @@ if [[ "$*" == *"-cron"* ]]; then
                     ;;
                 4)
                     echo "正在重新加载配置..."
-                    read_config
-                    echo "配置已重新加载。"
+                    if read_config; then
+                        echo "配置已重新加载。"
+                    else
+                        echo "配置重新加载失败。"
+                    fi
                     ;;
                 5)
                     echo "进入配置修改模式..."
-                    initial_config
+                    initial_config || echo "配置修改失败。"
                     ;;
                 6)
+                    local config_tmp="${CONFIG_FILE}.tmp.$$"
                     echo "修改每日报告时间"
                     echo -n "请输入新的每日报告时间 (HH:MM): "
                     read -r new_time
                     if [[ $new_time =~ ^([0-1][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
-                        # 直接使用命令行工具修改配置，避免交互环境问题
-                        cp "$CONFIG_FILE" "$CONFIG_FILE.backup"
-                        awk -v new_time="$new_time" '
+                        if ! cp "$CONFIG_FILE" "$CONFIG_FILE.backup" \
+                            || ! awk -v new_time="$new_time" '
                         /^DAILY_REPORT_TIME=/ { print "DAILY_REPORT_TIME=" new_time; next }
                         { print }
-                        ' "$CONFIG_FILE.backup" > "$CONFIG_FILE"
-                        chmod 600 "$CONFIG_FILE" "$CONFIG_FILE.backup" 2>/dev/null || true
+                        ' "$CONFIG_FILE.backup" > "$config_tmp" \
+                            || ! chmod 600 "$config_tmp" 2>/dev/null \
+                            || ! mv -f "$config_tmp" "$CONFIG_FILE"; then
+                            rm -f "$config_tmp"
+                            echo "每日报告时间更新失败，原配置未被覆盖。"
+                            continue
+                        fi
+                        chmod 600 "$CONFIG_FILE.backup" 2>/dev/null || true
                         
                         echo "每日报告时间已更新为 $new_time"
                         # 更新 cron 任务
-                        update_cron_time "$new_time"
+                        if ! update_cron_time "$new_time"; then
+                            echo "定时任务更新失败，请检查上方错误。"
+                            continue
+                        fi
                         # 修改时间后立即刷新缓存
                         echo "正在刷新端口流量缓存..."
                         save_port_traffic_data

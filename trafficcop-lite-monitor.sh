@@ -15,8 +15,10 @@ SCRIPT_PATH="$WORK_DIR/trafficcop-lite-monitor.sh"
 LOCK_FILE="$WORK_DIR/traffic_monitor.lock"
 TC_STATE_FILE="$WORK_DIR/tc_limit_state"
 PERIOD_STATE_FILE="$WORK_DIR/last_reset_period"
+RETENTION_STATE_FILE="$WORK_DIR/vnstat_daily_coverage_start"
+USAGE_STATE_FILE="$WORK_DIR/current_traffic_state"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.0.4"
+SCRIPT_VERSION="1.0.5"
 mkdir -p "$WORK_DIR"
 chmod 700 "$WORK_DIR" 2>/dev/null || true
 
@@ -111,14 +113,14 @@ ensure_vnstat_interface() {
 }
 
 ensure_vnstat_daily_retention() {
-    local required_days current_days config_path answer tmp_file
+    local required_days current_days config_path answer tmp_file mode owner group marker_tmp
     case "$TRAFFIC_PERIOD" in
         monthly) required_days=40 ;;
         quarterly) required_days=100 ;;
         yearly) required_days=400 ;;
     esac
     current_days=$(vnstat --showconfig 2>/dev/null | awk '$1 == "DailyDays" { print $NF; exit }')
-    if [[ "$current_days" =~ ^[0-9]+$ ]] && [ "$current_days" -ge "$required_days" ]; then
+    if [ "$current_days" = "-1" ] || { [[ "$current_days" =~ ^[0-9]+$ ]] && [ "$current_days" -ge "$required_days" ]; }; then
         return 0
     fi
 
@@ -144,8 +146,17 @@ ensure_vnstat_daily_retention() {
         { print }
         END { if (!updated) print "DailyDays " days }
     ' "$config_path" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
-    chmod 644 "$tmp_file" 2>/dev/null || true
-    mv -f "$tmp_file" "$config_path" || return 1
+    mode=$(stat -c '%a' "$config_path" 2>/dev/null || echo 644)
+    owner=$(stat -c '%u' "$config_path" 2>/dev/null || echo 0)
+    group=$(stat -c '%g' "$config_path" 2>/dev/null || echo 0)
+    chmod "$mode" "$tmp_file" 2>/dev/null || chmod 644 "$tmp_file" 2>/dev/null || true
+    chown "$owner:$group" "$tmp_file" 2>/dev/null || true
+
+    marker_tmp="${RETENTION_STATE_FILE}.tmp.$$"
+    date +%Y-%m-%d > "$marker_tmp" || { rm -f "$tmp_file"; return 1; }
+    chmod 600 "$marker_tmp" 2>/dev/null || true
+    mv -f "$marker_tmp" "$RETENTION_STATE_FILE" || { rm -f "$tmp_file" "$marker_tmp"; return 1; }
+    mv -f "$tmp_file" "$config_path" || { rm -f "$tmp_file"; return 1; }
     if command_exists systemctl; then
         systemctl restart vnstat.service >/dev/null 2>&1 || systemctl restart vnstatd.service >/dev/null 2>&1 || true
     elif command_exists rc-service; then
@@ -463,6 +474,11 @@ validate_config() {
             ;;
     esac
 
+    if [ "${LIMIT_MODE:-}" = "shutdown" ] && ! command_exists shutdown; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：关机模式需要系统 shutdown 命令。" | tee -a "$LOG_FILE"
+        has_error=true
+    fi
+
     if $has_error; then
         return 1
     fi
@@ -473,8 +489,17 @@ validate_config() {
 read_config() {
     if [ -f "$CONFIG_FILE" ]; then
         chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-        # shellcheck disable=SC1090
-        source "$CONFIG_FILE" || return 1
+        unset TRAFFIC_MODE TRAFFIC_PERIOD TRAFFIC_LIMIT TRAFFIC_TOLERANCE TRAFFIC_UNIT
+        unset PERIOD_START_DAY PERIOD_START_MONTH LIMIT_SPEED MAIN_INTERFACE LIMIT_MODE
+        unset DISABLED DISABLED_TIME
+        while IFS='=' read -r key value; do
+            value=${value%$'\r'}
+            case "$key" in
+                TRAFFIC_MODE|TRAFFIC_PERIOD|TRAFFIC_LIMIT|TRAFFIC_TOLERANCE|TRAFFIC_UNIT|PERIOD_START_DAY|PERIOD_START_MONTH|LIMIT_SPEED|MAIN_INTERFACE|LIMIT_MODE|DISABLED|DISABLED_TIME)
+                    printf -v "$key" '%s' "$value"
+                    ;;
+            esac
+        done < "$CONFIG_FILE"
         validate_config
     else
         return 1
@@ -483,7 +508,8 @@ read_config() {
 
 # 写入配置
 write_config() {
-    cat > "$CONFIG_FILE" << EOF
+    local tmp_file="${CONFIG_FILE}.tmp.$$"
+    if ! cat > "$tmp_file" << EOF
 TRAFFIC_MODE=$TRAFFIC_MODE
 TRAFFIC_PERIOD=$TRAFFIC_PERIOD
 TRAFFIC_LIMIT=$TRAFFIC_LIMIT
@@ -495,7 +521,12 @@ LIMIT_SPEED=${LIMIT_SPEED:-20}
 MAIN_INTERFACE=$MAIN_INTERFACE
 LIMIT_MODE=$LIMIT_MODE
 EOF
-    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+    then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$CONFIG_FILE" || { rm -f "$tmp_file"; return 1; }
     echo "$(date '+%Y-%m-%d %H:%M:%S') 配置已更新"| tee -a "$LOG_FILE"
 }
 
@@ -658,7 +689,7 @@ initial_config() {
         esac
     done
 
-    write_config
+    write_config || return 1
 }
 
 # 返回指定年月的周期锚点。若用户配置了不存在的日期（如 2 月 31 日），使用当月最后一天。
@@ -806,7 +837,7 @@ get_period_end_date() {
 get_traffic_usage() {
     local start_date end_date
     local start_num end_num vnstat_json usage_bytes rx_bytes tx_bytes divisor
-    local created_num earliest_num daily_days required_days
+    local created_num earliest_num daily_days required_days trafficless_entries retention_start retention_num
 
     start_date=$(get_period_start_date)
     end_date=$(get_period_end_date)
@@ -836,12 +867,23 @@ get_traffic_usage() {
         yearly) required_days=400 ;;
     esac
     daily_days=$(vnstat --showconfig 2>/dev/null | awk '$1 == "DailyDays" { print $NF; exit }')
-    if ! [[ "$daily_days" =~ ^[0-9]+$ ]] || [ "$daily_days" -lt "$required_days" ]; then
+    if [ "$daily_days" != "-1" ] && { ! [[ "$daily_days" =~ ^[0-9]+$ ]] || [ "$daily_days" -lt "$required_days" ]; }; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: vnStat DailyDays=${daily_days:-未知}，不足以可靠统计当前周期（建议至少 $required_days）" >&2
         return 1
     fi
-    if ! [[ "$created_num" =~ ^[0-9]+$ ]] || ! [[ "$earliest_num" =~ ^[0-9]+$ ]] \
-        || [ "$created_num" -gt "$start_num" ] || [ "$earliest_num" -eq 0 ] || [ "$earliest_num" -gt "$start_num" ]; then
+    trafficless_entries=$(vnstat --showconfig 2>/dev/null | awk '$1 == "TrafficlessEntries" { print $NF; exit }')
+    trafficless_entries=${trafficless_entries:-1}
+    retention_start=$(cat "$RETENTION_STATE_FILE" 2>/dev/null || true)
+    retention_num=${retention_start//-/}
+    if [ -z "$retention_start" ] && [ -f "$WORK_DIR/vnstat.conf.before-trafficcop-lite" ] \
+        && [[ "$earliest_num" =~ ^[0-9]{8}$ ]] && [ "$earliest_num" -ne 0 ]; then
+        # 旧版没有记录调整 DailyDays 的日期，以最早日记录作为保守覆盖起点。
+        retention_start="$earliest_num"
+        retention_num="$earliest_num"
+    fi
+    if ! [[ "$created_num" =~ ^[0-9]+$ ]] || [ "$created_num" -gt "$start_num" ] \
+        || { [ -n "$retention_start" ] && { ! [[ "$retention_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$start_num" ]; }; } \
+        || { [ "$trafficless_entries" != "0" ] && { ! [[ "$earliest_num" =~ ^[0-9]+$ ]] || [ "$earliest_num" -eq 0 ] || [ "$earliest_num" -gt "$start_num" ]; }; }; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: vnStat 日数据未完整覆盖周期起点 $start_date，拒绝按不完整数据限速" >&2
         return 1
     fi
@@ -1074,6 +1116,27 @@ clear_owned_tc_rules() {
     rm -f "$TC_STATE_FILE"
 }
 
+write_usage_state() {
+    local status="$1"
+    local current_usage="$2"
+    local limit_threshold="$3"
+    local unit_label="$4"
+    local tmp_file="${USAGE_STATE_FILE}.tmp.$$"
+
+    {
+        printf 'STATUS=%s\n' "$status"
+        printf 'PERIOD_START=%s\n' "$(get_period_start_date)"
+        printf 'PERIOD_END=%s\n' "$(get_period_end_date)"
+        printf 'USAGE=%s\n' "$current_usage"
+        printf 'TRAFFIC_LIMIT=%s\n' "$TRAFFIC_LIMIT"
+        printf 'LIMIT_THRESHOLD=%s\n' "$limit_threshold"
+        printf 'UNIT=%s\n' "$unit_label"
+        printf 'UPDATED_EPOCH=%s\n' "$(date +%s)"
+    } > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$USAGE_STATE_FILE" || { rm -f "$tmp_file"; return 1; }
+}
+
 
 # 修改 check_and_limit_traffic 函数
 check_and_limit_traffic() {
@@ -1103,42 +1166,54 @@ check_and_limit_traffic() {
                 echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到限速值异常：$safe_limit_speed，已使用默认值 20 kbit/s" | tee -a "$LOG_FILE"
                 safe_limit_speed=20
             fi
-            apply_tc_limit "$safe_limit_speed"
+            if ! apply_tc_limit "$safe_limit_speed"; then
+                return 1
+            fi
+            write_usage_state "limited" "$current_usage" "$limit_threshold" "$unit_label" || return 1
         elif [ "$LIMIT_MODE" = "shutdown" ]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制，系统将在 1 分钟后关机" | tee -a "$LOG_FILE"
-            shutdown -h +1 "流量超出限制，系统将在 1 分钟后关机"
+            if ! shutdown -h +1 "流量超出限制，系统将在 1 分钟后关机"; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 计划关机失败" | tee -a "$LOG_FILE"
+                return 1
+            fi
+            write_usage_state "shutdown" "$current_usage" "$limit_threshold" "$unit_label" || return 1
         fi
     else
         if ! clear_owned_tc_rules "流量正常"; then
             return 1
         fi
         echo "$(date '+%Y-%m-%d %H:%M:%S') 流量正常，已完成限速状态检查" | tee -a "$LOG_FILE"
+        write_usage_state "normal" "$current_usage" "$limit_threshold" "$unit_label" || return 1
     fi
 }
 
 
 # 检查是否需要重置限制
 check_reset_limit() {
-    local current_date period_start last_reset_period tmp_file
+    local period_start last_reset_period tmp_file
 
-    current_date=$(date +%Y-%m-%d)
     period_start=$(get_period_start_date)
+    last_reset_period=$(cat "$PERIOD_STATE_FILE" 2>/dev/null || true)
 
-    if [[ "$current_date" == "$period_start" ]]; then
-        last_reset_period=$(cat "$PERIOD_STATE_FILE" 2>/dev/null || true)
-        if [ "$last_reset_period" = "$period_start" ]; then
-            return 0
-        fi
+    if [ "$last_reset_period" = "$period_start" ]; then
+        return 0
+    fi
 
+    if [ -n "$last_reset_period" ]; then
         if ! clear_owned_tc_rules "新的流量周期开始"; then
             return 1
         fi
+    fi
+    rm -f "$USAGE_STATE_FILE"
 
-        tmp_file="${PERIOD_STATE_FILE}.tmp.$$"
-        printf '%s\n' "$period_start" > "$tmp_file" || return 1
-        chmod 600 "$tmp_file" 2>/dev/null || true
-        mv -f "$tmp_file" "$PERIOD_STATE_FILE"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 新的流量周期开始，重置限制"| tee -a "$LOG_FILE"
+    tmp_file="${PERIOD_STATE_FILE}.tmp.$$"
+    printf '%s\n' "$period_start" > "$tmp_file" || return 1
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$PERIOD_STATE_FILE" || { rm -f "$tmp_file"; return 1; }
+    if [ -n "$last_reset_period" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到新的流量周期，已重置限制"| tee -a "$LOG_FILE"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 已初始化当前流量周期状态"| tee -a "$LOG_FILE"
     fi
     return 0
 }
@@ -1150,7 +1225,7 @@ setup_crontab() {
         return 1
     fi
     new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
-    cron_entry="* * * * * $SCRIPT_PATH --run # TrafficCop-Lite Monitor"
+    cron_entry="* * * * * $SCRIPT_PATH --run >/dev/null 2>&1 # TrafficCop-Lite Monitor"
 
     if ! { printf '%s\n' "$new_crontab"; printf '%s\n' "$cron_entry"; } | sed '/^[[:space:]]*$/d' | crontab -; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') Crontab 设置失败" | tee -a "$LOG_FILE"
@@ -1206,42 +1281,27 @@ main() {
         return 1
     fi
     if check_existing_setup; then
-        read_config
+        read_config || return 1
         show_current_config
 
         echo "$(date '+%Y-%m-%d %H:%M:%S') 是否需要修改配置？(y/n): 5秒内按任意键修改配置，否则保持现有配置" | tee -a "$LOG_FILE"
         echo "$(date '+%Y-%m-%d %H:%M:%S') 开始等待用户输入..." | tee -a "$LOG_FILE"
         
-        start_time=$(date +%s.%N)
-     if read -r -t 5 -n 1 modify_config; then
-    end_time=$(date +%s.%N)
-    duration=$(echo "$end_time - $start_time" | bc 2>/dev/null || echo "0")
-    echo ""  # 换行
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 收到用户输入: '${modify_config}' (ASCII: $(printf '%d' "'$modify_config" 2>/dev/null || echo "N/A"))" | tee -a "$LOG_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 等待时间: $duration 秒" | tee -a "$LOG_FILE"
-    if (( $(echo "$duration < 0.1" | bc -l 2>/dev/null || echo "0") )); then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 警告：输入时间过短，可能是自动输入" | tee -a "$LOG_FILE"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 忽略此输入，保持现有配置。" | tee -a "$LOG_FILE"
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 开始修改配置..." | tee -a "$LOG_FILE"
-        initial_config
-        setup_crontab || return 1
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 配置已更新，脚本将每分钟自动运行一次" | tee -a "$LOG_FILE"
-    fi
-else
-    end_time=$(date +%s.%N)
-    duration=$(echo "$end_time - $start_time" | bc 2>/dev/null || echo "0")
-    echo ""  # 换行
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 等待超时，无用户输入" | tee -a "$LOG_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 等待时间: $duration 秒" | tee -a "$LOG_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 保持现有配置。" | tee -a "$LOG_FILE"
-fi
+        if read -r -t 5 -n 1; then
+            echo ""
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 开始修改配置..." | tee -a "$LOG_FILE"
+            initial_config || return 1
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置已更新，脚本将每分钟自动运行一次" | tee -a "$LOG_FILE"
+        else
+            echo ""
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 等待超时，保持现有配置。" | tee -a "$LOG_FILE"
+        fi
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') 开始初始化配置..." | tee -a "$LOG_FILE"
-        initial_config
-        setup_crontab || return 1
+        initial_config || return 1
         echo "$(date '+%Y-%m-%d %H:%M:%S') 初始配置完成，脚本将每分钟自动运行一次" | tee -a "$LOG_FILE"
     fi
+    setup_crontab || return 1
 
     # 显示当前流量使用情况和限制状态
     if read_config; then

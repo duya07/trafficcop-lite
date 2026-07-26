@@ -20,7 +20,7 @@ USAGE_STATE_FILE="$WORK_DIR/current_traffic_state"
 ENFORCEMENT_STATE_FILE="$WORK_DIR/enforcement_state"
 SHUTDOWN_STATE_FILE="$WORK_DIR/shutdown_limit_state"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 mkdir -p "$WORK_DIR"
 chmod 700 "$WORK_DIR" 2>/dev/null || true
 
@@ -713,7 +713,7 @@ configure_history_policy() {
     fi
     echo ""
     echo "检测到 vnStat 历史不足以覆盖周期起点 $period_start。"
-    echo "当前可用流量历史约从 $available_start 开始，之前的流量无法由重装后的系统补回。"
+    echo "当前可用流量历史约从 $available_start 开始；受 vnStat 本地历史记录限制，此前流量无法补回。"
     echo "继续后，脚本会按现有历史统计并正常执行限制，但实际已用流量可能偏低。"
     echo "主菜单会持续显示该提示，直到进入具有完整历史的新周期。"
     echo ""
@@ -907,7 +907,7 @@ initial_config() {
                     echo "无效输入，使用默认值：20 kbit/s"
                     LIMIT_SPEED=20
                 fi
-                read -r -p "请输入开机后限速宽限时间（分钟，0=立即，默认为10）: " TC_BOOT_GRACE_MINUTES
+                read -r -p "请输入开机后限速宽限时间（防卡死，单位：分钟；0=立即，默认为10）: " TC_BOOT_GRACE_MINUTES
                 TC_BOOT_GRACE_MINUTES=${TC_BOOT_GRACE_MINUTES:-10}
                 if ! [[ "$TC_BOOT_GRACE_MINUTES" =~ ^[0-9]+$ ]] || [ "$TC_BOOT_GRACE_MINUTES" -gt 1440 ]; then
                     echo "无效输入，使用默认值：10 分钟"

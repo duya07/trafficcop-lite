@@ -151,7 +151,7 @@ sudo env RAW_BASE="https://v6.gh-proxy.org/https://raw.githubusercontent.com/duy
 
 例如输入 `6`，年度统计周期会按每年 6 月的指定起始日开始计算。
 
-配置时还可选择流量单位：`GB` 使用十进制（1000³ 字节，适合服务商配额），`GiB` 使用二进制（1024³ 字节，兼容旧版）。季度和年度统计依赖 vnStat 的每日历史；脚本可调整 `DailyDays` 并将原配置备份到 `/etc/trafficcop-lite/vnstat.conf.before-trafficcop-lite`。`DailyDays=-1` 会按无限保留处理，`TrafficlessEntries=0` 产生的无流量日期缺口不会被误判为历史丢失。已有历史不足时仍会明确提示并跳过限速，不会按不完整数据误判。
+配置时还可选择流量单位：`GB` 使用十进制（1000³ 字节，适合服务商配额），`GiB` 使用二进制（1024³ 字节，兼容旧版）。容错范围必须大于等于 `0` 且小于流量限制，异常旧配置会停止本轮判断，不会按 `0` 阈值触发限速或关机。季度和年度统计依赖 vnStat 的每日历史；脚本可调整 `DailyDays` 并将原配置备份到 `/etc/trafficcop-lite/vnstat.conf.before-trafficcop-lite`。`DailyDays=-1` 会按无限保留处理，`TrafficlessEntries=0` 产生的无流量日期缺口不会被误判为历史丢失。已有历史不足时仍会明确提示并跳过限速，不会按不完整数据误判。
 
 ## 5) 流量计费口径
 

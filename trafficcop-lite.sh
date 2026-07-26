@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.1.0"
-LAST_UPDATE="2026-07-26"
+SCRIPT_VERSION="1.1.1"
+LAST_UPDATE="2026-07-27"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
@@ -969,7 +969,10 @@ view_logs() {
         echo "3) 当前 crontab 相关条目"
         echo "0) 返回主菜单"
         echo ""
-        read -r -p "请输入选项: " choice
+        if ! read -r -p "请输入选项: " choice; then
+            echo ""
+            return
+        fi
 
         case "$choice" in
             1) tail_file "$WORK_DIR/traffic_monitor.log" "流量监控日志"; pause ;;
@@ -1007,7 +1010,10 @@ view_config() {
         echo "3) 独立版安装状态"
         echo "0) 返回主菜单"
         echo ""
-        read -r -p "请输入选项: " choice
+        if ! read -r -p "请输入选项: " choice; then
+            echo ""
+            return
+        fi
 
         case "$choice" in
             1) print_config_file "$WORK_DIR/traffic_monitor_config.txt" "流量监控配置"; pause ;;
@@ -1199,7 +1205,7 @@ stop_all_services() {
     echo "✓ 已停止独立版监控/通知进程"
 
     clear_lite_tc_rules_interactive || has_error=true
-    cancel_shutdown_interactive
+    cancel_shutdown_interactive || has_error=true
     release_monitor_cleanup_lock
 
     if $has_error; then
@@ -1244,7 +1250,12 @@ uninstall_lite() {
         pause
         return 1
     fi
-    cancel_shutdown_interactive
+    if ! cancel_shutdown_interactive; then
+        release_monitor_cleanup_lock
+        echo -e "${RED}卸载已中止：本脚本记录的计划关机未能安全取消，状态文件已保留。${NC}"
+        pause
+        return 1
+    fi
 
     if [ -d "$WORK_DIR" ]; then
         read -r -p "是否先备份配置和日志？[Y/n]: " keep_backup
@@ -1364,7 +1375,11 @@ main() {
 
     while true; do
         show_main_menu
-        read -r -p "请输入选项: " choice
+        if ! read -r -p "请输入选项: " choice; then
+            echo ""
+            echo -e "${GREEN}输入已结束，退出 TrafficCop-Lite。${NC}"
+            exit 0
+        fi
         case "$choice" in
             1) manage_monitor ;;
             2) manage_telegram ;;

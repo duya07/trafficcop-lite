@@ -216,7 +216,7 @@ sudo bash /etc/trafficcop-lite/trafficcop-lite.sh --uninstall
 - 清理旧版 `/usr/local/bin/ncl` 和 `/usr/local/bin/tc` 快捷命令（仅当它们指向本脚本时）。
 - 清理独立版 crontab 条目。
 - 删除目录前会按当前配置检查 TC 限速规则和计划关机，并要求确认后处理。
-- TC 或 crontab 清理失败时会中止删除目录，避免留下失去状态记录的限速或定时任务。
+- TC、计划关机或 crontab 清理失败时会中止删除目录，避免留下失去状态记录的限速或定时任务。
 - 默认备份配置和日志到 `/etc/trafficcop-lite-backup-时间戳/`。
 - 不卸载系统依赖包。
 - 不删除上游默认目录 `/root/TrafficCop`。

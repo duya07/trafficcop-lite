@@ -18,7 +18,7 @@ PERIOD_STATE_FILE="$WORK_DIR/last_reset_period"
 RETENTION_STATE_FILE="$WORK_DIR/vnstat_daily_coverage_start"
 USAGE_STATE_FILE="$WORK_DIR/current_traffic_state"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.0.5"
+SCRIPT_VERSION="1.0.6"
 mkdir -p "$WORK_DIR"
 chmod 700 "$WORK_DIR" 2>/dev/null || true
 
@@ -68,6 +68,20 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+vnstat_config_value() {
+    local target="$1"
+    vnstat --showconfig 2>/dev/null | awk -v target="$target" '
+        {
+            key=$1
+            sub(/^[;#]/, "", key)
+            if (key == target) {
+                print $NF
+                exit
+            }
+        }
+    '
+}
+
 read_current_crontab() {
     local error_file="$WORK_DIR/.crontab-read-error.$$"
     local current_crontab status
@@ -91,7 +105,7 @@ read_current_crontab() {
 
 align_timezone_with_vnstat() {
     local use_utc
-    use_utc=$(vnstat --showconfig 2>/dev/null | awk '$1 == "UseUTC" { print $NF; exit }')
+    use_utc=$(vnstat_config_value "UseUTC")
     if [ "$use_utc" = "1" ]; then
         export TZ=UTC
     else
@@ -119,7 +133,7 @@ ensure_vnstat_daily_retention() {
         quarterly) required_days=100 ;;
         yearly) required_days=400 ;;
     esac
-    current_days=$(vnstat --showconfig 2>/dev/null | awk '$1 == "DailyDays" { print $NF; exit }')
+    current_days=$(vnstat_config_value "DailyDays")
     if [ "$current_days" = "-1" ] || { [[ "$current_days" =~ ^[0-9]+$ ]] && [ "$current_days" -ge "$required_days" ]; }; then
         return 0
     fi
@@ -142,7 +156,7 @@ ensure_vnstat_daily_retention() {
     tmp_file="${config_path}.trafficcop-lite.$$"
     awk -v days="$required_days" '
         BEGIN { updated=0 }
-        /^[[:space:]]*DailyDays[[:space:]]+/ { print "DailyDays " days; updated=1; next }
+        /^[[:space:]]*[;#]?[[:space:]]*DailyDays[[:space:]]+/ { print "DailyDays " days; updated=1; next }
         { print }
         END { if (!updated) print "DailyDays " days }
     ' "$config_path" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
@@ -351,13 +365,22 @@ check_and_install_packages() {
     fi
 
     # 获取主要网络接口
-    local main_interface=$(ip route | grep default | sed -e 's/^.*dev \([^ ]*\).*$/\1/' | head -n 1)
+    local main_interface
+    main_interface=$(ip route show default 2>/dev/null | awk '{
+        for (i = 1; i <= NF; i++) {
+            if ($i == "dev" && (i + 1) <= NF) {
+                print $(i + 1)
+                exit
+            }
+        }
+    }')
     echo "$(date '+%Y-%m-%d %H:%M:%S') 主要网络接口: $main_interface" | tee -a "$LOG_FILE"
 
     # 获取 vnstat 统计开始时间
     if [ -n "$main_interface" ]; then
-        local vnstat_json=$(vnstat -i "$main_interface" --json d)
-        local vnstat_start_time=$(echo "$vnstat_json" | jq -r '.interfaces[0].created.date | "\(.year)-\(.month | tostring | if length == 1 then "0" + . else . end)-\(.day | tostring | if length == 1 then "0" + . else . end)"')
+        local vnstat_json vnstat_start_time
+        vnstat_json=$(vnstat -i "$main_interface" --json d)
+        vnstat_start_time=$(echo "$vnstat_json" | jq -r '.interfaces[0].created.date | "\(.year)-\(.month | tostring | if length == 1 then "0" + . else . end)-\(.day | tostring | if length == 1 then "0" + . else . end)"')
         
         if [ -n "$vnstat_start_time" ] && [ "$vnstat_start_time" != "null-null-null" ]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') vnstat 统计开始日期: $vnstat_start_time，在此之前的流量不会被纳入统计！" | tee -a "$LOG_FILE"
@@ -551,7 +574,15 @@ show_current_config() {
 
 # 检测主要网络接口
 get_main_interface() {
-    local main_interface=$(ip route | grep default | sed -n 's/^default via [0-9.]* dev \([^ ]*\).*/\1/p' | head -n1)
+    local main_interface
+    main_interface=$(ip route show default 2>/dev/null | awk '{
+        for (i = 1; i <= NF; i++) {
+            if ($i == "dev" && (i + 1) <= NF) {
+                print $(i + 1)
+                exit
+            }
+        }
+    }')
     if [ -z "$main_interface" ]; then
         main_interface=$(ip link | grep 'state UP' | sed -n 's/^[0-9]*: \([^:]*\):.*/\1/p' | head -n1)
     fi
@@ -770,10 +801,12 @@ previous_day() {
 
 # 获取当前周期的起始日期
 get_period_start_date() {
-    local current_date=$(date +%Y-%m-%d)
-    local current_month=$(date +%m)
-    local current_year=$(date +%Y)
+    local current_date current_month current_year
     local anchor_this anchor_num current_num period_year period_month
+
+    current_date=$(date +%Y-%m-%d)
+    current_month=$(date +%m)
+    current_year=$(date +%Y)
 
     current_num=$(date_to_num "$current_date")
 
@@ -866,12 +899,12 @@ get_traffic_usage() {
         quarterly) required_days=100 ;;
         yearly) required_days=400 ;;
     esac
-    daily_days=$(vnstat --showconfig 2>/dev/null | awk '$1 == "DailyDays" { print $NF; exit }')
+    daily_days=$(vnstat_config_value "DailyDays")
     if [ "$daily_days" != "-1" ] && { ! [[ "$daily_days" =~ ^[0-9]+$ ]] || [ "$daily_days" -lt "$required_days" ]; }; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: vnStat DailyDays=${daily_days:-未知}，不足以可靠统计当前周期（建议至少 $required_days）" >&2
         return 1
     fi
-    trafficless_entries=$(vnstat --showconfig 2>/dev/null | awk '$1 == "TrafficlessEntries" { print $NF; exit }')
+    trafficless_entries=$(vnstat_config_value "TrafficlessEntries")
     trafficless_entries=${trafficless_entries:-1}
     retention_start=$(cat "$RETENTION_STATE_FILE" 2>/dev/null || true)
     retention_num=${retention_start//-/}
@@ -1137,6 +1170,16 @@ write_usage_state() {
     mv -f "$tmp_file" "$USAGE_STATE_FILE" || { rm -f "$tmp_file"; return 1; }
 }
 
+has_pending_shutdown() {
+    if shutdown --help 2>&1 | grep -q -- '--show'; then
+        shutdown --show >/dev/null 2>&1
+    elif command_exists pgrep; then
+        pgrep -x shutdown >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
 
 # 修改 check_and_limit_traffic 函数
 check_and_limit_traffic() {
@@ -1171,10 +1214,14 @@ check_and_limit_traffic() {
             fi
             write_usage_state "limited" "$current_usage" "$limit_threshold" "$unit_label" || return 1
         elif [ "$LIMIT_MODE" = "shutdown" ]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制，系统将在 1 分钟后关机" | tee -a "$LOG_FILE"
-            if ! shutdown -h +1 "流量超出限制，系统将在 1 分钟后关机"; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') 计划关机失败" | tee -a "$LOG_FILE"
-                return 1
+            if has_pending_shutdown; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制，系统已有计划关机，未重复提交或覆盖" | tee -a "$LOG_FILE"
+            else
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制，系统将在 1 分钟后关机" | tee -a "$LOG_FILE"
+                if ! shutdown -h +1 "流量超出限制，系统将在 1 分钟后关机"; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') 计划关机失败" | tee -a "$LOG_FILE"
+                    return 1
+                fi
             fi
             write_usage_state "shutdown" "$current_usage" "$limit_threshold" "$unit_label" || return 1
         fi
@@ -1309,7 +1356,8 @@ main() {
         local current_usage unit_label
         #echo "Debug: Current usage from get_traffic_usage: $current_usage" | tee -a "$LOG_FILE"
         if current_usage=$(get_traffic_usage); then
-            local start_date=$(get_period_start_date)
+            local start_date
+            start_date=$(get_period_start_date)
             echo "$(date '+%Y-%m-%d %H:%M:%S') 当前统计周期: $TRAFFIC_PERIOD (从 $start_date 开始)" | tee -a "$LOG_FILE"
             echo "$(date '+%Y-%m-%d %H:%M:%S') 统计模式: $TRAFFIC_MODE" | tee -a "$LOG_FILE"
             [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && unit_label="GB" || unit_label="GiB"

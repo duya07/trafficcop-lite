@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.0.6"
-LAST_UPDATE="2026-07-14"
+SCRIPT_VERSION="1.0.7"
+LAST_UPDATE="2026-07-26"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
@@ -607,6 +607,20 @@ lite_compare_ge() {
     awk -v left="$1" -v right="$2" 'BEGIN { exit !(left >= right) }'
 }
 
+lite_vnstat_config_value() {
+    local target="$1"
+    vnstat --showconfig 2>/dev/null | awk -v target="$target" '
+        {
+            key=$1
+            sub(/^[;#]/, "", key)
+            if (key == target) {
+                print $NF
+                exit
+            }
+        }
+    '
+}
+
 lite_usage_bar() {
     local percent="$1"
     local color="$2"
@@ -651,8 +665,8 @@ lite_current_usage_gb() {
         quarterly) required_days=100 ;;
         yearly) required_days=400 ;;
     esac
-    daily_days=$(vnstat --showconfig 2>/dev/null | awk '$1 == "DailyDays" { print $NF; exit }')
-    trafficless_entries=$(vnstat --showconfig 2>/dev/null | awk '$1 == "TrafficlessEntries" { print $NF; exit }')
+    daily_days=$(lite_vnstat_config_value "DailyDays")
+    trafficless_entries=$(lite_vnstat_config_value "TrafficlessEntries")
     trafficless_entries=${trafficless_entries:-1}
     retention_start=$(cat "$WORK_DIR/vnstat_daily_coverage_start" 2>/dev/null || true)
     retention_num=${retention_start//-/}
@@ -707,7 +721,7 @@ show_traffic_overview() {
         return
     fi
 
-    if command -v vnstat >/dev/null 2>&1 && [ "$(vnstat --showconfig 2>/dev/null | awk '$1 == "UseUTC" { print $NF; exit }')" = "1" ]; then
+    if command -v vnstat >/dev/null 2>&1 && [ "$(lite_vnstat_config_value "UseUTC")" = "1" ]; then
         export TZ=UTC
     else
         unset TZ

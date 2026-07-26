@@ -25,6 +25,8 @@
 9. Telegram 配置和状态文件使用 `600` 权限，通知发送失败会保留旧状态并在下次任务重试。
 10. 周期重置每个周期只执行一次；即使机器错过周期起始日，也会在恢复运行后补做重置。
 11. 监控成功后原子写入实时流量状态，Telegram 只使用未过期且周期一致的状态，不再从旧日志推断。
+12. 兼容 vnStat 以分号或井号标记的默认配置输出，不会误判 `DailyDays`、`TrafficlessEntries` 或 `UseUTC`。
+13. 关机模式检测到已有计划关机时不会重复提交或覆盖，避免每分钟改写系统关机计划。
 
 ## 下载方式说明
 
@@ -222,6 +224,6 @@ sudo /usr/sbin/tc qdisc show
 - Telegram cron 日志默认保留最近 2000 行；如需详细调试，可临时设置 `TG_DEBUG=true`。
 - 流量监控日志默认保留最近 5000 行，可通过 `LOG_MAX_LINES` 调整。
 - Telegram 报告时区可独立配置；旧配置默认使用 `Asia/Shanghai`。时区名称必须对应系统 `/usr/share/zoneinfo` 中的有效文件，因此精简系统需要安装 `tzdata`。到达设定时间后当天只发送一次，任务短暂中断时会在恢复后补发。
-- 需要 vnStat 2.x 或更高版本。脚本只修改 vnStat 的 `DailyDays` 保留期且保留原配置备份；卸载时不会自动恢复全局 vnStat 配置，以免覆盖用户后续修改。
+- 需要 vnStat 2.x 或更高版本。脚本兼容 `vnstat --showconfig` 中带分号或井号的默认配置项，只修改 vnStat 的 `DailyDays` 保留期并保留原配置备份；卸载时不会自动恢复全局 vnStat 配置，以免覆盖用户后续修改。
 - Debian/Ubuntu、RHEL 系、Alpine 和 Arch 系会按已识别的包管理器尝试安装依赖；无法自动启动 cron 或 vnStat 服务时会给出明确提示，请按系统服务管理方式确认其已运行。
 - 网络受限时，优先使用带 `v6.gh-proxy.org` 的命令。

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# TrafficCop 机器限速管理脚本 v2.1
+# TrafficCop 机器限速管理脚本 v2.2
 # 提供完整的启用/禁用/恢复机器限速功能
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -369,13 +369,15 @@ restore_machine_limit() {
 
 # 查看当前状态
 show_status() {
+    local disabled_time last_run last_run_timestamp current_timestamp time_diff
+
     echo -e "${CYAN}==================== 当前状态 ====================${NC}"
     echo ""
     
     # 检查配置文件
     if [ -f "$CONFIG_FILE" ]; then
         if grep -q "DISABLED=true" "$CONFIG_FILE" 2>/dev/null; then
-            local disabled_time=$(grep "DISABLED_TIME=" "$CONFIG_FILE" | cut -d'=' -f2)
+            disabled_time=$(grep "DISABLED_TIME=" "$CONFIG_FILE" | cut -d'=' -f2)
             echo -e "配置状态: ${RED}已禁用${NC} (禁用时间: $disabled_time)"
         else
             echo -e "配置状态: ${GREEN}已启用${NC}"
@@ -385,11 +387,11 @@ show_status() {
     fi
     
     # 检查进程状态（检查最近的执行记录而不是实时进程）
-    local last_run=$(grep "当前版本" "$WORK_DIR/traffic_monitor.log" 2>/dev/null | tail -1 | awk '{print $1, $2}')
+    last_run=$(grep "当前版本" "$WORK_DIR/traffic_monitor.log" 2>/dev/null | tail -1 | awk '{print $1, $2}')
     if [ -n "$last_run" ]; then
-        local last_run_timestamp=$(stat -c %Y "$WORK_DIR/traffic_monitor.log" 2>/dev/null || echo "0")
-        local current_timestamp=$(date +%s)
-        local time_diff=$((current_timestamp - last_run_timestamp))
+        last_run_timestamp=$(stat -c %Y "$WORK_DIR/traffic_monitor.log" 2>/dev/null || echo "0")
+        current_timestamp=$(date +%s)
+        time_diff=$((current_timestamp - last_run_timestamp))
         
         if [ $time_diff -lt 600 ]; then  # 10分钟内有执行记录
             echo -e "监控进程: ${GREEN}运行中${NC} (最后执行: $last_run)"

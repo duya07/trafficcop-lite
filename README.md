@@ -116,6 +116,8 @@ sudo ntc --uninstall
 8) 卸载 TrafficCop-Lite
 ```
 
+Telegram 管理菜单提供 `8. 开启/关闭自动通知`。关闭后会移除本项目的 Telegram 定时任务并保存关闭状态，但不会删除 Bot 配置，也不影响测试消息和手动发送；再次开启时会恢复唯一的每分钟检查任务。
+
 ## 3) 更新脚本
 
 交互菜单中选择 `7) 更新脚本`，可选择直连或国内优先线路。
@@ -142,6 +144,7 @@ sudo env RAW_BASE="https://v6.gh-proxy.org/https://raw.githubusercontent.com/duy
 - 旧配置没有 `TRAFFIC_UNIT` 时继续按 GiB 计算，不会因更新改变原配额含义。
 - 旧配置没有 `ALLOW_PARTIAL_HISTORY` 时保持严格模式，不会擅自按残缺历史执行限制。
 - 旧配置没有 `TC_BOOT_GRACE_MINUTES` 时默认使用 10 分钟开机限速宽限。
+- 旧 Telegram 配置没有 `TG_DISABLED` 时保持原行为，自动通知默认开启。
 - 下载到临时文件并通过 `bash -n` 语法检查后才替换。
 - 旧脚本会备份到 `/etc/trafficcop-lite/backups/scripts-时间戳/`。
 - 交互更新完成后会自动重新载入新版菜单；命令行更新完成后重新执行 `sudo ntc`。

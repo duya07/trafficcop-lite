@@ -21,7 +21,7 @@ CRON_LOG="$WORK_DIR/tg_notifier_cron.log"
 TG_LOCK_FILE="$WORK_DIR/tg_notifier.lock"
 CRON_LOG_MAX_LINES="${CRON_LOG_MAX_LINES:-2000}"
 TG_DEBUG="${TG_DEBUG:-false}"
-SCRIPT_VERSION="1.0.8"
+SCRIPT_VERSION="1.1.0"
 
 # 此函数只由 EXIT trap 调用，ShellCheck 无法沿字符串形式的 trap 识别调用关系。
 # shellcheck disable=SC2317,SC2329
@@ -142,10 +142,13 @@ read_config() {
 
     chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 
+    # 旧配置没有开关字段时保持原行为：自动通知默认开启。
+    TG_DISABLED=false
     # 读取配置文件
     # shellcheck disable=SC1090
     source "$CONFIG_FILE" || return 1
     REPORT_TIMEZONE="${REPORT_TIMEZONE:-Asia/Shanghai}"
+    TG_DISABLED="${TG_DISABLED:-false}"
 
     # 检查必要的配置项是否都存在
     if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ] || [ -z "$MACHINE_NAME" ] || [ -z "$DAILY_REPORT_TIME" ]; then
@@ -156,6 +159,13 @@ read_config() {
         echo "报告时区无效：$REPORT_TIMEZONE"
         return 1
     fi
+    case "$TG_DISABLED" in
+        true|false) ;;
+        *)
+            echo "自动通知开关配置无效：$TG_DISABLED"
+            return 1
+            ;;
+    esac
 
     return 0
 }
@@ -177,6 +187,7 @@ write_config() {
         write_config_value "DAILY_REPORT_TIME" "$DAILY_REPORT_TIME"
         write_config_value "REPORT_TIMEZONE" "${REPORT_TIMEZONE:-Asia/Shanghai}"
         write_config_value "MACHINE_NAME" "$MACHINE_NAME"
+        write_config_value "TG_DISABLED" "${TG_DISABLED:-false}"
     } > "$tmp_file"; then
         rm -f "$tmp_file"
         return 1
@@ -195,6 +206,11 @@ initial_config() {
     echo ""
     echo "提示：按 Enter 保留当前配置，输入新值则更新配置"
     echo ""
+
+    case "${TG_DISABLED:-false}" in
+        true|false) ;;
+        *) TG_DISABLED=false ;;
+    esac
     
     local new_token new_chat_id new_machine_name new_daily_report_time new_report_timezone
 
@@ -554,6 +570,51 @@ setup_cron() {
     crontab -l
 }
 
+remove_telegram_cron() {
+    local current_crontab new_crontab
+
+    if ! current_crontab="$(read_current_crontab)"; then
+        echo "读取当前 crontab 失败，未修改定时任务。"
+        return 1
+    fi
+    new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
+    if ! printf '%s\n' "$new_crontab" | sed '/^[[:space:]]*$/d' | crontab -; then
+        echo "移除 Telegram crontab 失败。"
+        return 1
+    fi
+    echo "已移除 TrafficCop-Lite Telegram 自动通知任务。"
+}
+
+enable_telegram_notifications() {
+    # 配置仍为关闭时先创建任务；即使 cron 立即触发也会安全跳过。
+    if ! setup_cron; then
+        echo "自动通知开启失败，当前仍保持关闭状态。"
+        return 1
+    fi
+
+    TG_DISABLED=false
+    if ! write_config; then
+        TG_DISABLED=true
+        remove_telegram_cron >/dev/null 2>&1 || true
+        echo "自动通知开启失败：无法更新配置，已清理新建的定时任务。"
+        return 1
+    fi
+    echo "Telegram 自动通知已开启。"
+}
+
+disable_telegram_notifications() {
+    TG_DISABLED=true
+    if ! write_config; then
+        echo "自动通知关闭失败：无法更新配置。"
+        return 1
+    fi
+    if ! remove_telegram_cron; then
+        echo "自动通知已标记为关闭，但定时任务清理失败；残留任务运行时也会跳过推送。"
+        return 1
+    fi
+    echo "Telegram 自动通知已关闭；配置和手动功能仍保留。"
+}
+
 # 更新cron任务中的时间（当修改每日报告时间时调用）
 update_cron_time() {
     local new_time="$1"
@@ -562,8 +623,10 @@ update_cron_time() {
     # 重新读取配置以获取最新时间
     read_config || return 1
     
-    # 重新设置cron任务
-    setup_cron || return 1
+    # 关闭状态下只保存时间，不重新创建任务。
+    if [ "${TG_DISABLED:-false}" != "true" ]; then
+        setup_cron || return 1
+    fi
     
     echo "cron任务时间已更新"
 }
@@ -612,6 +675,10 @@ if [[ "$*" == *"-cron"* ]]; then
     log_cron "进入cron模式"
     if read_config; then
         debug_log "成功读取配置文件"
+        if [ "${TG_DISABLED:-false}" = "true" ]; then
+            log_cron "Telegram 自动通知已关闭，跳过本轮任务"
+            return 0
+        fi
         # 继续执行其他操作
         check_and_notify || log_cron "状态检查未完整成功"
         
@@ -646,7 +713,11 @@ if [[ "$*" == *"-cron"* ]]; then
             initial_config || return 1
         fi
         
-        if ! setup_cron; then
+        if [ "${TG_DISABLED:-false}" = "true" ]; then
+            if ! remove_telegram_cron; then
+                return 1
+            fi
+        elif ! setup_cron; then
             return 1
         fi
         
@@ -662,6 +733,11 @@ if [[ "$*" == *"-cron"* ]]; then
             echo "报告时区: ${REPORT_TIMEZONE:-Asia/Shanghai}"
             echo "Bot Token: ${BOT_TOKEN:0:10}..." # 只显示前10个字符
             echo "Chat ID: $CHAT_ID"
+            if [ "${TG_DISABLED:-false}" = "true" ]; then
+                echo "自动通知: 已关闭"
+            else
+                echo "自动通知: 已开启"
+            fi
             echo "======================================"
             echo "1. 检查流量并推送"
             echo "2. 手动发送每日报告"
@@ -670,9 +746,10 @@ if [[ "$*" == *"-cron"* ]]; then
             echo "5. 修改配置"
             echo "6. 修改每日报告时间"
             echo "7. 查看通知运行日志"
+            echo "8. 开启/关闭自动通知"
             echo "0. 退出"
             echo "======================================"
-            echo -n "请选择操作 [0-7]: "
+            echo -n "请选择操作 [0-8]: "
             
             if ! read -r choice; then
                 echo
@@ -747,8 +824,15 @@ if [[ "$*" == *"-cron"* ]]; then
                         echo "通知日志不存在"
                     fi
                     ;;
+                8)
+                    if [ "${TG_DISABLED:-false}" = "true" ]; then
+                        enable_telegram_notifications
+                    else
+                        disable_telegram_notifications
+                    fi
+                    ;;
                 *)
-                    echo "无效的选择，请输入 0-7"
+                    echo "无效的选择，请输入 0-8"
                     ;;
             esac
             

@@ -751,7 +751,7 @@ lite_current_usage_gb() {
         return 2
     fi
     if [ "$created_num" -gt "$start_num" ] \
-        || { [ -n "$retention_start" ] && { ! [[ "$retention_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$start_num" ]; }; } \
+        || { [ "$trafficless_entries" = "0" ] && [ -n "$retention_start" ] && { ! [[ "$retention_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$start_num" ]; }; } \
         || { [ "$trafficless_entries" != "0" ] && { ! [[ "$earliest_num" =~ ^[0-9]+$ ]] || [ "$earliest_num" -eq 0 ] || [ "$earliest_num" -gt "$start_num" ]; }; }; then
         [ "${ALLOW_PARTIAL_HISTORY:-false}" = "true" ] || return 2
     fi
@@ -789,7 +789,7 @@ lite_current_usage_gb() {
 show_traffic_overview() {
     local config_file="$WORK_DIR/traffic_monitor_config.txt"
     local start_date end_date period_label mode_label usage_gb percent usage_color bar limit_text unit_label usage_status
-    local available_start available_num start_num retention_start retention_num
+    local available_start available_num start_num retention_start retention_num trafficless_entries
 
     if [ ! -s "$config_file" ]; then
         echo -e "${CYAN}流量概览:${NC} ${YELLOW}未配置${NC}"
@@ -842,10 +842,12 @@ show_traffic_overview() {
     if [ "$ALLOW_PARTIAL_HISTORY" = "true" ]; then
         available_start=$(lite_vnstat_available_start 2>/dev/null || true)
         retention_start=$(cat "$WORK_DIR/vnstat_daily_coverage_start" 2>/dev/null || true)
+        trafficless_entries=$(lite_vnstat_config_value "TrafficlessEntries")
+        trafficless_entries=${trafficless_entries:-1}
         available_num=${available_start//-/}
         retention_num=${retention_start//-/}
         start_num=${start_date//-/}
-        if [[ "$retention_num" =~ ^[0-9]{8}$ ]] \
+        if [ "$trafficless_entries" = "0" ] && [[ "$retention_num" =~ ^[0-9]{8}$ ]] \
             && { ! [[ "$available_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$available_num" ]; }; then
             available_start="$retention_start"
             available_num="$retention_num"

@@ -672,25 +672,28 @@ get_vnstat_available_start() {
 }
 
 history_incomplete_for_current_period() {
-    local period_start available_start retention_start
+    local period_start available_start retention_start trafficless_entries
     local period_num available_num retention_num
 
     period_start=$(get_period_start_date) || return 1
     available_start=$(get_vnstat_available_start) || return 1
     retention_start=$(cat "$RETENTION_STATE_FILE" 2>/dev/null || true)
+    trafficless_entries=$(vnstat_config_value "TrafficlessEntries")
+    trafficless_entries=${trafficless_entries:-1}
     period_num=${period_start//-/}
     available_num=${available_start//-/}
     retention_num=${retention_start//-/}
 
     [ "$available_num" -gt "$period_num" ] && return 0
-    if [ -n "$retention_start" ] && { ! [[ "$retention_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$period_num" ]; }; then
+    if [ "$trafficless_entries" = "0" ] && [ -n "$retention_start" ] \
+        && { ! [[ "$retention_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$period_num" ]; }; then
         return 0
     fi
     return 1
 }
 
 configure_history_policy() {
-    local period_start available_start available_num retention_start retention_num history_choice
+    local period_start available_start available_num retention_start retention_num trafficless_entries history_choice
 
     ALLOW_PARTIAL_HISTORY=false
     if ! history_incomplete_for_current_period; then
@@ -700,9 +703,11 @@ configure_history_policy() {
     period_start=$(get_period_start_date)
     available_start=$(get_vnstat_available_start 2>/dev/null || echo "未知")
     retention_start=$(cat "$RETENTION_STATE_FILE" 2>/dev/null || true)
+    trafficless_entries=$(vnstat_config_value "TrafficlessEntries")
+    trafficless_entries=${trafficless_entries:-1}
     available_num=${available_start//-/}
     retention_num=${retention_start//-/}
-    if [[ "$retention_num" =~ ^[0-9]{8}$ ]] \
+    if [ "$trafficless_entries" = "0" ] && [[ "$retention_num" =~ ^[0-9]{8}$ ]] \
         && { ! [[ "$available_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$available_num" ]; }; then
         available_start="$retention_start"
     fi
@@ -1122,7 +1127,7 @@ get_traffic_usage() {
         return 1
     fi
     if [ "$created_num" -gt "$start_num" ] \
-        || { [ -n "$retention_start" ] && { ! [[ "$retention_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$start_num" ]; }; } \
+        || { [ "$trafficless_entries" = "0" ] && [ -n "$retention_start" ] && { ! [[ "$retention_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$start_num" ]; }; } \
         || { [ "$trafficless_entries" != "0" ] && { ! [[ "$earliest_num" =~ ^[0-9]+$ ]] || [ "$earliest_num" -eq 0 ] || [ "$earliest_num" -gt "$start_num" ]; }; }; then
         if [ "${ALLOW_PARTIAL_HISTORY:-false}" != "true" ]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: vnStat 日数据未完整覆盖周期起点 $start_date，拒绝按不完整数据限速" >&2
@@ -1133,7 +1138,8 @@ get_traffic_usage() {
             && [[ "$earliest_num" =~ ^[0-9]{8}$ ]] && [ "$earliest_num" -gt "$available_num" ]; then
             available_num="$earliest_num"
         fi
-        if [[ "$retention_num" =~ ^[0-9]{8}$ ]] && [ "$retention_num" -gt "$available_num" ]; then
+        if [ "$trafficless_entries" = "0" ] \
+            && [[ "$retention_num" =~ ^[0-9]{8}$ ]] && [ "$retention_num" -gt "$available_num" ]; then
             available_num="$retention_num"
         fi
         available_start=$(date_num_to_iso "$available_num")

@@ -3,7 +3,7 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.0.7"
+SCRIPT_VERSION="1.0.8"
 LAST_UPDATE="2026-07-26"
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -95,11 +95,44 @@ read_current_crontab() {
     return 1
 }
 
+script_version_from_file() {
+    local file="$1"
+    sed -nE '
+        s/^SCRIPT_VERSION="([0-9]+([.][0-9]+)*)".*/\1/p
+        s/^# .* v([0-9]+([.][0-9]+)*).*/\1/p
+    ' "$file" 2>/dev/null | head -n 1
+}
+
+version_is_newer() {
+    local installed="$1"
+    local candidate="$2"
+    awk -v installed="$installed" -v candidate="$candidate" 'BEGIN {
+        installed_count = split(installed, installed_parts, ".")
+        candidate_count = split(candidate, candidate_parts, ".")
+        count = installed_count > candidate_count ? installed_count : candidate_count
+        for (i = 1; i <= count; i++) {
+            installed_part = installed_parts[i] + 0
+            candidate_part = candidate_parts[i] + 0
+            if (installed_part > candidate_part) exit 0
+            if (installed_part < candidate_part) exit 1
+        }
+        exit 1
+    }'
+}
+
 copy_self_if_needed() {
     local self_path="$SOURCE_PATH"
+    local dest="$WORK_DIR/trafficcop-lite.sh"
+    local installed_version
+
     if [ "$self_path" != "$WORK_DIR/trafficcop-lite.sh" ] && [ -f "$self_path" ]; then
-        cp "$self_path" "$WORK_DIR/trafficcop-lite.sh"
-        chmod +x "$WORK_DIR/trafficcop-lite.sh"
+        installed_version=$(script_version_from_file "$dest")
+        if [ -n "$installed_version" ] && version_is_newer "$installed_version" "$SCRIPT_VERSION"; then
+            echo -e "${YELLOW}! 已安装主脚本版本 $installed_version 高于当前副本 $SCRIPT_VERSION，已阻止降级。${NC}"
+            return 0
+        fi
+        cp "$self_path" "$dest"
+        chmod +x "$dest"
     fi
 }
 
@@ -151,6 +184,7 @@ ensure_component() {
     local script_name="$1"
     local src="$SCRIPT_DIR/$script_name"
     local dest="$WORK_DIR/$script_name"
+    local source_version installed_version
 
     ensure_work_dir
 
@@ -158,6 +192,14 @@ ensure_component() {
         if ! bash -n "$src" 2>/dev/null; then
             echo -e "${RED}本地脚本语法检查失败：$src${NC}"
             return 1
+        fi
+        source_version=$(script_version_from_file "$src")
+        installed_version=$(script_version_from_file "$dest")
+        if [ -n "$source_version" ] && [ -n "$installed_version" ] \
+            && bash -n "$dest" 2>/dev/null \
+            && version_is_newer "$installed_version" "$source_version"; then
+            echo -e "${YELLOW}! 已安装 $script_name 版本 $installed_version 高于当前副本 $source_version，已阻止降级。${NC}"
+            return 0
         fi
         cp "$src" "$dest"
         chmod +x "$dest"
@@ -368,7 +410,7 @@ update_scripts() {
 
     echo ""
     echo -e "${GREEN}脚本更新完成。旧脚本已备份到：$backup_dir${NC}"
-    echo -e "${YELLOW}建议重新执行 sudo ntc 进入新版菜单。${NC}"
+    echo -e "${YELLOW}命令行更新后请重新执行 sudo ntc；交互更新将自动载入新版菜单。${NC}"
 }
 
 update_scripts_interactive() {
@@ -380,7 +422,11 @@ update_scripts_interactive() {
         return
     }
 
-    update_scripts "$selected_base"
+    if update_scripts "$selected_base"; then
+        echo -e "${GREEN}正在载入新版菜单...${NC}"
+        exec bash "$WORK_DIR/trafficcop-lite.sh"
+        echo -e "${RED}新版菜单载入失败，请重新执行 sudo ntc。${NC}"
+    fi
     pause
 }
 

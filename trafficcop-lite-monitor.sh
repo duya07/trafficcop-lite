@@ -18,7 +18,7 @@ PERIOD_STATE_FILE="$WORK_DIR/last_reset_period"
 RETENTION_STATE_FILE="$WORK_DIR/vnstat_daily_coverage_start"
 USAGE_STATE_FILE="$WORK_DIR/current_traffic_state"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.0.6"
+SCRIPT_VERSION="1.0.7"
 mkdir -p "$WORK_DIR"
 chmod 700 "$WORK_DIR" 2>/dev/null || true
 
@@ -449,6 +449,9 @@ validate_config() {
     TRAFFIC_TOLERANCE="${TRAFFIC_TOLERANCE:-0}"
     if ! is_decimal "$TRAFFIC_TOLERANCE"; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：TRAFFIC_TOLERANCE 必须是非负数字。" | tee -a "$LOG_FILE"
+        has_error=true
+    elif is_decimal "${TRAFFIC_LIMIT:-}" && compare_decimal "$TRAFFIC_TOLERANCE" "$TRAFFIC_LIMIT" "ge"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：TRAFFIC_TOLERANCE 必须小于 TRAFFIC_LIMIT。" | tee -a "$LOG_FILE"
         has_error=true
     fi
 
@@ -1193,9 +1196,9 @@ check_and_limit_traffic() {
 
     limit_threshold=$(echo "$TRAFFIC_LIMIT - $TRAFFIC_TOLERANCE" | bc 2>/dev/null || echo "0")
 
-    if (( $(echo "$limit_threshold < 0" | bc -l 2>/dev/null || echo "0") )); then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到配置异常：容错范围大于流量限制，已将限制阈值按 0 $unit_label 处理" | tee -a "$LOG_FILE"
-        limit_threshold=0
+    if (( $(echo "$limit_threshold <= 0" | bc -l 2>/dev/null || echo "0") )); then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到配置异常：限制阈值必须大于 0 $unit_label，本轮跳过限速判断" | tee -a "$LOG_FILE"
+        return 1
     fi
     
     echo "$(date '+%Y-%m-%d %H:%M:%S') 当前使用流量: $current_usage $unit_label，限制流量: $limit_threshold $unit_label" | tee -a "$LOG_FILE"

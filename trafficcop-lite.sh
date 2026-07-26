@@ -3,7 +3,7 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.0.9"
+SCRIPT_VERSION="1.1.0"
 LAST_UPDATE="2026-07-26"
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -11,6 +11,8 @@ MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
 TELEGRAM_SCRIPT="trafficcop-lite-telegram.sh"
 MACHINE_LIMIT_SCRIPT="trafficcop-lite-machine-limit.sh"
 TC_STATE_FILE="$WORK_DIR/tc_limit_state"
+ENFORCEMENT_STATE_FILE="$WORK_DIR/enforcement_state"
+SHUTDOWN_STATE_FILE="$WORK_DIR/shutdown_limit_state"
 MONITOR_LOCK_FILE="$WORK_DIR/traffic_monitor.lock"
 SHORTCUT_PATH="/usr/local/bin/ntc"
 LEGACY_NCL_SHORTCUT_PATH="/usr/local/bin/ncl"
@@ -72,6 +74,8 @@ ensure_work_dir() {
     [ ! -f "$WORK_DIR/current_traffic_state" ] || chmod 600 "$WORK_DIR/current_traffic_state" 2>/dev/null || true
     [ ! -f "$WORK_DIR/vnstat_daily_coverage_start" ] || chmod 600 "$WORK_DIR/vnstat_daily_coverage_start" 2>/dev/null || true
     [ ! -f "$WORK_DIR/last_traffic_notification" ] || chmod 600 "$WORK_DIR/last_traffic_notification" 2>/dev/null || true
+    [ ! -f "$ENFORCEMENT_STATE_FILE" ] || chmod 600 "$ENFORCEMENT_STATE_FILE" 2>/dev/null || true
+    [ ! -f "$SHUTDOWN_STATE_FILE" ] || chmod 600 "$SHUTDOWN_STATE_FILE" 2>/dev/null || true
 }
 
 read_current_crontab() {
@@ -667,6 +671,27 @@ lite_vnstat_config_value() {
     '
 }
 
+lite_vnstat_available_start() {
+    local vnstat_json created_num earliest_num available_num trafficless_entries
+
+    [ -n "${MAIN_INTERFACE:-}" ] || return 1
+    vnstat_json=$(vnstat -i "$MAIN_INTERFACE" --json 2>/dev/null) || return 1
+    created_num=$(printf '%s' "$vnstat_json" | jq -r \
+        '.interfaces[0].created.date | (.year * 10000 + .month * 100 + .day)' 2>/dev/null) || return 1
+    earliest_num=$(printf '%s' "$vnstat_json" | jq -r \
+        '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day)] | min // 0' 2>/dev/null) || return 1
+    [[ "$created_num" =~ ^[0-9]{8}$ ]] || return 1
+
+    trafficless_entries=$(lite_vnstat_config_value "TrafficlessEntries")
+    trafficless_entries=${trafficless_entries:-1}
+    available_num="$created_num"
+    if [ "$trafficless_entries" != "0" ] \
+        && [[ "$earliest_num" =~ ^[0-9]{8}$ ]] && [ "$earliest_num" -gt "$available_num" ]; then
+        available_num="$earliest_num"
+    fi
+    printf '%s-%s-%s\n' "${available_num:0:4}" "${available_num:4:2}" "${available_num:6:2}"
+}
+
 lite_usage_bar() {
     local percent="$1"
     local color="$2"
@@ -721,11 +746,14 @@ lite_current_usage_gb() {
         retention_start="$earliest_num"
         retention_num="$earliest_num"
     fi
-    if ! [[ "$created_num" =~ ^[0-9]+$ ]] || [ "$created_num" -gt "$start_num" ] \
-        || { [ "$daily_days" != "-1" ] && { ! [[ "$daily_days" =~ ^[0-9]+$ ]] || [ "$daily_days" -lt "$required_days" ]; }; } \
+    if ! [[ "$created_num" =~ ^[0-9]{8}$ ]] \
+        || { [ "$daily_days" != "-1" ] && { ! [[ "$daily_days" =~ ^[0-9]+$ ]] || [ "$daily_days" -lt "$required_days" ]; }; }; then
+        return 2
+    fi
+    if [ "$created_num" -gt "$start_num" ] \
         || { [ -n "$retention_start" ] && { ! [[ "$retention_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$start_num" ]; }; } \
         || { [ "$trafficless_entries" != "0" ] && { ! [[ "$earliest_num" =~ ^[0-9]+$ ]] || [ "$earliest_num" -eq 0 ] || [ "$earliest_num" -gt "$start_num" ]; }; }; then
-        return 2
+        [ "${ALLOW_PARTIAL_HISTORY:-false}" = "true" ] || return 2
     fi
 
     case "${TRAFFIC_MODE:-total}" in
@@ -761,6 +789,7 @@ lite_current_usage_gb() {
 show_traffic_overview() {
     local config_file="$WORK_DIR/traffic_monitor_config.txt"
     local start_date end_date period_label mode_label usage_gb percent usage_color bar limit_text unit_label usage_status
+    local available_start available_num start_num retention_start retention_num
 
     if [ ! -s "$config_file" ]; then
         echo -e "${CYAN}流量概览:${NC} ${YELLOW}未配置${NC}"
@@ -780,12 +809,13 @@ show_traffic_overview() {
     local PERIOD_START_DAY="1"
     local PERIOD_START_MONTH="1"
     local MAIN_INTERFACE=""
+    local ALLOW_PARTIAL_HISTORY="false"
     local key value
 
     while IFS='=' read -r key value; do
         value=${value%$'\r'}
         case "$key" in
-            TRAFFIC_MODE|TRAFFIC_PERIOD|TRAFFIC_LIMIT|TRAFFIC_UNIT|PERIOD_START_DAY|PERIOD_START_MONTH|MAIN_INTERFACE)
+            TRAFFIC_MODE|TRAFFIC_PERIOD|TRAFFIC_LIMIT|TRAFFIC_UNIT|PERIOD_START_DAY|PERIOD_START_MONTH|MAIN_INTERFACE|ALLOW_PARTIAL_HISTORY)
                 printf -v "$key" '%s' "$value"
                 ;;
         esac
@@ -809,6 +839,22 @@ show_traffic_overview() {
     [ "$TRAFFIC_UNIT" = "decimal" ] && unit_label="GB" || unit_label="GiB"
 
     echo -e "${CYAN}流量周期:${NC} ${WHITE}${period_label} · ${mode_label}${NC}  ${WHITE}${start_date} ~ ${end_date}${NC}"
+    if [ "$ALLOW_PARTIAL_HISTORY" = "true" ]; then
+        available_start=$(lite_vnstat_available_start 2>/dev/null || true)
+        retention_start=$(cat "$WORK_DIR/vnstat_daily_coverage_start" 2>/dev/null || true)
+        available_num=${available_start//-/}
+        retention_num=${retention_start//-/}
+        start_num=${start_date//-/}
+        if [[ "$retention_num" =~ ^[0-9]{8}$ ]] \
+            && { ! [[ "$available_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$available_num" ]; }; then
+            available_start="$retention_start"
+            available_num="$retention_num"
+        fi
+        if { [[ "$available_num" =~ ^[0-9]{8}$ ]] && [ "$available_num" -gt "$start_num" ]; } \
+            || { [ -n "$retention_start" ] && [[ "$retention_num" =~ ^[0-9]{8}$ ]] && [ "$retention_num" -gt "$start_num" ]; }; then
+            echo -e "${YELLOW}历史提示:${NC} ${YELLOW}仅统计 ${available_start:-现有记录} 以来数据，周期早段流量未计入${NC}"
+        fi
+    fi
 
     if [ -z "$TRAFFIC_LIMIT" ]; then
         echo -e "${CYAN}已用/总量:${NC} ${YELLOW}总量配置异常${NC}"
@@ -837,6 +883,58 @@ show_traffic_overview() {
     bar=$(lite_usage_bar "$percent" "$usage_color")
 
     echo -e "${CYAN}已用/总量:${NC} ${usage_color}${usage_gb} $unit_label${NC} / ${WHITE}${limit_text} $unit_label${NC}  ${usage_color}${percent}%${NC} ${bar}"
+}
+
+lite_state_value() {
+    local file="$1"
+    local key="$2"
+    if [ -f "$file" ]; then
+        grep "^${key}=" "$file" 2>/dev/null | tail -n 1 | cut -d'=' -f2-
+    fi
+}
+
+show_enforcement_overview() {
+    local config_file="$WORK_DIR/traffic_monitor_config.txt"
+    local mode until_epoch reason now remaining
+    local limit_mode="" boot_grace_minutes=10 key value uptime_seconds
+
+    [ -s "$config_file" ] || return
+    while IFS='=' read -r key value; do
+        value=${value%$'\r'}
+        case "$key" in
+            LIMIT_MODE) limit_mode="$value" ;;
+            TC_BOOT_GRACE_MINUTES) boot_grace_minutes="$value" ;;
+        esac
+    done < "$config_file"
+
+    mode=$(lite_state_value "$ENFORCEMENT_STATE_FILE" "MODE")
+    until_epoch=$(lite_state_value "$ENFORCEMENT_STATE_FILE" "UNTIL_EPOCH")
+    reason=$(lite_state_value "$ENFORCEMENT_STATE_FILE" "REASON")
+    now=$(date +%s)
+    if [ "$mode" = "grace" ] && [[ "$until_epoch" =~ ^[0-9]+$ ]] && [ "$until_epoch" -gt "$now" ]; then
+        remaining=$(( (until_epoch - now + 59) / 60 ))
+        echo -e "${CYAN}限制执行:${NC} ${YELLOW}宽限中，约剩余 $remaining 分钟${NC}"
+        return
+    fi
+    if [ "$mode" = "paused" ]; then
+        if [ "$reason" = "shutdown_reboot" ]; then
+            echo -e "${CYAN}限制执行:${NC} ${RED}关机后重启保护，已暂停再次关机${NC}"
+        else
+            echo -e "${CYAN}限制执行:${NC} ${YELLOW}已暂停，仅监控流量${NC}"
+        fi
+        return
+    fi
+
+    if [ "$limit_mode" = "tc" ] && [[ "$boot_grace_minutes" =~ ^[0-9]+$ ]] \
+        && [ "$boot_grace_minutes" -gt 0 ] && [ "$boot_grace_minutes" -le 1440 ]; then
+        uptime_seconds=$(awk '{ printf "%d", $1 }' /proc/uptime 2>/dev/null || echo 0)
+        if [[ "$uptime_seconds" =~ ^[0-9]+$ ]] && [ "$uptime_seconds" -lt $((boot_grace_minutes * 60)) ]; then
+            remaining=$(( (boot_grace_minutes * 60 - uptime_seconds + 59) / 60 ))
+            echo -e "${CYAN}限制执行:${NC} ${YELLOW}开机宽限中，约剩余 $remaining 分钟${NC}"
+            return
+        fi
+    fi
+    echo -e "${CYAN}限制执行:${NC} ${GREEN}正常${NC}"
 }
 
 menu_item() {
@@ -1047,8 +1145,27 @@ clear_lite_tc_rules_interactive() {
     fi
 }
 
+lite_has_pending_shutdown() {
+    if shutdown --help 2>&1 | grep -q -- '--show'; then
+        shutdown --show >/dev/null 2>&1
+    elif command -v pgrep >/dev/null 2>&1; then
+        pgrep -x shutdown >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
 cancel_shutdown_interactive() {
     local config="$WORK_DIR/traffic_monitor_config.txt"
+    if [ -f "$SHUTDOWN_STATE_FILE" ]; then
+        if lite_has_pending_shutdown && ! shutdown -c 2>/dev/null; then
+            echo -e "${RED}无法取消本脚本记录的计划关机，已保留状态文件。${NC}"
+            return 1
+        fi
+        rm -f "$SHUTDOWN_STATE_FILE" || return 1
+        echo "✓ 已取消本脚本记录的计划关机"
+        return
+    fi
     if grep -q '^LIMIT_MODE=shutdown' "$config" 2>/dev/null; then
         echo -e "${YELLOW}检测到独立版曾配置关机模式。${NC}"
         read -r -p "是否取消当前系统计划关机？[y/N]: " confirm
@@ -1187,6 +1304,7 @@ show_main_menu() {
     show_status_line
     echo -e "${CYAN}快捷命令:${NC} sudo ntc"
     show_traffic_overview
+    show_enforcement_overview
     echo ""
     menu_item "1" "安装/管理流量监控"
     menu_item "2" "安装/管理 Telegram 通知"

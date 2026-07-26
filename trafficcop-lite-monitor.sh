@@ -17,8 +17,10 @@ TC_STATE_FILE="$WORK_DIR/tc_limit_state"
 PERIOD_STATE_FILE="$WORK_DIR/last_reset_period"
 RETENTION_STATE_FILE="$WORK_DIR/vnstat_daily_coverage_start"
 USAGE_STATE_FILE="$WORK_DIR/current_traffic_state"
+ENFORCEMENT_STATE_FILE="$WORK_DIR/enforcement_state"
+SHUTDOWN_STATE_FILE="$WORK_DIR/shutdown_limit_state"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.0.7"
+SCRIPT_VERSION="1.1.0"
 mkdir -p "$WORK_DIR"
 chmod 700 "$WORK_DIR" 2>/dev/null || true
 
@@ -285,7 +287,9 @@ ensure_service_running() {
     elif command_exists rc-service; then
         for service_name in "$@"; do
             if [ -x "/etc/init.d/$service_name" ]; then
-                command_exists rc-update && run_privileged rc-update add "$service_name" default >/dev/null 2>&1 || true
+                if command_exists rc-update; then
+                    run_privileged rc-update add "$service_name" default >/dev/null 2>&1 || true
+                fi
                 if run_privileged rc-service "$service_name" start >/dev/null 2>&1 || rc-service "$service_name" status >/dev/null 2>&1; then
                     return 0
                 fi
@@ -464,7 +468,8 @@ validate_config() {
             ;;
     esac
 
-    if ! [[ "${PERIOD_START_DAY:-1}" =~ ^[0-9]+$ ]]; then
+    PERIOD_START_DAY="${PERIOD_START_DAY:-1}"
+    if ! [[ "$PERIOD_START_DAY" =~ ^[0-9]+$ ]]; then
         PERIOD_START_DAY=1
     fi
     PERIOD_START_DAY=$((10#$PERIOD_START_DAY))
@@ -472,7 +477,8 @@ validate_config() {
         PERIOD_START_DAY=1
     fi
 
-    if ! [[ "${PERIOD_START_MONTH:-1}" =~ ^[0-9]+$ ]]; then
+    PERIOD_START_MONTH="${PERIOD_START_MONTH:-1}"
+    if ! [[ "$PERIOD_START_MONTH" =~ ^[0-9]+$ ]]; then
         PERIOD_START_MONTH=1
     fi
     PERIOD_START_MONTH=$((10#$PERIOD_START_MONTH))
@@ -480,9 +486,23 @@ validate_config() {
         PERIOD_START_MONTH=1
     fi
 
-    if ! [[ "${LIMIT_SPEED:-20}" =~ ^[1-9][0-9]*$ ]]; then
+    LIMIT_SPEED="${LIMIT_SPEED:-20}"
+    if ! [[ "$LIMIT_SPEED" =~ ^[1-9][0-9]*$ ]]; then
         LIMIT_SPEED=20
     fi
+    TC_BOOT_GRACE_MINUTES="${TC_BOOT_GRACE_MINUTES:-10}"
+    if ! [[ "$TC_BOOT_GRACE_MINUTES" =~ ^[0-9]+$ ]] || [ "$TC_BOOT_GRACE_MINUTES" -gt 1440 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：TC_BOOT_GRACE_MINUTES 必须是 0-1440 的整数。" | tee -a "$LOG_FILE"
+        has_error=true
+    fi
+    ALLOW_PARTIAL_HISTORY="${ALLOW_PARTIAL_HISTORY:-false}"
+    case "$ALLOW_PARTIAL_HISTORY" in
+        true|false) ;;
+        *)
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：ALLOW_PARTIAL_HISTORY 必须是 true 或 false。" | tee -a "$LOG_FILE"
+            has_error=true
+            ;;
+    esac
 
     if [ -z "${MAIN_INTERFACE:-}" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：MAIN_INTERFACE 为空。" | tee -a "$LOG_FILE"
@@ -517,11 +537,12 @@ read_config() {
         chmod 600 "$CONFIG_FILE" 2>/dev/null || true
         unset TRAFFIC_MODE TRAFFIC_PERIOD TRAFFIC_LIMIT TRAFFIC_TOLERANCE TRAFFIC_UNIT
         unset PERIOD_START_DAY PERIOD_START_MONTH LIMIT_SPEED MAIN_INTERFACE LIMIT_MODE
+        unset ALLOW_PARTIAL_HISTORY TC_BOOT_GRACE_MINUTES
         unset DISABLED DISABLED_TIME
         while IFS='=' read -r key value; do
             value=${value%$'\r'}
             case "$key" in
-                TRAFFIC_MODE|TRAFFIC_PERIOD|TRAFFIC_LIMIT|TRAFFIC_TOLERANCE|TRAFFIC_UNIT|PERIOD_START_DAY|PERIOD_START_MONTH|LIMIT_SPEED|MAIN_INTERFACE|LIMIT_MODE|DISABLED|DISABLED_TIME)
+                TRAFFIC_MODE|TRAFFIC_PERIOD|TRAFFIC_LIMIT|TRAFFIC_TOLERANCE|TRAFFIC_UNIT|PERIOD_START_DAY|PERIOD_START_MONTH|LIMIT_SPEED|MAIN_INTERFACE|LIMIT_MODE|ALLOW_PARTIAL_HISTORY|TC_BOOT_GRACE_MINUTES|DISABLED|DISABLED_TIME)
                     printf -v "$key" '%s' "$value"
                     ;;
             esac
@@ -546,6 +567,8 @@ PERIOD_START_MONTH=${PERIOD_START_MONTH:-1}
 LIMIT_SPEED=${LIMIT_SPEED:-20}
 MAIN_INTERFACE=$MAIN_INTERFACE
 LIMIT_MODE=$LIMIT_MODE
+ALLOW_PARTIAL_HISTORY=${ALLOW_PARTIAL_HISTORY:-false}
+TC_BOOT_GRACE_MINUTES=${TC_BOOT_GRACE_MINUTES:-10}
 EOF
     then
         rm -f "$tmp_file"
@@ -573,6 +596,10 @@ show_current_config() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') 限速: ${LIMIT_SPEED:-20} kbit/s"| tee -a "$LOG_FILE"
     echo "$(date '+%Y-%m-%d %H:%M:%S') 主要网络接口: $MAIN_INTERFACE"| tee -a "$LOG_FILE"
     echo "$(date '+%Y-%m-%d %H:%M:%S') 限制模式: $LIMIT_MODE"| tee -a "$LOG_FILE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') 历史不足时继续统计: ${ALLOW_PARTIAL_HISTORY:-false}"| tee -a "$LOG_FILE"
+    if [ "$LIMIT_MODE" = "tc" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 开机后限速宽限: ${TC_BOOT_GRACE_MINUTES:-10} 分钟"| tee -a "$LOG_FILE"
+    fi
 }
 
 # 检测主要网络接口
@@ -617,6 +644,169 @@ get_main_interface() {
     
     echo "$(date '+%Y-%m-%d %H:%M:%S') 主要网络接口: $main_interface"| tee -a "$LOG_FILE" >&2
     echo "$main_interface"
+}
+
+date_num_to_iso() {
+    local date_num="$1"
+    printf '%s-%s-%s\n' "${date_num:0:4}" "${date_num:4:2}" "${date_num:6:2}"
+}
+
+get_vnstat_available_start() {
+    local vnstat_json created_num earliest_num available_num trafficless_entries
+
+    vnstat_json=$(vnstat -i "$MAIN_INTERFACE" --json 2>/dev/null) || return 1
+    created_num=$(printf '%s' "$vnstat_json" | jq -r \
+        '.interfaces[0].created.date | (.year * 10000 + .month * 100 + .day)' 2>/dev/null) || return 1
+    earliest_num=$(printf '%s' "$vnstat_json" | jq -r \
+        '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day)] | min // 0' 2>/dev/null) || return 1
+    [[ "$created_num" =~ ^[0-9]{8}$ ]] || return 1
+
+    trafficless_entries=$(vnstat_config_value "TrafficlessEntries")
+    trafficless_entries=${trafficless_entries:-1}
+    available_num="$created_num"
+    if [ "$trafficless_entries" != "0" ] \
+        && [[ "$earliest_num" =~ ^[0-9]{8}$ ]] && [ "$earliest_num" -gt "$available_num" ]; then
+        available_num="$earliest_num"
+    fi
+    date_num_to_iso "$available_num"
+}
+
+history_incomplete_for_current_period() {
+    local period_start available_start retention_start
+    local period_num available_num retention_num
+
+    period_start=$(get_period_start_date) || return 1
+    available_start=$(get_vnstat_available_start) || return 1
+    retention_start=$(cat "$RETENTION_STATE_FILE" 2>/dev/null || true)
+    period_num=${period_start//-/}
+    available_num=${available_start//-/}
+    retention_num=${retention_start//-/}
+
+    [ "$available_num" -gt "$period_num" ] && return 0
+    if [ -n "$retention_start" ] && { ! [[ "$retention_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$period_num" ]; }; then
+        return 0
+    fi
+    return 1
+}
+
+configure_history_policy() {
+    local period_start available_start available_num retention_start retention_num history_choice
+
+    ALLOW_PARTIAL_HISTORY=false
+    if ! history_incomplete_for_current_period; then
+        return 0
+    fi
+
+    period_start=$(get_period_start_date)
+    available_start=$(get_vnstat_available_start 2>/dev/null || echo "未知")
+    retention_start=$(cat "$RETENTION_STATE_FILE" 2>/dev/null || true)
+    available_num=${available_start//-/}
+    retention_num=${retention_start//-/}
+    if [[ "$retention_num" =~ ^[0-9]{8}$ ]] \
+        && { ! [[ "$available_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$available_num" ]; }; then
+        available_start="$retention_start"
+    fi
+    echo ""
+    echo "检测到 vnStat 历史不足以覆盖周期起点 $period_start。"
+    echo "当前可用流量历史约从 $available_start 开始，之前的流量无法由重装后的系统补回。"
+    echo "继续后，脚本会按现有历史统计并正常执行限制，但实际已用流量可能偏低。"
+    echo "主菜单会持续显示该提示，直到进入具有完整历史的新周期。"
+    echo ""
+    echo "1) 我已了解，按现有 vnStat 历史继续"
+    echo "0) 取消配置，不保存本次修改"
+    read -r -p "请输入选择 [0/1]: " history_choice
+    if [ "$history_choice" != "1" ]; then
+        echo "已取消配置；原配置未被覆盖。"
+        return 1
+    fi
+    ALLOW_PARTIAL_HISTORY=true
+}
+
+enforcement_state_value() {
+    local key="$1"
+    if [ -f "$ENFORCEMENT_STATE_FILE" ]; then
+        grep "^${key}=" "$ENFORCEMENT_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-
+    fi
+}
+
+shutdown_state_value() {
+    local key="$1"
+    if [ -f "$SHUTDOWN_STATE_FILE" ]; then
+        grep "^${key}=" "$SHUTDOWN_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-
+    fi
+}
+
+write_enforcement_state() {
+    local mode="$1"
+    local until_epoch="$2"
+    local reason="$3"
+    local tmp_file="${ENFORCEMENT_STATE_FILE}.tmp.$$"
+
+    {
+        printf 'MODE=%s\n' "$mode"
+        printf 'UNTIL_EPOCH=%s\n' "$until_epoch"
+        printf 'REASON=%s\n' "$reason"
+        printf 'UPDATED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    } > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$ENFORCEMENT_STATE_FILE"
+}
+
+clear_owned_shutdown_schedule() {
+    if [ -f "$SHUTDOWN_STATE_FILE" ]; then
+        if has_pending_shutdown && ! shutdown -c 2>/dev/null; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 无法取消本脚本记录的计划关机，已保留状态文件。" | tee -a "$LOG_FILE"
+            return 1
+        fi
+        rm -f "$SHUTDOWN_STATE_FILE" || return 1
+    fi
+}
+
+configure_post_save_enforcement() {
+    local current_usage limit_threshold unit_label policy_choice grace_minutes until_epoch
+
+    clear_owned_shutdown_schedule || return 1
+    rm -f "$ENFORCEMENT_STATE_FILE"
+    clear_owned_tc_rules "配置已更新" || return 1
+    [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && unit_label="GB" || unit_label="GiB"
+    current_usage=$(get_traffic_usage) || return 0
+    limit_threshold=$(echo "$TRAFFIC_LIMIT - $TRAFFIC_TOLERANCE" | bc 2>/dev/null || echo "0")
+    if ! compare_decimal "$current_usage" "$limit_threshold" "ge"; then
+        return 0
+    fi
+
+    echo ""
+    echo "当前可统计流量为 $current_usage $unit_label，已经达到执行阈值 $limit_threshold $unit_label。"
+    echo "为避免保存配置后突然限速或关机，请选择本次执行策略："
+    echo "1) 宽限一段时间后再执行（推荐）"
+    echo "2) 立即执行"
+    echo "3) 仅监控，暂停执行限制，稍后在机器限速管理中恢复"
+    read -r -p "请输入选择 (1-3，默认为1): " policy_choice
+    case "$policy_choice" in
+        2)
+            rm -f "$ENFORCEMENT_STATE_FILE"
+            ;;
+        3)
+            write_enforcement_state "paused" "0" "manual" || return 1
+            echo "限制执行已暂停；流量统计和主页显示仍会继续。"
+            ;;
+        1|"")
+            read -r -p "请输入宽限分钟数 (1-1440，默认为10): " grace_minutes
+            grace_minutes=${grace_minutes:-10}
+            if ! [[ "$grace_minutes" =~ ^[0-9]+$ ]] || [ "$grace_minutes" -lt 1 ] || [ "$grace_minutes" -gt 1440 ]; then
+                echo "输入无效，使用默认值：10 分钟"
+                grace_minutes=10
+            fi
+            until_epoch=$(( $(date +%s) + grace_minutes * 60 ))
+            write_enforcement_state "grace" "$until_epoch" "config" || return 1
+            echo "已设置 $grace_minutes 分钟宽限；期间只统计流量，不执行限制。"
+            ;;
+        *)
+            echo "输入无效，使用推荐值：宽限 10 分钟"
+            until_epoch=$(( $(date +%s) + 600 ))
+            write_enforcement_state "grace" "$until_epoch" "config" || return 1
+            ;;
+    esac
 }
 
 # 初始配置函数
@@ -712,18 +902,27 @@ initial_config() {
                     echo "无效输入，使用默认值：20 kbit/s"
                     LIMIT_SPEED=20
                 fi
+                read -r -p "请输入开机后限速宽限时间（分钟，0=立即，默认为10）: " TC_BOOT_GRACE_MINUTES
+                TC_BOOT_GRACE_MINUTES=${TC_BOOT_GRACE_MINUTES:-10}
+                if ! [[ "$TC_BOOT_GRACE_MINUTES" =~ ^[0-9]+$ ]] || [ "$TC_BOOT_GRACE_MINUTES" -gt 1440 ]; then
+                    echo "无效输入，使用默认值：10 分钟"
+                    TC_BOOT_GRACE_MINUTES=10
+                fi
                 break 
                 ;;
             2) 
                 LIMIT_MODE="shutdown"
                 LIMIT_SPEED=""  # 关机模式不需要限速
+                TC_BOOT_GRACE_MINUTES=10
                 break 
                 ;;
             *) echo "无效输入，请重新选择。" ;;
         esac
     done
 
+    configure_history_policy || return 1
     write_config || return 1
+    configure_post_save_enforcement || return 1
 }
 
 # 返回指定年月的周期锚点。若用户配置了不存在的日期（如 2 月 31 日），使用当月最后一天。
@@ -874,6 +1073,7 @@ get_traffic_usage() {
     local start_date end_date
     local start_num end_num vnstat_json usage_bytes rx_bytes tx_bytes divisor
     local created_num earliest_num daily_days required_days trafficless_entries retention_start retention_num
+    local available_num available_start
 
     start_date=$(get_period_start_date)
     end_date=$(get_period_end_date)
@@ -917,11 +1117,27 @@ get_traffic_usage() {
         retention_start="$earliest_num"
         retention_num="$earliest_num"
     fi
-    if ! [[ "$created_num" =~ ^[0-9]+$ ]] || [ "$created_num" -gt "$start_num" ] \
+    if ! [[ "$created_num" =~ ^[0-9]{8}$ ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: 无法确认 vnStat 数据起始日期" >&2
+        return 1
+    fi
+    if [ "$created_num" -gt "$start_num" ] \
         || { [ -n "$retention_start" ] && { ! [[ "$retention_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$start_num" ]; }; } \
         || { [ "$trafficless_entries" != "0" ] && { ! [[ "$earliest_num" =~ ^[0-9]+$ ]] || [ "$earliest_num" -eq 0 ] || [ "$earliest_num" -gt "$start_num" ]; }; }; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: vnStat 日数据未完整覆盖周期起点 $start_date，拒绝按不完整数据限速" >&2
-        return 1
+        if [ "${ALLOW_PARTIAL_HISTORY:-false}" != "true" ]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: vnStat 日数据未完整覆盖周期起点 $start_date，拒绝按不完整数据限速" >&2
+            return 1
+        fi
+        available_num="$created_num"
+        if [ "$trafficless_entries" != "0" ] \
+            && [[ "$earliest_num" =~ ^[0-9]{8}$ ]] && [ "$earliest_num" -gt "$available_num" ]; then
+            available_num="$earliest_num"
+        fi
+        if [[ "$retention_num" =~ ^[0-9]{8}$ ]] && [ "$retention_num" -gt "$available_num" ]; then
+            available_num="$retention_num"
+        fi
+        available_start=$(date_num_to_iso "$available_num")
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 警告: 用户已确认按部分历史继续；仅统计 $available_start 以来的可用流量，周期早段流量未计入" >&2
     fi
     
     # 根据 TRAFFIC_MODE 累加对应的流量
@@ -1183,10 +1399,131 @@ has_pending_shutdown() {
     fi
 }
 
+write_shutdown_state() {
+    local period_start boot_id
+    local tmp_file="${SHUTDOWN_STATE_FILE}.tmp.$$"
+
+    period_start=$(get_period_start_date)
+    boot_id=$(current_boot_id)
+    [[ "$period_start" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    [ -n "$boot_id" ] || return 1
+
+    {
+        printf 'PERIOD_START=%s\n' "$period_start"
+        printf 'BOOT_ID=%s\n' "$boot_id"
+        printf 'SCHEDULED_EPOCH=%s\n' "$(date +%s)"
+    } > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$SHUTDOWN_STATE_FILE"
+}
+
+shutdown_reboot_guard_active() {
+    local state_period state_boot current_period boot_id
+
+    [ -f "$SHUTDOWN_STATE_FILE" ] || return 1
+    state_period=$(shutdown_state_value "PERIOD_START")
+    state_boot=$(shutdown_state_value "BOOT_ID")
+    current_period=$(get_period_start_date)
+    boot_id=$(current_boot_id)
+    if [ -z "$state_period" ] || [ -z "$state_boot" ] || [ -z "$boot_id" ]; then
+        return 2
+    fi
+    if [ "$state_period" != "$current_period" ]; then
+        rm -f "$SHUTDOWN_STATE_FILE"
+        return 1
+    fi
+    if [ -n "$state_boot" ] && [ -n "$boot_id" ] && [ "$state_boot" != "$boot_id" ]; then
+        if ! write_enforcement_state "paused" "0" "shutdown_reboot"; then
+            return 2
+        fi
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到关机限制后的系统重启；同一周期已自动暂停再次关机，等待用户手动恢复。" | tee -a "$LOG_FILE"
+        return 0
+    fi
+    return 1
+}
+
+ENFORCEMENT_GUARD_MODE=""
+ENFORCEMENT_GUARD_REASON=""
+ENFORCEMENT_GUARD_REMAINING=0
+
+enforcement_guard_active() {
+    local mode until_epoch reason now
+
+    ENFORCEMENT_GUARD_MODE=""
+    ENFORCEMENT_GUARD_REASON=""
+    ENFORCEMENT_GUARD_REMAINING=0
+    [ -f "$ENFORCEMENT_STATE_FILE" ] || return 1
+    mode=$(enforcement_state_value "MODE")
+    until_epoch=$(enforcement_state_value "UNTIL_EPOCH")
+    reason=$(enforcement_state_value "REASON")
+    case "$mode" in
+        paused)
+            ENFORCEMENT_GUARD_MODE="paused"
+            ENFORCEMENT_GUARD_REASON="$reason"
+            return 0
+            ;;
+        grace)
+            if ! [[ "$until_epoch" =~ ^[0-9]+$ ]]; then
+                rm -f "$ENFORCEMENT_STATE_FILE"
+                return 1
+            fi
+            now=$(date +%s)
+            if [ "$now" -ge "$until_epoch" ]; then
+                rm -f "$ENFORCEMENT_STATE_FILE"
+                return 1
+            fi
+            ENFORCEMENT_GUARD_MODE="grace"
+            ENFORCEMENT_GUARD_REASON="$reason"
+            ENFORCEMENT_GUARD_REMAINING=$(( (until_epoch - now + 59) / 60 ))
+            return 0
+            ;;
+        *)
+            rm -f "$ENFORCEMENT_STATE_FILE"
+            return 1
+            ;;
+    esac
+}
+
+owned_tc_limit_active() {
+    local state_interface qdisc_line state_qdisc_line state_speed
+
+    [ -f "$TC_STATE_FILE" ] || return 1
+    state_interface=$(tc_state_interface)
+    [ "$state_interface" = "$MAIN_INTERFACE" ] || return 1
+    qdisc_line=$(tc_root_qdisc "$state_interface")
+    echo "$qdisc_line" | grep -q " tbf " || return 1
+    state_qdisc_line=$(tc_state_value "QDISC_LINE")
+    state_speed=$(tc_state_value "LIMIT_SPEED")
+    if [ -n "$state_qdisc_line" ]; then
+        [ "$qdisc_line" = "$state_qdisc_line" ]
+    else
+        [[ "$state_speed" =~ ^[0-9]+$ ]] \
+            && echo "$qdisc_line" | grep -Eq "rate[[:space:]]+${state_speed}[Kk]bit"
+    fi
+}
+
+TC_BOOT_GRACE_REMAINING=0
+
+tc_boot_grace_active() {
+    local grace_minutes uptime_seconds grace_seconds
+
+    TC_BOOT_GRACE_REMAINING=0
+    grace_minutes="${TC_BOOT_GRACE_MINUTES:-10}"
+    [[ "$grace_minutes" =~ ^[0-9]+$ ]] || grace_minutes=10
+    [ "$grace_minutes" -gt 0 ] || return 1
+    owned_tc_limit_active && return 1
+    uptime_seconds=$(awk '{ printf "%d", $1 }' /proc/uptime 2>/dev/null) || return 1
+    [[ "$uptime_seconds" =~ ^[0-9]+$ ]] || return 1
+    grace_seconds=$((grace_minutes * 60))
+    [ "$uptime_seconds" -lt "$grace_seconds" ] || return 1
+    TC_BOOT_GRACE_REMAINING=$(( (grace_seconds - uptime_seconds + 59) / 60 ))
+    return 0
+}
+
 
 # 修改 check_and_limit_traffic 函数
 check_and_limit_traffic() {
-    local current_usage limit_threshold unit_label
+    local current_usage limit_threshold unit_label shutdown_guard_status
     [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && unit_label="GB" || unit_label="GiB"
 
     if ! current_usage=$(get_traffic_usage); then
@@ -1205,7 +1542,33 @@ check_and_limit_traffic() {
     
     if (( $(echo "$current_usage >= $limit_threshold" | bc -l 2>/dev/null || echo "0") )); then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制" | tee -a "$LOG_FILE"
+        if [ "$LIMIT_MODE" = "shutdown" ]; then
+            if [ -f "$TC_STATE_FILE" ] && ! clear_owned_tc_rules "关机模式不保留 TC 限速"; then
+                return 1
+            fi
+            shutdown_reboot_guard_active
+            shutdown_guard_status=$?
+            if [ "$shutdown_guard_status" -eq 2 ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 无法写入关机重启保护状态，本轮拒绝再次关机。" | tee -a "$LOG_FILE"
+                return 1
+            fi
+        fi
+        if enforcement_guard_active; then
+            if [ "$ENFORCEMENT_GUARD_MODE" = "grace" ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 当前处于执行宽限期，剩余约 $ENFORCEMENT_GUARD_REMAINING 分钟；本轮只统计，不执行限制。" | tee -a "$LOG_FILE"
+                write_usage_state "grace" "$current_usage" "$limit_threshold" "$unit_label" || return 1
+            else
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 限制执行已暂停（原因：${ENFORCEMENT_GUARD_REASON:-manual}）；本轮只统计，不执行限制。" | tee -a "$LOG_FILE"
+                write_usage_state "paused" "$current_usage" "$limit_threshold" "$unit_label" || return 1
+            fi
+            return 0
+        fi
         if [ "$LIMIT_MODE" = "tc" ]; then
+            if tc_boot_grace_active; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 系统仍在开机限速宽限期，剩余约 $TC_BOOT_GRACE_REMAINING 分钟；暂不下发 TC 限速。" | tee -a "$LOG_FILE"
+                write_usage_state "grace" "$current_usage" "$limit_threshold" "$unit_label" || return 1
+                return 0
+            fi
             echo "$(date '+%Y-%m-%d %H:%M:%S') 使用 TC 模式限速" | tee -a "$LOG_FILE"
             local safe_limit_speed="${LIMIT_SPEED:-20}"
             if ! [[ "$safe_limit_speed" =~ ^[1-9][0-9]*$ ]]; then
@@ -1225,6 +1588,11 @@ check_and_limit_traffic() {
                     echo "$(date '+%Y-%m-%d %H:%M:%S') 计划关机失败" | tee -a "$LOG_FILE"
                     return 1
                 fi
+                if ! write_shutdown_state; then
+                    shutdown -c 2>/dev/null || true
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') 关机保护状态写入失败，已取消本次计划关机" | tee -a "$LOG_FILE"
+                    return 1
+                fi
             fi
             write_usage_state "shutdown" "$current_usage" "$limit_threshold" "$unit_label" || return 1
         fi
@@ -1240,7 +1608,7 @@ check_and_limit_traffic() {
 
 # 检查是否需要重置限制
 check_reset_limit() {
-    local period_start last_reset_period tmp_file
+    local period_start last_reset_period tmp_file enforcement_reason
 
     period_start=$(get_period_start_date)
     last_reset_period=$(cat "$PERIOD_STATE_FILE" 2>/dev/null || true)
@@ -1255,6 +1623,11 @@ check_reset_limit() {
         fi
     fi
     rm -f "$USAGE_STATE_FILE"
+    rm -f "$SHUTDOWN_STATE_FILE"
+    enforcement_reason=$(enforcement_state_value "REASON")
+    if [ "$enforcement_reason" = "shutdown_reboot" ]; then
+        rm -f "$ENFORCEMENT_STATE_FILE"
+    fi
 
     tmp_file="${PERIOD_STATE_FILE}.tmp.$$"
     printf '%s\n' "$period_start" > "$tmp_file" || return 1

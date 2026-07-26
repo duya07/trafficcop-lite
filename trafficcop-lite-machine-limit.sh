@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# TrafficCop 机器限速管理脚本 v2.2
+# TrafficCop 机器限速管理脚本 v2.3
 # 提供完整的启用/禁用/恢复机器限速功能
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -8,6 +8,8 @@ CONFIG_FILE="$WORK_DIR/traffic_monitor_config.txt"
 BACKUP_CONFIG_FILE="$CONFIG_FILE.disabled.backup"
 SCRIPT_PATH="$WORK_DIR/trafficcop-lite-monitor.sh"
 TC_STATE_FILE="$WORK_DIR/tc_limit_state"
+ENFORCEMENT_STATE_FILE="$WORK_DIR/enforcement_state"
+SHUTDOWN_STATE_FILE="$WORK_DIR/shutdown_limit_state"
 MONITOR_LOCK_FILE="$WORK_DIR/traffic_monitor.lock"
 CRON_COMMENT="# TrafficCop-Lite Monitor"
 
@@ -57,6 +59,60 @@ tc_root_qdisc() {
     if [ -n "$TC_BIN" ] && [ -n "$interface" ]; then
         "$TC_BIN" qdisc show dev "$interface" root 2>/dev/null | head -n 1
     fi
+}
+
+enforcement_state_value() {
+    local key="$1"
+    if [ -f "$ENFORCEMENT_STATE_FILE" ]; then
+        grep "^${key}=" "$ENFORCEMENT_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-
+    fi
+}
+
+has_pending_shutdown() {
+    if shutdown --help 2>&1 | grep -q -- '--show'; then
+        shutdown --show >/dev/null 2>&1
+    elif command -v pgrep >/dev/null 2>&1; then
+        pgrep -x shutdown >/dev/null 2>&1
+    else
+        return 1
+    fi
+}
+
+write_enforcement_state() {
+    local mode="$1"
+    local until_epoch="$2"
+    local reason="$3"
+    local tmp_file="${ENFORCEMENT_STATE_FILE}.tmp.$$"
+
+    {
+        printf 'MODE=%s\n' "$mode"
+        printf 'UNTIL_EPOCH=%s\n' "$until_epoch"
+        printf 'REASON=%s\n' "$reason"
+        printf 'UPDATED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    } > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$ENFORCEMENT_STATE_FILE"
+}
+
+cancel_owned_shutdown() {
+    if [ -f "$SHUTDOWN_STATE_FILE" ]; then
+        if has_pending_shutdown && ! shutdown -c 2>/dev/null; then
+            echo "✗ 无法取消本脚本记录的计划关机，已保留状态文件"
+            return 1
+        fi
+        rm -f "$SHUTDOWN_STATE_FILE" || return 1
+        echo "✓ 已取消本脚本记录的计划关机"
+    fi
+}
+
+begin_enable_grace() {
+    local grace_minutes="${1:-10}"
+    local until_epoch
+
+    [[ "$grace_minutes" =~ ^[0-9]+$ ]] || grace_minutes=10
+    until_epoch=$(( $(date +%s) + grace_minutes * 60 ))
+    cancel_owned_shutdown || return 1
+    write_enforcement_state "grace" "$until_epoch" "enable"
 }
 
 # 颜色定义
@@ -210,7 +266,7 @@ add_cron_job() {
 
 # 完全禁用机器限速
 disable_machine_limit() {
-    local has_error=false config_tmp
+    local has_error=false config_tmp had_owned_shutdown=false
 
     echo -e "${YELLOW}==================== 禁用机器限速 ====================${NC}"
     echo ""
@@ -255,8 +311,13 @@ disable_machine_limit() {
         fi
     fi
     
-    # 3. 取消可能的关机计划
-    if grep -q "LIMIT_MODE=shutdown" "$CONFIG_FILE" 2>/dev/null; then
+    # 3. 取消可能的关机计划并清理执行控制状态
+    [ -f "$SHUTDOWN_STATE_FILE" ] && had_owned_shutdown=true
+    if ! cancel_owned_shutdown; then
+        has_error=true
+    fi
+    rm -f "$ENFORCEMENT_STATE_FILE"
+    if ! $had_owned_shutdown && grep -q "LIMIT_MODE=shutdown" "$CONFIG_FILE" 2>/dev/null; then
         read -r -p "检测到关机模式配置，是否取消当前系统计划关机？[y/N]: " cancel_shutdown
         if [[ $cancel_shutdown =~ ^[Yy]$ ]]; then
             shutdown -c 2>/dev/null || true
@@ -307,9 +368,18 @@ enable_machine_limit() {
         echo "✓ 配置文件已恢复"
     fi
 
-    # 2. 立即执行一次监控，确认配置和运行环境有效
+    # 2. 启用后先留出安全窗口，再执行一次监控确认配置和运行环境。
+    if ! begin_enable_grace 10; then
+        cp "$enable_backup" "$CONFIG_FILE" 2>/dev/null || true
+        rm -f "$enable_backup"
+        echo -e "${RED}无法创建启用宽限状态，未启动监控。${NC}"
+        return 1
+    fi
+    echo "✓ 已设置 10 分钟启用宽限，期间只统计流量"
+
     echo "启动TrafficCop监控测试..."
     if ! cd "$WORK_DIR" || ! bash "$SCRIPT_PATH" --run; then
+        rm -f "$ENFORCEMENT_STATE_FILE"
         $had_tc_state || clear_tc_rules || true
         if cp "$enable_backup" "$CONFIG_FILE"; then
             chmod 600 "$CONFIG_FILE" 2>/dev/null || true
@@ -323,6 +393,7 @@ enable_machine_limit() {
 
     # 3. 测试成功后再添加定时任务
     if ! add_cron_job; then
+        rm -f "$ENFORCEMENT_STATE_FILE"
         $had_tc_state || clear_tc_rules || true
         if cp "$enable_backup" "$CONFIG_FILE"; then
             chmod 600 "$CONFIG_FILE" 2>/dev/null || true
@@ -367,9 +438,95 @@ restore_machine_limit() {
     enable_machine_limit
 }
 
+manage_enforcement_control() {
+    local control_choice grace_minutes until_epoch config_tmp
+
+    echo -e "${CYAN}==================== 限制执行控制 ====================${NC}"
+    echo "流量统计和 cron 可保持运行；这里仅控制达到阈值后是否真正限速或关机。"
+    echo ""
+    echo "1) 恢复执行（TC 仍遵守配置的开机宽限）"
+    echo "2) 宽限一段时间"
+    echo "3) 暂停执行（仅监控）"
+    echo "4) 修改 TC 开机宽限"
+    echo "0) 返回"
+    read -r -p "请选择 [0-4]: " control_choice
+    case "$control_choice" in
+        1)
+            cancel_owned_shutdown || return 1
+            rm -f "$ENFORCEMENT_STATE_FILE"
+            echo "✓ 已恢复限制执行；下次监控达到阈值时将按配置处理"
+            ;;
+        2|3)
+            if ! acquire_monitor_cleanup_lock; then
+                echo "✗ 无法取得监控锁，未修改执行状态"
+                return 1
+            fi
+            if ! clear_tc_rules; then
+                release_monitor_cleanup_lock
+                echo "✗ 无法安全清理当前 TC 规则，未修改执行状态"
+                return 1
+            fi
+            if ! cancel_owned_shutdown; then
+                release_monitor_cleanup_lock
+                return 1
+            fi
+            if [ "$control_choice" = "2" ]; then
+                read -r -p "请输入宽限分钟数 (1-1440，默认为10): " grace_minutes
+                grace_minutes=${grace_minutes:-10}
+                if ! [[ "$grace_minutes" =~ ^[0-9]+$ ]] || [ "$grace_minutes" -lt 1 ] || [ "$grace_minutes" -gt 1440 ]; then
+                    echo "输入无效，使用默认值：10 分钟"
+                    grace_minutes=10
+                fi
+                until_epoch=$(( $(date +%s) + grace_minutes * 60 ))
+                write_enforcement_state "grace" "$until_epoch" "manual" || {
+                    release_monitor_cleanup_lock
+                    return 1
+                }
+                echo "✓ 已设置 $grace_minutes 分钟宽限"
+            else
+                write_enforcement_state "paused" "0" "manual" || {
+                    release_monitor_cleanup_lock
+                    return 1
+                }
+                echo "✓ 已暂停限制执行；流量统计仍会继续"
+            fi
+            release_monitor_cleanup_lock
+            ;;
+        4)
+            if ! grep -q '^LIMIT_MODE=tc$' "$CONFIG_FILE" 2>/dev/null; then
+                echo "当前不是 TC 限速模式，无需设置开机限速宽限。"
+                return 1
+            fi
+            read -r -p "请输入开机后宽限分钟数 (0=立即，0-1440，默认为10): " grace_minutes
+            grace_minutes=${grace_minutes:-10}
+            if ! [[ "$grace_minutes" =~ ^[0-9]+$ ]] || [ "$grace_minutes" -gt 1440 ]; then
+                echo "输入无效，未修改。"
+                return 1
+            fi
+            config_tmp="${CONFIG_FILE}.tmp.$$"
+            if ! awk -v value="$grace_minutes" '
+                BEGIN { updated=0 }
+                /^TC_BOOT_GRACE_MINUTES=/ { print "TC_BOOT_GRACE_MINUTES=" value; updated=1; next }
+                { print }
+                END { if (!updated) print "TC_BOOT_GRACE_MINUTES=" value }
+            ' "$CONFIG_FILE" > "$config_tmp" \
+                || ! chmod 600 "$config_tmp" 2>/dev/null \
+                || ! mv -f "$config_tmp" "$CONFIG_FILE"; then
+                rm -f "$config_tmp"
+                echo "TC 开机宽限更新失败。"
+                return 1
+            fi
+            echo "✓ TC 开机宽限已更新为 $grace_minutes 分钟"
+            ;;
+        0) return 0 ;;
+        *) echo "无效选择"; return 1 ;;
+    esac
+}
+
 # 查看当前状态
 show_status() {
     local disabled_time last_run last_run_timestamp current_timestamp time_diff
+    local enforcement_mode enforcement_until enforcement_reason remaining boot_grace
 
     echo -e "${CYAN}==================== 当前状态 ====================${NC}"
     echo ""
@@ -384,6 +541,27 @@ show_status() {
         fi
     else
         echo -e "配置状态: ${YELLOW}未配置${NC}"
+    fi
+
+    enforcement_mode=$(enforcement_state_value "MODE")
+    enforcement_until=$(enforcement_state_value "UNTIL_EPOCH")
+    enforcement_reason=$(enforcement_state_value "REASON")
+    if [ "$enforcement_mode" = "paused" ]; then
+        if [ "$enforcement_reason" = "shutdown_reboot" ]; then
+            echo -e "限制执行: ${RED}关机后重启保护，已暂停${NC}"
+        else
+            echo -e "限制执行: ${YELLOW}已暂停，仅监控${NC}"
+        fi
+    elif [ "$enforcement_mode" = "grace" ] && [[ "$enforcement_until" =~ ^[0-9]+$ ]] \
+        && [ "$enforcement_until" -gt "$(date +%s)" ]; then
+        remaining=$(( (enforcement_until - $(date +%s) + 59) / 60 ))
+        echo -e "限制执行: ${YELLOW}宽限中，约剩余 $remaining 分钟${NC}"
+    else
+        echo -e "限制执行: ${GREEN}正常${NC}"
+    fi
+    boot_grace=$(grep '^TC_BOOT_GRACE_MINUTES=' "$CONFIG_FILE" 2>/dev/null | tail -1 | cut -d'=' -f2-)
+    if [ -n "$boot_grace" ]; then
+        echo "TC 开机宽限: $boot_grace 分钟"
     fi
     
     # 检查进程状态（检查最近的执行记录而不是实时进程）
@@ -512,6 +690,7 @@ show_menu() {
     echo "3) 恢复之前配置 (从备份恢复)"
     echo "4) 查看详细状态"
     echo "5) 清除TC限速规则 (仅清除当前限速)"
+    echo "6) 限制执行控制 (立即/宽限/暂停)"
     echo "0) 退出"
     echo ""
 }
@@ -540,7 +719,7 @@ main() {
     
     while true; do
         show_menu
-        read -r -p "请选择 [0-5]: " choice
+        read -r -p "请选择 [0-6]: " choice
         
         case $choice in
             1)
@@ -569,6 +748,11 @@ main() {
             5)
                 echo ""
                 clear_tc_rules
+                read -r -p "按回车键继续..."
+                ;;
+            6)
+                echo ""
+                manage_enforcement_control
                 read -r -p "按回车键继续..."
                 ;;
             0)

@@ -21,8 +21,10 @@ CRON_LOG="$WORK_DIR/tg_notifier_cron.log"
 TG_LOCK_FILE="$WORK_DIR/tg_notifier.lock"
 CRON_LOG_MAX_LINES="${CRON_LOG_MAX_LINES:-2000}"
 TG_DEBUG="${TG_DEBUG:-false}"
-SCRIPT_VERSION="1.0.6"
+SCRIPT_VERSION="1.0.7"
 
+# 此函数只由 EXIT trap 调用，ShellCheck 无法沿字符串形式的 trap 识别调用关系。
+# shellcheck disable=SC2317,SC2329
 trim_log_file() {
     local file="$1"
     local max_lines="$2"
@@ -406,7 +408,7 @@ read_current_traffic_state() {
     done < "$USAGE_STATE_FILE"
 
     case "$CURRENT_TRAFFIC_STATUS" in
-        normal|limited|shutdown) ;;
+        normal|limited|shutdown|grace|paused) ;;
         *) return 1 ;;
     esac
     [[ "$CURRENT_TRAFFIC_PERIOD_START" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
@@ -443,6 +445,8 @@ check_and_notify() {
             shutdown) current_status="关机" ;;
             limited) current_status="限速" ;;
             normal) current_status="正常" ;;
+            grace) current_status="宽限" ;;
+            paused) current_status="暂停" ;;
         esac
     else
         log_cron "实时流量状态不存在、无效或已过期，不根据旧日志发送状态通知"
@@ -502,7 +506,12 @@ check_and_notify() {
                     fi
                 elif [ -z "$effective_last_status" ]; then
                     next_status="正常"
+                else
+                    next_status="正常"
                 fi
+                ;;
+            宽限|暂停)
+                next_status="$current_status"
                 ;;
             *)
                 log_cron "无法识别当前状态，不发送通知"

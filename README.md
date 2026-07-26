@@ -27,6 +27,10 @@
 11. 监控成功后原子写入实时流量状态，Telegram 只使用未过期且周期一致的状态，不再从旧日志推断。
 12. 兼容 vnStat 以分号或井号标记的默认配置输出，不会误判 `DailyDays`、`TrafficlessEntries` 或 `UseUTC`。
 13. 关机模式检测到已有计划关机时不会重复提交或覆盖，避免每分钟改写系统关机计划。
+14. vnStat 历史晚于流量周期起点时，可由用户明确确认后按现有历史继续统计，主页会持续提示周期早段流量未计入。
+15. 保存配置时若当前流量已经达到阈值，可选择立即执行、限时宽限或暂停执行。
+16. TC 模式支持开机宽限，默认开机 10 分钟后才允许首次下发限速。
+17. 关机模式记录触发时的周期和 boot ID；同一周期内手动开机后会自动暂停再次关机，避免循环。
 
 ## 下载方式说明
 
@@ -136,6 +140,8 @@ sudo env RAW_BASE="https://v6.gh-proxy.org/https://raw.githubusercontent.com/duy
 - 不覆盖 `traffic_monitor_config.txt`、`tg_notifier_config.txt`、日志和 crontab。
 - 兼容旧配置；旧配置没有 `PERIOD_START_MONTH` 时仍按 1 月起算。
 - 旧配置没有 `TRAFFIC_UNIT` 时继续按 GiB 计算，不会因更新改变原配额含义。
+- 旧配置没有 `ALLOW_PARTIAL_HISTORY` 时保持严格模式，不会擅自按残缺历史执行限制。
+- 旧配置没有 `TC_BOOT_GRACE_MINUTES` 时默认使用 10 分钟开机限速宽限。
 - 下载到临时文件并通过 `bash -n` 语法检查后才替换。
 - 旧脚本会备份到 `/etc/trafficcop-lite/backups/scripts-时间戳/`。
 - 交互更新完成后会自动重新载入新版菜单；命令行更新完成后重新执行 `sudo ntc`。
@@ -151,9 +157,34 @@ sudo env RAW_BASE="https://v6.gh-proxy.org/https://raw.githubusercontent.com/duy
 
 例如输入 `6`，年度统计周期会按每年 6 月的指定起始日开始计算。
 
-配置时还可选择流量单位：`GB` 使用十进制（1000³ 字节，适合服务商配额），`GiB` 使用二进制（1024³ 字节，兼容旧版）。容错范围必须大于等于 `0` 且小于流量限制，异常旧配置会停止本轮判断，不会按 `0` 阈值触发限速或关机。季度和年度统计依赖 vnStat 的每日历史；脚本可调整 `DailyDays` 并将原配置备份到 `/etc/trafficcop-lite/vnstat.conf.before-trafficcop-lite`。`DailyDays=-1` 会按无限保留处理，`TrafficlessEntries=0` 产生的无流量日期缺口不会被误判为历史丢失。已有历史不足时仍会明确提示并跳过限速，不会按不完整数据误判。
+配置时还可选择流量单位：`GB` 使用十进制（1000³ 字节，适合服务商配额），`GiB` 使用二进制（1024³ 字节，兼容旧版）。容错范围必须大于等于 `0` 且小于流量限制，异常旧配置会停止本轮判断，不会按 `0` 阈值触发限速或关机。季度和年度统计依赖 vnStat 的每日历史；脚本可调整 `DailyDays` 并将原配置备份到 `/etc/trafficcop-lite/vnstat.conf.before-trafficcop-lite`。`DailyDays=-1` 会按无限保留处理，`TrafficlessEntries=0` 产生的无流量日期缺口不会被误判为历史丢失。
 
-## 5) 流量计费口径
+机器重装后，vnStat 无法恢复重装前的流量。若配置的周期起点早于现有历史，脚本会明确显示可用历史起点，并要求选择：
+
+```text
+1) 我已了解，按现有 vnStat 历史继续
+0) 取消配置，不保存本次修改
+```
+
+选择继续后，脚本会正常统计现有历史并执行规则，但实际已用流量可能偏低；主页会显示“周期早段流量未计入”。未确认或旧配置没有 `ALLOW_PARTIAL_HISTORY=true` 时仍采用严格模式，历史不完整就跳过限制判断。
+
+## 5) 限制执行与安全宽限
+
+保存配置时，如果现有可统计流量已经达到执行阈值，脚本不会突然限速或关机，而是要求选择：
+
+```text
+1) 宽限一段时间后再执行（推荐，默认 10 分钟）
+2) 立即执行
+3) 仅监控，暂停执行限制
+```
+
+暂停不会停止 vnStat 统计或监控 cron。可进入 `3) 机器限速管理 (启用/禁用)`，再选择 `6) 限制执行控制 (立即/宽限/暂停)` 恢复执行、重新宽限或继续暂停。
+
+TC 模式还包含独立的“开机限速宽限”，配置时可设为 `0-1440` 分钟，默认 `10` 分钟。系统刚启动且本脚本的 TC 规则尚未生效时，即使流量已经超额，也会等宽限结束再限速；设为 `0` 才会在下一次监控任务（通常一分钟内）立即处理。更新前的版本没有此保护，超额后通常会在开机后的第一次 cron 检查直接限速。
+
+关机模式会保存触发周期和 boot ID。因流量超额关机后，如果用户在同一流量周期内手动开机，脚本会自动切换为“关机后重启保护，已暂停”，不会每分钟再次关机。用户可在机器限速管理的限制执行控制中手动恢复；若未恢复，进入下一个流量周期时会自动解除这项重启保护。
+
+## 6) 流量计费口径
 
 vnStat 已分别记录每个接口实际接收的 `RX` 和发送的 `TX` 字节数，本脚本不会额外复制规则或重复乘权：
 
@@ -164,7 +195,7 @@ vnStat 已分别记录每个接口实际接收的 `RX` 和发送的 `TX` 字节�
 
 页面显示、阈值判断和 Telegram 状态都使用同一个计算结果。`GB` 与 `GiB` 只影响字节换算，不改变 RX/TX 的计费公式；旧配置没有 `TRAFFIC_UNIT` 时继续按 `GiB` 处理。
 
-## 6) 卸载
+## 7) 卸载
 
 推荐使用:
 
@@ -190,7 +221,7 @@ sudo bash /etc/trafficcop-lite/trafficcop-lite.sh --uninstall
 - 不卸载系统依赖包。
 - 不删除上游默认目录 `/root/TrafficCop`。
 
-## 7) 目录说明
+## 8) 目录说明
 
 安装后的默认目录:
 
@@ -207,6 +238,8 @@ sudo bash /etc/trafficcop-lite/trafficcop-lite.sh --uninstall
 ├── traffic_monitor.lock
 ├── tg_notifier.lock
 ├── tc_limit_state
+├── enforcement_state
+├── shutdown_limit_state
 ├── last_reset_period
 ├── current_traffic_state
 ├── vnstat_daily_coverage_start
@@ -231,6 +264,7 @@ sudo /usr/sbin/tc qdisc show
 
 - 脚本会安装依赖、写入 crontab，并可能配置 TC 限速或关机模式，请先在测试机确认。
 - TC 模式会用 `/etc/trafficcop-lite/tc_limit_state` 标记本脚本应用过的限速；自动恢复只清理带有该标记的规则，未标记的系统原有 `tbf` 规则会被保留或要求确认。
+- `enforcement_state` 只记录临时宽限或暂停状态；`shutdown_limit_state` 只记录本脚本计划的流量关机及其 boot ID。
 - 若状态记录与当前 qdisc 不一致，脚本会按外部规则处理并停止自动覆盖。
 - 停止服务/卸载时，未标记的 TC 规则和计划关机会要求确认后才处理。
 - Telegram cron 日志默认保留最近 2000 行；如需详细调试，可临时设置 `TG_DEBUG=true`。

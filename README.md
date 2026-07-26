@@ -138,7 +138,8 @@ sudo env RAW_BASE="https://v6.gh-proxy.org/https://raw.githubusercontent.com/duy
 - 旧配置没有 `TRAFFIC_UNIT` 时继续按 GiB 计算，不会因更新改变原配额含义。
 - 下载到临时文件并通过 `bash -n` 语法检查后才替换。
 - 旧脚本会备份到 `/etc/trafficcop-lite/backups/scripts-时间戳/`。
-- 更新完成后建议重新执行 `sudo ntc` 进入新版菜单。
+- 交互更新完成后会自动重新载入新版菜单；命令行更新完成后重新执行 `sudo ntc`。
+- 新版安装器会比较组件版本，阻止较旧的外部脚本覆盖已经安装的更高版本。
 
 ## 4) 年度起始月份
 
@@ -152,7 +153,18 @@ sudo env RAW_BASE="https://v6.gh-proxy.org/https://raw.githubusercontent.com/duy
 
 配置时还可选择流量单位：`GB` 使用十进制（1000³ 字节，适合服务商配额），`GiB` 使用二进制（1024³ 字节，兼容旧版）。季度和年度统计依赖 vnStat 的每日历史；脚本可调整 `DailyDays` 并将原配置备份到 `/etc/trafficcop-lite/vnstat.conf.before-trafficcop-lite`。`DailyDays=-1` 会按无限保留处理，`TrafficlessEntries=0` 产生的无流量日期缺口不会被误判为历史丢失。已有历史不足时仍会明确提示并跳过限速，不会按不完整数据误判。
 
-## 5) 卸载
+## 5) 流量计费口径
+
+vnStat 已分别记录每个接口实际接收的 `RX` 和发送的 `TX` 字节数，本脚本不会额外复制规则或重复乘权：
+
+- 只计算出站：`ΣTX`
+- 只计算进站：`ΣRX`
+- 进站与出站都计算：`ΣRX + ΣTX`
+- 进出取大：`max(ΣRX, ΣTX)`，按整个统计周期的两个方向总量取大，不是逐日取大后再累加。
+
+页面显示、阈值判断和 Telegram 状态都使用同一个计算结果。`GB` 与 `GiB` 只影响字节换算，不改变 RX/TX 的计费公式；旧配置没有 `TRAFFIC_UNIT` 时继续按 `GiB` 处理。
+
+## 6) 卸载
 
 推荐使用:
 
@@ -178,7 +190,7 @@ sudo bash /etc/trafficcop-lite/trafficcop-lite.sh --uninstall
 - 不卸载系统依赖包。
 - 不删除上游默认目录 `/root/TrafficCop`。
 
-## 6) 目录说明
+## 7) 目录说明
 
 安装后的默认目录:
 

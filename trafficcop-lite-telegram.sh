@@ -21,7 +21,7 @@ CRON_LOG="$WORK_DIR/tg_notifier_cron.log"
 TG_LOCK_FILE="$WORK_DIR/tg_notifier.lock"
 CRON_LOG_MAX_LINES="${CRON_LOG_MAX_LINES:-2000}"
 TG_DEBUG="${TG_DEBUG:-false}"
-SCRIPT_VERSION="1.0.7"
+SCRIPT_VERSION="1.0.8"
 
 # 此函数只由 EXIT trap 调用，ShellCheck 无法沿字符串形式的 trap 识别调用关系。
 # shellcheck disable=SC2317,SC2329
@@ -674,7 +674,11 @@ if [[ "$*" == *"-cron"* ]]; then
             echo "======================================"
             echo -n "请选择操作 [0-7]: "
             
-            read -r choice
+            if ! read -r choice; then
+                echo
+                echo "输入已结束，退出脚本。"
+                exit 0
+            fi
             echo
             
             case $choice in

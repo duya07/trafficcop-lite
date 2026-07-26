@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# TrafficCop 机器限速管理脚本 v2.3
+# TrafficCop 机器限速管理脚本 v2.4
 # 提供完整的启用/禁用/恢复机器限速功能
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -719,7 +719,11 @@ main() {
     
     while true; do
         show_menu
-        read -r -p "请选择 [0-6]: " choice
+        if ! read -r -p "请选择 [0-6]: " choice; then
+            echo ""
+            echo "输入已结束，退出"
+            exit 0
+        fi
         
         case $choice in
             1)

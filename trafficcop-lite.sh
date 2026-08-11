@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.1.2"
-LAST_UPDATE="2026-08-11"
+SCRIPT_VERSION="1.1.3"
+LAST_UPDATE="2026-08-12"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
@@ -124,6 +124,40 @@ version_is_newer() {
     }'
 }
 
+validate_update_candidate() {
+    local script_name="$1"
+    local candidate_file="$2"
+    local installed_file="$WORK_DIR/$script_name"
+    local candidate_version installed_version
+
+    candidate_version=$(script_version_from_file "$candidate_file")
+    if [ -z "$candidate_version" ]; then
+        echo -e "${RED}无法识别 $script_name 的候选版本，已取消更新。${NC}"
+        return 1
+    fi
+
+    installed_version=$(script_version_from_file "$installed_file")
+    if [ -n "$installed_version" ] && version_is_newer "$installed_version" "$candidate_version"; then
+        echo -e "${RED}更新源中的 $script_name 版本 $candidate_version 低于已安装版本 $installed_version，已阻止降级。${NC}"
+        return 1
+    fi
+}
+
+verify_installed_scripts() {
+    local script_name
+
+    for script_name in "trafficcop-lite.sh" "$MONITOR_SCRIPT" "$TELEGRAM_SCRIPT" "$MACHINE_LIMIT_SCRIPT"; do
+        if [ ! -s "$WORK_DIR/$script_name" ] || ! bash -n "$WORK_DIR/$script_name" 2>/dev/null; then
+            echo -e "${RED}安装后校验失败：$script_name${NC}"
+            return 1
+        fi
+        if ! chmod +x "$WORK_DIR/$script_name"; then
+            echo -e "${RED}无法设置脚本执行权限：$script_name${NC}"
+            return 1
+        fi
+    done
+}
+
 copy_self_if_needed() {
     local self_path="$SOURCE_PATH"
     local dest="$WORK_DIR/trafficcop-lite.sh"
@@ -175,9 +209,9 @@ download_url_to_file() {
     local dest="$2"
 
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$url" -o "$dest"
+        curl -fsSL --retry 2 --connect-timeout 10 --max-time 90 "$url" -o "$dest"
     elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$dest" "$url"
+        wget -q -T 30 -O "$dest" "$url"
     else
         echo -e "${RED}缺少 curl/wget，无法下载文件。${NC}"
         return 1
@@ -229,18 +263,19 @@ install_all_components() {
     copy_self_if_needed
 }
 
-install_shortcut() {
-    install_all_components || return 1
-
+install_shortcut_link() {
     if [ -e "$SHORTCUT_PATH" ] && [ "$(readlink "$SHORTCUT_PATH" 2>/dev/null)" != "$WORK_DIR/trafficcop-lite.sh" ]; then
         echo -e "${YELLOW}! $SHORTCUT_PATH 已存在，未覆盖。${NC}"
         echo -e "${YELLOW}  你仍可使用：sudo bash $WORK_DIR/trafficcop-lite.sh${NC}"
         return 0
     fi
 
-    mkdir -p "$(dirname "$SHORTCUT_PATH")"
-    ln -sfn "$WORK_DIR/trafficcop-lite.sh" "$SHORTCUT_PATH"
-    chmod +x "$WORK_DIR/trafficcop-lite.sh"
+    if ! mkdir -p "$(dirname "$SHORTCUT_PATH")" \
+        || ! ln -sfn "$WORK_DIR/trafficcop-lite.sh" "$SHORTCUT_PATH" \
+        || ! chmod +x "$WORK_DIR/trafficcop-lite.sh"; then
+        echo -e "${RED}快捷命令安装失败，请使用：sudo bash $WORK_DIR/trafficcop-lite.sh${NC}"
+        return 1
+    fi
     echo -e "${GREEN}✓ 快捷命令已安装：sudo ntc${NC}"
     if [ "$(readlink "$LEGACY_NCL_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
         rm -f "$LEGACY_NCL_SHORTCUT_PATH"
@@ -253,6 +288,31 @@ install_shortcut() {
     if [ -n "$TC_BIN" ]; then
         echo -e "${CYAN}系统原 tc 命令路径：$TC_BIN${NC}"
     fi
+}
+
+install_shortcut() {
+    install_all_components || return 1
+    install_shortcut_link
+}
+
+source_has_complete_bundle() {
+    local script_name
+
+    for script_name in "$MONITOR_SCRIPT" "$TELEGRAM_SCRIPT" "$MACHINE_LIMIT_SCRIPT"; do
+        [ -f "$SCRIPT_DIR/$script_name" ] || return 1
+    done
+}
+
+install_from_entrypoint() {
+    if [ "$SOURCE_PATH" != "$WORK_DIR/trafficcop-lite.sh" ] && ! source_has_complete_bundle; then
+        echo -e "${CYAN}检测到单文件安装入口，正在同步整套最新脚本...${NC}"
+        update_scripts "$RAW_BASE" || return 1
+        verify_installed_scripts || return 1
+        install_shortcut_link
+        return $?
+    fi
+
+    install_shortcut
 }
 
 run_component() {
@@ -323,11 +383,34 @@ choose_update_base() {
     esac
 }
 
+rollback_script_update() {
+    local backup_dir="$1"
+    shift
+    local script_name
+    local rollback_failed=false
+
+    for script_name in "$@"; do
+        if [ -f "$backup_dir/$script_name" ]; then
+            cp -a "$backup_dir/$script_name" "$WORK_DIR/$script_name" || rollback_failed=true
+        elif [ -f "$backup_dir/.absent-$script_name" ]; then
+            rm -f "$WORK_DIR/$script_name" || rollback_failed=true
+        else
+            rollback_failed=true
+        fi
+    done
+
+    ! $rollback_failed
+}
+
 update_scripts() {
     local update_base="${1:-$RAW_BASE}"
     local scripts=("trafficcop-lite.sh" "$MONITOR_SCRIPT" "$TELEGRAM_SCRIPT" "$MACHINE_LIMIT_SCRIPT")
     local temp_files=()
-    local script_name restore_name tmp_file url backup_dir rollback_failed
+    local script_name tmp_file url backup_dir candidate_version
+    local release_changed=false
+
+    UPDATE_PREVIOUS_VERSION=$(script_version_from_file "$WORK_DIR/trafficcop-lite.sh")
+    UPDATE_NEW_VERSION=""
 
     ensure_work_dir
     echo -e "${CYAN}正在更新 TrafficCop-Lite 脚本...${NC}"
@@ -358,11 +441,33 @@ update_scripts() {
             return 1
         fi
 
+        if ! validate_update_candidate "$script_name" "$tmp_file"; then
+            rm -f "${temp_files[@]}" "$tmp_file" 2>/dev/null || true
+            return 1
+        fi
+
+        if [ "$script_name" = "trafficcop-lite.sh" ]; then
+            candidate_version=$(script_version_from_file "$tmp_file")
+            UPDATE_NEW_VERSION="$candidate_version"
+        fi
+
+        if [ ! -f "$WORK_DIR/$script_name" ] || ! cmp -s "$tmp_file" "$WORK_DIR/$script_name"; then
+            release_changed=true
+        fi
+
         temp_files+=("$tmp_file")
     done
 
-    backup_dir="$WORK_DIR/backups/scripts-$(date +%Y%m%d-%H%M%S)"
-    if ! mkdir -p "$backup_dir"; then
+    if ! $release_changed; then
+        rm -f "${temp_files[@]}" 2>/dev/null || true
+        verify_installed_scripts || return 1
+        install_shortcut_link || return 1
+        echo ""
+        echo -e "${GREEN}当前已是最新版本：${UPDATE_NEW_VERSION:-未知}${NC}"
+        return 0
+    fi
+    backup_dir="$WORK_DIR/backups/scripts-$(date +%Y%m%d-%H%M%S)-$$"
+    if ! mkdir -p "$WORK_DIR/backups" || ! mkdir "$backup_dir"; then
         echo -e "${RED}无法创建脚本备份目录，已取消更新。${NC}"
         rm -f "${temp_files[@]}" 2>/dev/null || true
         return 1
@@ -375,45 +480,38 @@ update_scripts() {
                 rm -f "${temp_files[@]}" 2>/dev/null || true
                 return 1
             fi
+        elif ! : > "$backup_dir/.absent-$script_name"; then
+            echo -e "${RED}记录 $script_name 的安装前状态失败，已取消更新。${NC}"
+            rm -f "${temp_files[@]}" 2>/dev/null || true
+            return 1
         fi
     done
-
     for script_name in "${scripts[@]}"; do
         tmp_file="$WORK_DIR/.${script_name}.new.$$"
         if ! chmod +x "$tmp_file" || ! mv -f "$tmp_file" "$WORK_DIR/$script_name"; then
             echo -e "${RED}替换 $script_name 失败，正在恢复更新前脚本。${NC}"
-            rollback_failed=false
-            for restore_name in "${scripts[@]}"; do
-                if [ -f "$backup_dir/$restore_name" ]; then
-                    cp -a "$backup_dir/$restore_name" "$WORK_DIR/$restore_name" || rollback_failed=true
-                else
-                    rm -f "$WORK_DIR/$restore_name" || rollback_failed=true
-                fi
-            done
-            rm -f "${temp_files[@]}" 2>/dev/null || true
-            if $rollback_failed; then
+            if ! rollback_script_update "$backup_dir" "${scripts[@]}"; then
                 echo -e "${RED}部分脚本回滚失败，备份保留在：$backup_dir${NC}"
             fi
+            rm -f "${temp_files[@]}" 2>/dev/null || true
             return 1
         fi
         echo -e "${GREEN}✓ 已更新 $script_name${NC}"
     done
 
-    if [ -e "$SHORTCUT_PATH" ] && [ "$(readlink "$SHORTCUT_PATH" 2>/dev/null)" != "$WORK_DIR/trafficcop-lite.sh" ]; then
-        echo -e "${YELLOW}! $SHORTCUT_PATH 已存在且不属于本脚本，已保留。${NC}"
-    else
-        mkdir -p "$(dirname "$SHORTCUT_PATH")"
-        ln -sfn "$WORK_DIR/trafficcop-lite.sh" "$SHORTCUT_PATH"
-    fi
-    if [ "$(readlink "$LEGACY_NCL_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
-        rm -f "$LEGACY_NCL_SHORTCUT_PATH"
-    fi
-    if [ "$(readlink "$LEGACY_TC_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
-        rm -f "$LEGACY_TC_SHORTCUT_PATH"
+    if ! verify_installed_scripts; then
+        echo -e "${RED}更新后的脚本校验失败，正在恢复更新前脚本。${NC}"
+        if ! rollback_script_update "$backup_dir" "${scripts[@]}"; then
+            echo -e "${RED}部分脚本回滚失败，备份保留在：$backup_dir${NC}"
+        fi
+        return 1
     fi
 
+    install_shortcut_link || return 1
+
     echo ""
-    echo -e "${GREEN}脚本更新完成。旧脚本已备份到：$backup_dir${NC}"
+    echo -e "${GREEN}脚本更新完成：${UPDATE_PREVIOUS_VERSION:-未安装} → ${UPDATE_NEW_VERSION:-未知}${NC}"
+    echo -e "${GREEN}旧脚本已备份到：$backup_dir${NC}"
     echo -e "${YELLOW}命令行更新后请重新执行 sudo ntc；交互更新将自动载入新版菜单。${NC}"
 }
 
@@ -1350,7 +1448,7 @@ main() {
 
     case "${1:-}" in
         --install)
-            install_shortcut
+            install_from_entrypoint
             install_status=$?
             [ "$install_status" -eq 0 ] || exit "$install_status"
             echo -e "${GREEN}安装完成。以后可执行：sudo ntc${NC}"

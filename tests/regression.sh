@@ -440,6 +440,163 @@ test_telegram_real_lock_contention_and_release() {
     exec 7>&-
 }
 
+# shellcheck disable=SC2034,SC2317,SC2329
+test_update_rejects_older_candidate() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/update-downgrade.XXXXXX") || return 1
+    WORK_DIR="$work/installed"
+    RED=''
+    NC=''
+    mkdir -p "$WORK_DIR"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.3"' > "$WORK_DIR/trafficcop-lite.sh"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.0.2"' > "$work/candidate.sh"
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" script_version_from_file || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" version_is_newer || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" validate_update_candidate || return 1
+
+    if validate_update_candidate trafficcop-lite.sh "$work/candidate.sh" >/dev/null; then
+        return 1
+    fi
+    assert_file_content "$(printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.3"')" "$WORK_DIR/trafficcop-lite.sh"
+}
+
+# shellcheck disable=SC2034,SC2317,SC2329
+test_single_file_install_refreshes_all_scripts() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/single-install.XXXXXX") || return 1
+    WORK_DIR="$work/installed"
+    SCRIPT_DIR="$work/download"
+    SOURCE_PATH="$SCRIPT_DIR/trafficcop-lite.sh"
+    MONITOR_SCRIPT='trafficcop-lite-monitor.sh'
+    TELEGRAM_SCRIPT='trafficcop-lite-telegram.sh'
+    MACHINE_LIMIT_SCRIPT='trafficcop-lite-machine-limit.sh'
+    RAW_BASE='https://example.invalid/release'
+    CYAN=''
+    NC=''
+    mkdir -p "$SCRIPT_DIR"
+    : > "$SOURCE_PATH"
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" source_has_complete_bundle || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" install_from_entrypoint || return 1
+    update_scripts() { printf '%s\n' "$1" > "$work/update-called"; }
+    verify_installed_scripts() { printf '%s\n' 'called' > "$work/verify-called"; }
+    install_shortcut_link() { printf '%s\n' 'called' > "$work/shortcut-called"; }
+    install_shortcut() { printf '%s\n' 'unexpected' > "$work/local-install-called"; }
+
+    install_from_entrypoint >/dev/null || return 1
+    assert_file_content "$RAW_BASE" "$work/update-called" || return 1
+    assert_file_content 'called' "$work/verify-called" || return 1
+    assert_file_content 'called' "$work/shortcut-called" || return 1
+    assert_absent "$work/local-install-called"
+}
+
+# shellcheck disable=SC2034,SC2317,SC2329
+test_complete_bundle_install_stays_local() {
+    local work script_name
+    work=$(mktemp -d "$TEST_ROOT/bundle-install.XXXXXX") || return 1
+    WORK_DIR="$work/installed"
+    SCRIPT_DIR="$work/bundle"
+    SOURCE_PATH="$SCRIPT_DIR/trafficcop-lite.sh"
+    MONITOR_SCRIPT='trafficcop-lite-monitor.sh'
+    TELEGRAM_SCRIPT='trafficcop-lite-telegram.sh'
+    MACHINE_LIMIT_SCRIPT='trafficcop-lite-machine-limit.sh'
+    CYAN=''
+    NC=''
+    mkdir -p "$SCRIPT_DIR"
+    for script_name in trafficcop-lite.sh "$MONITOR_SCRIPT" "$TELEGRAM_SCRIPT" "$MACHINE_LIMIT_SCRIPT"; do
+        : > "$SCRIPT_DIR/$script_name"
+    done
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" source_has_complete_bundle || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" install_from_entrypoint || return 1
+    update_scripts() { printf '%s\n' 'unexpected' > "$work/update-called"; }
+    install_shortcut() { printf '%s\n' 'called' > "$work/local-install-called"; }
+
+    install_from_entrypoint >/dev/null || return 1
+    assert_file_content 'called' "$work/local-install-called" || return 1
+    assert_absent "$work/update-called"
+}
+
+# shellcheck disable=SC2034,SC2317,SC2329
+test_update_replaces_full_release_and_preserves_state() {
+    local work script_name backup_main
+    work=$(mktemp -d "$TEST_ROOT/update-release.XXXXXX") || return 1
+    WORK_DIR="$work/installed"
+    local remote_dir="$work/remote"
+    MONITOR_SCRIPT='trafficcop-lite-monitor.sh'
+    TELEGRAM_SCRIPT='trafficcop-lite-telegram.sh'
+    MACHINE_LIMIT_SCRIPT='trafficcop-lite-machine-limit.sh'
+    RED=''
+    GREEN=''
+    YELLOW=''
+    CYAN=''
+    NC=''
+    mkdir -p "$WORK_DIR" "$remote_dir"
+
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.0.2"' > "$WORK_DIR/trafficcop-lite.sh"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.0.0"' > "$WORK_DIR/$MONITOR_SCRIPT"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.0.0"' > "$WORK_DIR/$TELEGRAM_SCRIPT"
+    printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.0' > "$WORK_DIR/$MACHINE_LIMIT_SCRIPT"
+    printf '%s\n' 'CONFIG=keep-me' > "$WORK_DIR/traffic_monitor_config.txt"
+
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.3"' > "$remote_dir/trafficcop-lite.sh"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.2"' > "$remote_dir/$MONITOR_SCRIPT"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.1"' > "$remote_dir/$TELEGRAM_SCRIPT"
+    printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.5' > "$remote_dir/$MACHINE_LIMIT_SCRIPT"
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" script_version_from_file || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" version_is_newer || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" validate_update_candidate || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" verify_installed_scripts || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" rollback_script_update || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" update_scripts || return 1
+    ensure_work_dir() { mkdir -p "$WORK_DIR"; }
+    download_url_to_file() { cp "$remote_dir/$(basename "$1")" "$2"; }
+    install_shortcut_link() { printf '%s\n' 'called' > "$work/shortcut-called"; }
+
+    update_scripts 'https://example.invalid/release' >/dev/null || return 1
+    grep -Fqx 'SCRIPT_VERSION="1.1.3"' "$WORK_DIR/trafficcop-lite.sh" || return 1
+    grep -Fqx 'SCRIPT_VERSION="1.1.2"' "$WORK_DIR/$MONITOR_SCRIPT" || return 1
+    grep -Fqx 'SCRIPT_VERSION="1.1.1"' "$WORK_DIR/$TELEGRAM_SCRIPT" || return 1
+    grep -Fqx '# TrafficCop Lite Machine Limit v2.5' "$WORK_DIR/$MACHINE_LIMIT_SCRIPT" || return 1
+    assert_file_content 'CONFIG=keep-me' "$WORK_DIR/traffic_monitor_config.txt" || return 1
+    backup_main=$(find "$WORK_DIR/backups" -type f -name trafficcop-lite.sh -print -quit) || return 1
+    [ -n "$backup_main" ] || return 1
+    grep -Fqx 'SCRIPT_VERSION="1.0.2"' "$backup_main" || return 1
+    [ "$UPDATE_PREVIOUS_VERSION" = '1.0.2' ] || return 1
+    [ "$UPDATE_NEW_VERSION" = '1.1.3' ] || return 1
+    assert_file_content 'called' "$work/shortcut-called"
+}
+
+# shellcheck disable=SC2034
+test_update_rollback_requires_backup_evidence() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/update-rollback.XXXXXX") || return 1
+    WORK_DIR="$work/installed"
+    local backup_dir="$work/backup"
+    mkdir -p "$WORK_DIR" "$backup_dir"
+
+    printf '%s\n' 'old-main' > "$backup_dir/trafficcop-lite.sh"
+    : > "$backup_dir/.absent-trafficcop-lite-monitor.sh"
+    printf '%s\n' 'new-main' > "$WORK_DIR/trafficcop-lite.sh"
+    printf '%s\n' 'new-monitor' > "$WORK_DIR/trafficcop-lite-monitor.sh"
+    printf '%s\n' 'new-telegram' > "$WORK_DIR/trafficcop-lite-telegram.sh"
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" rollback_script_update || return 1
+    if rollback_script_update \
+        "$backup_dir" \
+        trafficcop-lite.sh \
+        trafficcop-lite-monitor.sh \
+        trafficcop-lite-telegram.sh; then
+        return 1
+    fi
+
+    assert_file_content 'old-main' "$WORK_DIR/trafficcop-lite.sh" || return 1
+    assert_absent "$WORK_DIR/trafficcop-lite-monitor.sh" || return 1
+    assert_file_content 'new-telegram' "$WORK_DIR/trafficcop-lite-telegram.sh"
+}
+
 run_test() {
     local name="$1"
     local test_function="$2"
@@ -467,6 +624,11 @@ run_test 'Telegram menu does not hold cron lock' test_telegram_menu_does_not_hol
 run_test 'Telegram cron still takes lock' test_telegram_cron_still_takes_lock
 run_test 'Telegram action releases lock after failure' test_telegram_action_releases_lock_after_failure
 run_test 'Telegram real lock contention and release' test_telegram_real_lock_contention_and_release
+run_test 'update rejects an older candidate' test_update_rejects_older_candidate
+run_test 'single-file install refreshes every script' test_single_file_install_refreshes_all_scripts
+run_test 'complete bundle install remains local' test_complete_bundle_install_stays_local
+run_test 'update replaces full release and preserves state' test_update_replaces_full_release_and_preserves_state
+run_test 'update rollback requires backup evidence' test_update_rollback_requires_backup_evidence
 
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

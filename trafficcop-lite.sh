@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.1.1"
-LAST_UPDATE="2026-07-27"
+SCRIPT_VERSION="1.1.2"
+LAST_UPDATE="2026-08-11"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
@@ -1165,7 +1165,20 @@ lite_has_pending_shutdown() {
 
 cancel_shutdown_interactive() {
     local config="$WORK_DIR/traffic_monitor_config.txt"
+    local state_boot current_boot
+
     if [ -f "$SHUTDOWN_STATE_FILE" ]; then
+        state_boot=$(grep '^BOOT_ID=' "$SHUTDOWN_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-)
+        current_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+        if [ -n "$state_boot" ] && [ -n "$current_boot" ] && [ "$state_boot" != "$current_boot" ]; then
+            rm -f "$SHUTDOWN_STATE_FILE" || return 1
+            echo "✓ 已清理上次开机遗留的关机状态，未触碰本次开机的计划关机"
+            return 0
+        fi
+        if { [ -z "$state_boot" ] || [ -z "$current_boot" ]; } && lite_has_pending_shutdown; then
+            echo -e "${RED}无法确认计划关机是否属于本脚本，已保留系统任务和状态文件。${NC}"
+            return 1
+        fi
         if lite_has_pending_shutdown && ! shutdown -c 2>/dev/null; then
             echo -e "${RED}无法取消本脚本记录的计划关机，已保留状态文件。${NC}"
             return 1

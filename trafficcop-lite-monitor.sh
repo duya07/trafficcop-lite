@@ -20,7 +20,7 @@ USAGE_STATE_FILE="$WORK_DIR/current_traffic_state"
 ENFORCEMENT_STATE_FILE="$WORK_DIR/enforcement_state"
 SHUTDOWN_STATE_FILE="$WORK_DIR/shutdown_limit_state"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.1.2"
 mkdir -p "$WORK_DIR"
 chmod 700 "$WORK_DIR" 2>/dev/null || true
 
@@ -128,6 +128,49 @@ ensure_vnstat_interface() {
     ensure_service_running "vnStat" vnstat vnstatd
 }
 
+commit_vnstat_retention_update() {
+    local config_path="$1"
+    local config_tmp="$2"
+    local marker_tmp="$3"
+    local marker_backup="${RETENTION_STATE_FILE}.before-update.$$"
+    local had_marker=false
+    local rollback_failed=false
+
+    if [ -f "$RETENTION_STATE_FILE" ]; then
+        if ! cp -p "$RETENTION_STATE_FILE" "$marker_backup"; then
+            rm -f "$config_tmp" "$marker_tmp"
+            return 1
+        fi
+        had_marker=true
+    fi
+
+    if ! mv -f "$marker_tmp" "$RETENTION_STATE_FILE"; then
+        rm -f "$config_tmp" "$marker_tmp" "$marker_backup"
+        return 1
+    fi
+
+    if mv -f "$config_tmp" "$config_path"; then
+        rm -f "$marker_backup"
+        return 0
+    fi
+
+    if $had_marker; then
+        mv -f "$marker_backup" "$RETENTION_STATE_FILE" || rollback_failed=true
+    else
+        rm -f "$RETENTION_STATE_FILE" || rollback_failed=true
+    fi
+    rm -f "$config_tmp" "$marker_tmp"
+
+    if $rollback_failed; then
+        if $had_marker; then
+            echo "vnStat 配置写入失败，且保留期状态回滚失败；旧标记备份保留在 $marker_backup。"
+        else
+            echo "vnStat 配置写入失败，且无法删除新建的保留期标记；请检查 $RETENTION_STATE_FILE。"
+        fi
+    fi
+    return 1
+}
+
 ensure_vnstat_daily_retention() {
     local required_days current_days config_path answer tmp_file mode owner group marker_tmp
     case "$TRAFFIC_PERIOD" in
@@ -171,8 +214,7 @@ ensure_vnstat_daily_retention() {
     marker_tmp="${RETENTION_STATE_FILE}.tmp.$$"
     date +%Y-%m-%d > "$marker_tmp" || { rm -f "$tmp_file"; return 1; }
     chmod 600 "$marker_tmp" 2>/dev/null || true
-    mv -f "$marker_tmp" "$RETENTION_STATE_FILE" || { rm -f "$tmp_file" "$marker_tmp"; return 1; }
-    mv -f "$tmp_file" "$config_path" || { rm -f "$tmp_file"; return 1; }
+    commit_vnstat_retention_update "$config_path" "$tmp_file" "$marker_tmp" || return 1
     if command_exists systemctl; then
         systemctl restart vnstat.service >/dev/null 2>&1 || systemctl restart vnstatd.service >/dev/null 2>&1 || true
     elif command_exists rc-service; then
@@ -579,6 +621,35 @@ EOF
     echo "$(date '+%Y-%m-%d %H:%M:%S') 配置已更新"| tee -a "$LOG_FILE"
 }
 
+restore_monitor_config_snapshot() {
+    local config_backup="$1"
+    local had_config="$2"
+    local enforcement_backup="$3"
+    local had_enforcement="$4"
+    local restore_failed=false
+
+    if [ "$had_config" = "true" ]; then
+        if [ ! -f "$config_backup" ] || ! mv -f "$config_backup" "$CONFIG_FILE"; then
+            restore_failed=true
+        fi
+    elif ! rm -f "$CONFIG_FILE"; then
+        restore_failed=true
+    fi
+
+    if [ "$had_enforcement" = "true" ]; then
+        if [ ! -f "$enforcement_backup" ] || ! mv -f "$enforcement_backup" "$ENFORCEMENT_STATE_FILE"; then
+            restore_failed=true
+        fi
+    elif ! rm -f "$ENFORCEMENT_STATE_FILE"; then
+        restore_failed=true
+    fi
+
+    if $restore_failed; then
+        return 1
+    fi
+    return 0
+}
+
 
 # 显示当前配置
 show_current_config() {
@@ -758,7 +829,20 @@ write_enforcement_state() {
 }
 
 clear_owned_shutdown_schedule() {
+    local state_boot current_boot
+
     if [ -f "$SHUTDOWN_STATE_FILE" ]; then
+        state_boot=$(grep '^BOOT_ID=' "$SHUTDOWN_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-)
+        current_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+        if [ -n "$state_boot" ] && [ -n "$current_boot" ] && [ "$state_boot" != "$current_boot" ]; then
+            rm -f "$SHUTDOWN_STATE_FILE" || return 1
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 已清理上次开机遗留的关机状态；未触碰本次开机的计划关机。" | tee -a "$LOG_FILE"
+            return 0
+        fi
+        if { [ -z "$state_boot" ] || [ -z "$current_boot" ]; } && has_pending_shutdown; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 无法确认计划关机是否属于本脚本，已保留系统任务和状态文件。" | tee -a "$LOG_FILE"
+            return 1
+        fi
         if has_pending_shutdown && ! shutdown -c 2>/dev/null; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 无法取消本脚本记录的计划关机，已保留状态文件。" | tee -a "$LOG_FILE"
             return 1
@@ -817,6 +901,11 @@ configure_post_save_enforcement() {
 # 初始配置函数
 echo "$(date '+%Y-%m-%d %H:%M:%S') 开始初始化配置"| tee -a "$LOG_FILE"
 initial_config() {
+    local config_backup="${CONFIG_FILE}.before-config.$$"
+    local enforcement_backup="${ENFORCEMENT_STATE_FILE}.before-config.$$"
+    local had_config=false
+    local had_enforcement=false
+
     echo "$(date '+%Y-%m-%d %H:%M:%S') 正在检测主要网络接口..."| tee -a "$LOG_FILE"
     MAIN_INTERFACE=$(get_main_interface)
     ensure_vnstat_interface "$MAIN_INTERFACE" || return 1
@@ -926,8 +1015,40 @@ initial_config() {
     done
 
     configure_history_policy || return 1
-    write_config || return 1
-    configure_post_save_enforcement || return 1
+
+    if [ -f "$CONFIG_FILE" ]; then
+        cp -p "$CONFIG_FILE" "$config_backup" || return 1
+        chmod 600 "$config_backup" 2>/dev/null || true
+        had_config=true
+    fi
+    if [ -f "$ENFORCEMENT_STATE_FILE" ]; then
+        if ! cp -p "$ENFORCEMENT_STATE_FILE" "$enforcement_backup"; then
+            rm -f "$config_backup"
+            return 1
+        fi
+        chmod 600 "$enforcement_backup" 2>/dev/null || true
+        had_enforcement=true
+    fi
+
+    if ! write_config; then
+        if restore_monitor_config_snapshot "$config_backup" "$had_config" "$enforcement_backup" "$had_enforcement"; then
+            echo "配置写入失败，已恢复修改前的监控配置与执行策略。"
+        else
+            echo "配置写入失败，且无法完整恢复修改前状态；可用备份会保留在 $config_backup 或 $enforcement_backup。"
+        fi
+        return 1
+    fi
+
+    if ! configure_post_save_enforcement; then
+        if restore_monitor_config_snapshot "$config_backup" "$had_config" "$enforcement_backup" "$had_enforcement"; then
+            echo "后续安全处理失败，已恢复修改前的监控配置与执行策略。"
+        else
+            echo "后续安全处理失败，且无法完整恢复修改前状态；可用备份会保留在 $config_backup 或 $enforcement_backup。"
+        fi
+        return 1
+    fi
+
+    rm -f "$config_backup" "$enforcement_backup"
 }
 
 # 返回指定年月的周期锚点。若用户配置了不存在的日期（如 2 月 31 日），使用当月最后一天。
@@ -1623,13 +1744,15 @@ check_reset_limit() {
         return 0
     fi
 
+    if ! clear_owned_shutdown_schedule; then
+        return 1
+    fi
     if [ -n "$last_reset_period" ]; then
         if ! clear_owned_tc_rules "新的流量周期开始"; then
             return 1
         fi
     fi
     rm -f "$USAGE_STATE_FILE"
-    rm -f "$SHUTDOWN_STATE_FILE"
     enforcement_reason=$(enforcement_state_value "REASON")
     if [ "$enforcement_reason" = "shutdown_reboot" ]; then
         rm -f "$ENFORCEMENT_STATE_FILE"

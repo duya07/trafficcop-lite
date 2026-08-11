@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# TrafficCop 机器限速管理脚本 v2.4
+# TrafficCop 机器限速管理脚本 v2.5
 # 提供完整的启用/禁用/恢复机器限速功能
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -95,7 +95,20 @@ write_enforcement_state() {
 }
 
 cancel_owned_shutdown() {
+    local state_boot current_boot
+
     if [ -f "$SHUTDOWN_STATE_FILE" ]; then
+        state_boot=$(grep '^BOOT_ID=' "$SHUTDOWN_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-)
+        current_boot=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null || true)
+        if [ -n "$state_boot" ] && [ -n "$current_boot" ] && [ "$state_boot" != "$current_boot" ]; then
+            rm -f "$SHUTDOWN_STATE_FILE" || return 1
+            echo "✓ 已清理上次开机遗留的关机状态，未触碰本次开机的计划关机"
+            return 0
+        fi
+        if { [ -z "$state_boot" ] || [ -z "$current_boot" ]; } && has_pending_shutdown; then
+            echo "✗ 无法确认计划关机是否属于本脚本，已保留系统任务和状态文件"
+            return 1
+        fi
         if has_pending_shutdown && ! shutdown -c 2>/dev/null; then
             echo "✗ 无法取消本脚本记录的计划关机，已保留状态文件"
             return 1

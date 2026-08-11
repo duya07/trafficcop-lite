@@ -31,6 +31,11 @@
 15. 保存配置时若当前流量已经达到阈值，可选择立即执行、限时宽限或暂停执行。
 16. TC 模式支持开机宽限，默认开机 10 分钟后才允许首次下发限速。
 17. 关机模式记录触发时的周期和 boot ID；同一周期内手动开机后会自动暂停再次关机，避免循环。
+18. 新周期重置时会先撤销本脚本登记的计划关机；撤销失败则保留状态并停止重置。
+19. 修改监控配置后的安全处理若失败，会恢复修改前的配置和执行策略。
+20. Telegram 交互菜单不再长期占用任务锁，定时任务与手动发送仍保持互斥。
+21. vnStat 保留期配置与覆盖起点标记同步提交，配置替换失败时会恢复旧标记。
+22. 取消计划关机前会核对 boot ID；重启后的陈旧标记不会取消本次开机由其他工具创建的关机任务。旧标记无法验证归属时会保留系统任务并停止自动清理。
 
 ## 下载方式说明
 
@@ -276,3 +281,13 @@ sudo /usr/sbin/tc qdisc show
 - 需要 vnStat 2.x 或更高版本。脚本兼容 `vnstat --showconfig` 中带分号或井号的默认配置项，只修改 vnStat 的 `DailyDays` 保留期并保留原配置备份；卸载时不会自动恢复全局 vnStat 配置，以免覆盖用户后续修改。
 - Debian/Ubuntu、RHEL 系、Alpine 和 Arch 系会按已识别的包管理器尝试安装依赖；无法自动启动 cron 或 vnStat 服务时会给出明确提示，请按系统服务管理方式确认其已运行。
 - 网络受限时，优先使用带 `v6.gh-proxy.org` 的命令。
+
+## 开发验证
+
+仓库内置失败路径回归测试，并在 GitHub Actions 中执行语法检查、ShellCheck 和回归测试：
+
+```bash
+bash -n trafficcop-lite.sh trafficcop-lite-monitor.sh trafficcop-lite-telegram.sh trafficcop-lite-machine-limit.sh tests/regression.sh
+shellcheck trafficcop-lite.sh trafficcop-lite-monitor.sh trafficcop-lite-telegram.sh trafficcop-lite-machine-limit.sh tests/regression.sh
+bash tests/regression.sh
+```

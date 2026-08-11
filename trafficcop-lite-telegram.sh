@@ -21,7 +21,7 @@ CRON_LOG="$WORK_DIR/tg_notifier_cron.log"
 TG_LOCK_FILE="$WORK_DIR/tg_notifier.lock"
 CRON_LOG_MAX_LINES="${CRON_LOG_MAX_LINES:-2000}"
 TG_DEBUG="${TG_DEBUG:-false}"
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 
 # 此函数只由 EXIT trap 调用，ShellCheck 无法沿字符串形式的 trap 识别调用关系。
 # shellcheck disable=SC2317,SC2329
@@ -74,16 +74,36 @@ echo "$(date '+%Y-%m-%d %H:%M:%S') : 当前版本：$SCRIPT_VERSION" | tee -a "$
 
 # 检查是否有同名的 crontab 正在执行:
 check_running() {
+    local wait_seconds="${1:-0}"
+
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 开始检查是否有其他实例运行" >> "$CRON_LOG"
     exec 8>"$TG_LOCK_FILE"
     chmod 600 "$TG_LOCK_FILE" 2>/dev/null || true
-    if ! flock -n 8; then
+    if { [ "$wait_seconds" -gt 0 ] && ! flock -w "$wait_seconds" 8; } \
+        || { [ "$wait_seconds" -eq 0 ] && ! flock -n 8; }; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') : 另一个脚本实例正在运行，退出脚本" >> "$CRON_LOG"
-        echo "另一个脚本实例正在运行，退出脚本"
-        exit 1
+        echo "另一个 Telegram 通知任务正在运行，请稍后重试。"
+        exec 8>&-
+        return 1
     fi
     trap 'flock -u 8 2>/dev/null || true; trim_log_file "$CRON_LOG" "$CRON_LOG_MAX_LINES"' EXIT
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 没有其他实例运行，继续执行" >> "$CRON_LOG"
+}
+
+release_running_lock() {
+    flock -u 8 2>/dev/null || true
+    exec 8>&-
+    trap 'trim_log_file "$CRON_LOG" "$CRON_LOG_MAX_LINES"' EXIT
+}
+
+run_with_telegram_lock() {
+    local status
+
+    check_running 15 || return 1
+    "$@"
+    status=$?
+    release_running_lock
+    return "$status"
 }
 
 check_runtime_dependencies() {
@@ -350,6 +370,8 @@ send_shutdown_warning() {
 
 
 
+# 该函数由 run_with_telegram_lock 按菜单选择间接调用。
+# shellcheck disable=SC2317,SC2329
 test_telegram_notification() {
     local message="🔔 [${MACHINE_NAME}]这是一条测试消息。如果您收到这条消息，说明Telegram通知功能正常工作。"
 
@@ -585,6 +607,8 @@ remove_telegram_cron() {
     echo "已移除 TrafficCop-Lite Telegram 自动通知任务。"
 }
 
+# 以下两个函数由 run_with_telegram_lock 按菜单选择间接调用。
+# shellcheck disable=SC2317,SC2329
 enable_telegram_notifications() {
     # 配置仍为关闭时先创建任务；即使 cron 立即触发也会安全跳过。
     if ! setup_cron; then
@@ -602,6 +626,7 @@ enable_telegram_notifications() {
     echo "Telegram 自动通知已开启。"
 }
 
+# shellcheck disable=SC2317,SC2329
 disable_telegram_notifications() {
     TG_DISABLED=true
     if ! write_config; then
@@ -669,9 +694,9 @@ main() {
     debug_log "进入主任务，参数数量=$#，参数=$*"
     
     check_runtime_dependencies || return 1
-    check_running
     
 if [[ "$*" == *"-cron"* ]]; then
+    check_running || return 1
     log_cron "进入cron模式"
     if read_config; then
         debug_log "成功读取配置文件"
@@ -765,15 +790,15 @@ if [[ "$*" == *"-cron"* ]]; then
                     ;;
                 1)
                     echo "正在检查流量并推送..."
-                    check_and_notify
+                    run_with_telegram_lock check_and_notify
                     ;;
                 2)
                     echo "正在发送每日报告..."
-                    daily_report
+                    run_with_telegram_lock daily_report
                     ;;
                 3)
                     echo "正在发送测试消息..."
-                    test_telegram_notification
+                    run_with_telegram_lock test_telegram_notification
                     ;;
                 4)
                     echo "正在重新加载配置..."
@@ -826,9 +851,9 @@ if [[ "$*" == *"-cron"* ]]; then
                     ;;
                 8)
                     if [ "${TG_DISABLED:-false}" = "true" ]; then
-                        enable_telegram_notifications
+                        run_with_telegram_lock enable_telegram_notifications
                     else
-                        disable_telegram_notifications
+                        run_with_telegram_lock disable_telegram_notifications
                     fi
                     ;;
                 *)

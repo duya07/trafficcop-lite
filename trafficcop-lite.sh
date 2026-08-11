@@ -3,7 +3,7 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.1.3"
+SCRIPT_VERSION="1.1.4"
 LAST_UPDATE="2026-08-12"
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -306,9 +306,7 @@ source_has_complete_bundle() {
 install_from_entrypoint() {
     if [ "$SOURCE_PATH" != "$WORK_DIR/trafficcop-lite.sh" ] && ! source_has_complete_bundle; then
         echo -e "${CYAN}检测到单文件安装入口，正在同步整套最新脚本...${NC}"
-        update_scripts "$RAW_BASE" || return 1
-        verify_installed_scripts || return 1
-        install_shortcut_link
+        update_scripts "$RAW_BASE"
         return $?
     fi
 

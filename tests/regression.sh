@@ -480,14 +480,10 @@ test_single_file_install_refreshes_all_scripts() {
     load_function "$ROOT_DIR/trafficcop-lite.sh" source_has_complete_bundle || return 1
     load_function "$ROOT_DIR/trafficcop-lite.sh" install_from_entrypoint || return 1
     update_scripts() { printf '%s\n' "$1" > "$work/update-called"; }
-    verify_installed_scripts() { printf '%s\n' 'called' > "$work/verify-called"; }
-    install_shortcut_link() { printf '%s\n' 'called' > "$work/shortcut-called"; }
     install_shortcut() { printf '%s\n' 'unexpected' > "$work/local-install-called"; }
 
     install_from_entrypoint >/dev/null || return 1
     assert_file_content "$RAW_BASE" "$work/update-called" || return 1
-    assert_file_content 'called' "$work/verify-called" || return 1
-    assert_file_content 'called' "$work/shortcut-called" || return 1
     assert_absent "$work/local-install-called"
 }
 
@@ -540,7 +536,7 @@ test_update_replaces_full_release_and_preserves_state() {
     printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.0' > "$WORK_DIR/$MACHINE_LIMIT_SCRIPT"
     printf '%s\n' 'CONFIG=keep-me' > "$WORK_DIR/traffic_monitor_config.txt"
 
-    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.3"' > "$remote_dir/trafficcop-lite.sh"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.4"' > "$remote_dir/trafficcop-lite.sh"
     printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.2"' > "$remote_dir/$MONITOR_SCRIPT"
     printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.1"' > "$remote_dir/$TELEGRAM_SCRIPT"
     printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.5' > "$remote_dir/$MACHINE_LIMIT_SCRIPT"
@@ -556,7 +552,7 @@ test_update_replaces_full_release_and_preserves_state() {
     install_shortcut_link() { printf '%s\n' 'called' > "$work/shortcut-called"; }
 
     update_scripts 'https://example.invalid/release' >/dev/null || return 1
-    grep -Fqx 'SCRIPT_VERSION="1.1.3"' "$WORK_DIR/trafficcop-lite.sh" || return 1
+    grep -Fqx 'SCRIPT_VERSION="1.1.4"' "$WORK_DIR/trafficcop-lite.sh" || return 1
     grep -Fqx 'SCRIPT_VERSION="1.1.2"' "$WORK_DIR/$MONITOR_SCRIPT" || return 1
     grep -Fqx 'SCRIPT_VERSION="1.1.1"' "$WORK_DIR/$TELEGRAM_SCRIPT" || return 1
     grep -Fqx '# TrafficCop Lite Machine Limit v2.5' "$WORK_DIR/$MACHINE_LIMIT_SCRIPT" || return 1
@@ -565,7 +561,7 @@ test_update_replaces_full_release_and_preserves_state() {
     [ -n "$backup_main" ] || return 1
     grep -Fqx 'SCRIPT_VERSION="1.0.2"' "$backup_main" || return 1
     [ "$UPDATE_PREVIOUS_VERSION" = '1.0.2' ] || return 1
-    [ "$UPDATE_NEW_VERSION" = '1.1.3' ] || return 1
+    [ "$UPDATE_NEW_VERSION" = '1.1.4' ] || return 1
     assert_file_content 'called' "$work/shortcut-called"
 }
 

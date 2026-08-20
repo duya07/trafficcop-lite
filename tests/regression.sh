@@ -536,10 +536,10 @@ test_update_replaces_full_release_and_preserves_state() {
     printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.0' > "$WORK_DIR/$MACHINE_LIMIT_SCRIPT"
     printf '%s\n' 'CONFIG=keep-me' > "$WORK_DIR/traffic_monitor_config.txt"
 
-    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.4"' > "$remote_dir/trafficcop-lite.sh"
-    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.2"' > "$remote_dir/$MONITOR_SCRIPT"
-    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.1"' > "$remote_dir/$TELEGRAM_SCRIPT"
-    printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.5' > "$remote_dir/$MACHINE_LIMIT_SCRIPT"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.6"' > "$remote_dir/trafficcop-lite.sh"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.4"' > "$remote_dir/$MONITOR_SCRIPT"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.2"' > "$remote_dir/$TELEGRAM_SCRIPT"
+    printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.6' > "$remote_dir/$MACHINE_LIMIT_SCRIPT"
 
     load_function "$ROOT_DIR/trafficcop-lite.sh" script_version_from_file || return 1
     load_function "$ROOT_DIR/trafficcop-lite.sh" version_is_newer || return 1
@@ -552,16 +552,16 @@ test_update_replaces_full_release_and_preserves_state() {
     install_shortcut_link() { printf '%s\n' 'called' > "$work/shortcut-called"; }
 
     update_scripts 'https://example.invalid/release' >/dev/null || return 1
-    grep -Fqx 'SCRIPT_VERSION="1.1.4"' "$WORK_DIR/trafficcop-lite.sh" || return 1
-    grep -Fqx 'SCRIPT_VERSION="1.1.2"' "$WORK_DIR/$MONITOR_SCRIPT" || return 1
-    grep -Fqx 'SCRIPT_VERSION="1.1.1"' "$WORK_DIR/$TELEGRAM_SCRIPT" || return 1
-    grep -Fqx '# TrafficCop Lite Machine Limit v2.5' "$WORK_DIR/$MACHINE_LIMIT_SCRIPT" || return 1
+    grep -Fqx 'SCRIPT_VERSION="1.1.6"' "$WORK_DIR/trafficcop-lite.sh" || return 1
+    grep -Fqx 'SCRIPT_VERSION="1.1.4"' "$WORK_DIR/$MONITOR_SCRIPT" || return 1
+    grep -Fqx 'SCRIPT_VERSION="1.1.2"' "$WORK_DIR/$TELEGRAM_SCRIPT" || return 1
+    grep -Fqx '# TrafficCop Lite Machine Limit v2.6' "$WORK_DIR/$MACHINE_LIMIT_SCRIPT" || return 1
     assert_file_content 'CONFIG=keep-me' "$WORK_DIR/traffic_monitor_config.txt" || return 1
     backup_main=$(find "$WORK_DIR/backups" -type f -name trafficcop-lite.sh -print -quit) || return 1
     [ -n "$backup_main" ] || return 1
     grep -Fqx 'SCRIPT_VERSION="1.0.2"' "$backup_main" || return 1
     [ "$UPDATE_PREVIOUS_VERSION" = '1.0.2' ] || return 1
-    [ "$UPDATE_NEW_VERSION" = '1.1.4' ] || return 1
+    [ "$UPDATE_NEW_VERSION" = '1.1.6' ] || return 1
     assert_file_content 'called' "$work/shortcut-called"
 }
 
@@ -591,6 +591,551 @@ test_update_rollback_requires_backup_evidence() {
     assert_file_content 'old-main' "$WORK_DIR/trafficcop-lite.sh" || return 1
     assert_absent "$WORK_DIR/trafficcop-lite-monitor.sh" || return 1
     assert_file_content 'new-telegram' "$WORK_DIR/trafficcop-lite-telegram.sh"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_retention_decline_aborts_configuration() {
+    TRAFFIC_PERIOD='yearly'
+
+    load_function "$MONITOR_SCRIPT" ensure_vnstat_daily_retention || return 1
+    vnstat_config_value() { printf '%s\n' '30'; }
+
+    if printf '%s\n' 'n' | ensure_vnstat_daily_retention >/dev/null; then
+        return 1
+    fi
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_vnstat_history_read_error_aborts_configuration() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/history-read-error.XXXXXX") || return 1
+    RETENTION_STATE_FILE="$work/coverage"
+
+    load_function "$MONITOR_SCRIPT" history_incomplete_for_current_period || return 1
+    load_function "$MONITOR_SCRIPT" configure_history_policy || return 1
+    get_period_start_date() { printf '%s\n' '2026-01-01'; }
+    get_vnstat_available_start() { return 1; }
+    vnstat_config_value() { printf '%s\n' '1'; }
+
+    if configure_history_policy >/dev/null; then
+        return 1
+    fi
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_post_save_read_error_preserves_runtime_state() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/post-save-read-error.XXXXXX") || return 1
+    ENFORCEMENT_STATE_FILE="$work/enforcement"
+    printf '%s\n' 'MODE=paused' > "$ENFORCEMENT_STATE_FILE"
+
+    load_function "$MONITOR_SCRIPT" configure_post_save_enforcement || return 1
+    get_traffic_usage() { return 1; }
+    clear_owned_shutdown_schedule() { printf '%s\n' 'called' > "$work/shutdown-cleared"; }
+    clear_owned_tc_rules() { printf '%s\n' 'called' > "$work/tc-cleared"; }
+
+    if configure_post_save_enforcement >/dev/null; then
+        return 1
+    fi
+    assert_file_content 'MODE=paused' "$ENFORCEMENT_STATE_FILE" || return 1
+    assert_absent "$work/shutdown-cleared" || return 1
+    assert_absent "$work/tc-cleared"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_tc_change_requires_prepared_state() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/tc-prewrite.XXXXXX") || return 1
+    TC_STATE_FILE="$work/tc-state"
+    LOG_FILE="$work/log"
+    MAIN_INTERFACE='eth0'
+    TC_BIN='mock_tc'
+
+    load_function "$MONITOR_SCRIPT" apply_tc_limit || return 1
+    tc_root_qdisc() { printf '%s\n' 'qdisc fq_codel 0: root'; }
+    tc_state_interface() { return 0; }
+    is_default_qdisc_line() { return 0; }
+    write_tc_state() {
+        printf '%s\n' 'called' > "$work/state-prewrite"
+        return 1
+    }
+    mock_tc() { printf '%s\n' 'called' > "$work/tc-called"; }
+
+    if apply_tc_limit 100 >/dev/null; then
+        return 1
+    fi
+    assert_file_content 'called' "$work/state-prewrite" || return 1
+    assert_absent "$work/tc-called"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_shutdown_requires_prepared_state() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/shutdown-prewrite.XXXXXX") || return 1
+    LOG_FILE="$work/log"
+    TC_STATE_FILE="$work/tc-state"
+    SHUTDOWN_STATE_FILE="$work/shutdown-state"
+    TRAFFIC_UNIT='decimal'
+    TRAFFIC_LIMIT='100'
+    TRAFFIC_TOLERANCE='0'
+    LIMIT_MODE='shutdown'
+
+    load_function "$MONITOR_SCRIPT" check_and_limit_traffic || return 1
+    get_traffic_usage() { printf '%s\n' '100.000'; }
+    bc() {
+        local expression
+        expression=$(cat)
+        case "$expression" in
+            *' - '*) printf '%s\n' '100' ;;
+            *' <= 0') printf '%s\n' '0' ;;
+            *' >= '*) printf '%s\n' '1' ;;
+            *) printf '%s\n' '0' ;;
+        esac
+    }
+    shutdown_reboot_guard_active() { return 1; }
+    enforcement_guard_active() { return 1; }
+    has_pending_shutdown() { return 1; }
+    write_shutdown_state() {
+        printf '%s\n' 'called' > "$work/state-prewrite"
+        return 1
+    }
+    shutdown() { printf '%s\n' 'called' > "$work/shutdown-called"; }
+    write_usage_state() { return 0; }
+    clear_owned_tc_rules() { return 0; }
+
+    if check_and_limit_traffic >/dev/null; then
+        return 1
+    fi
+    assert_file_content 'called' "$work/state-prewrite" || return 1
+    assert_absent "$work/shutdown-called"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_telegram_config_does_not_reuse_stale_secret() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/telegram-stale.XXXXXX") || return 1
+    CONFIG_FILE="$work/config"
+    BOT_TOKEN='stale-secret'
+    cat > "$CONFIG_FILE" <<'EOF'
+CONFIG_FORMAT=plain-v2
+CHAT_ID=12345
+DAILY_REPORT_TIME=08:00
+REPORT_TIMEZONE=UTC
+MACHINE_NAME=test
+TG_DISABLED=false
+EOF
+
+    load_function "$TELEGRAM_SCRIPT" decode_legacy_config_value || return 1
+    load_function "$TELEGRAM_SCRIPT" read_config || return 1
+    is_valid_timezone() { return 0; }
+
+    if read_config >/dev/null; then
+        return 1
+    fi
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_telegram_legacy_config_is_parsed_without_execution() {
+    local work marker
+    work=$(mktemp -d "$TEST_ROOT/telegram-legacy.XXXXXX") || return 1
+    CONFIG_FILE="$work/config"
+    marker="$work/executed"
+    cat > "$CONFIG_FILE" <<EOF
+BOT_TOKEN=\$(touch "$marker"; printf token)
+CHAT_ID=12345
+DAILY_REPORT_TIME=08:00
+REPORT_TIMEZONE=UTC
+MACHINE_NAME=legacy\\ server
+EOF
+
+    load_function "$TELEGRAM_SCRIPT" decode_legacy_config_value || return 1
+    load_function "$TELEGRAM_SCRIPT" read_config || return 1
+    is_valid_timezone() { return 0; }
+
+    read_config >/dev/null || return 1
+    assert_absent "$marker" || return 1
+    [ "$MACHINE_NAME" = 'legacy server' ] || return 1
+    [ "$TG_DISABLED" = 'false' ]
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_telegram_plain_config_round_trip() {
+    local work expected_name
+    work=$(mktemp -d "$TEST_ROOT/telegram-round-trip.XXXXXX") || return 1
+    CONFIG_FILE="$work/config"
+    BOT_TOKEN='123456:test-token'
+    CHAT_ID='-10012345'
+    DAILY_REPORT_TIME='09:30'
+    REPORT_TIMEZONE='UTC'
+    expected_name='edge node\primary=1'
+    MACHINE_NAME="$expected_name"
+    TG_DISABLED='true'
+
+    load_function "$TELEGRAM_SCRIPT" decode_legacy_config_value || return 1
+    load_function "$TELEGRAM_SCRIPT" read_config || return 1
+    load_function "$TELEGRAM_SCRIPT" write_config_value || return 1
+    load_function "$TELEGRAM_SCRIPT" write_config || return 1
+    is_valid_timezone() { return 0; }
+
+    write_config >/dev/null || return 1
+    grep -Fqx 'CONFIG_FORMAT=plain-v2' "$CONFIG_FILE" || return 1
+    read_config >/dev/null || return 1
+    [ "$MACHINE_NAME" = "$expected_name" ] || return 1
+    [ "$TG_DISABLED" = 'true' ]
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_telegram_token_is_not_in_curl_arguments() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/telegram-curl.XXXXXX") || return 1
+    BOT_TOKEN='123456:top-secret-token'
+    CHAT_ID='12345'
+
+    load_function "$TELEGRAM_SCRIPT" telegram_send_message || return 1
+    curl() {
+        printf '%s\n' "$@" > "$work/curl-args"
+        cat > "$work/curl-stdin"
+        printf '%s\n' '{"ok":true}'
+    }
+
+    telegram_send_message 'test message' || return 1
+    ! grep -Fq "$BOT_TOKEN" "$work/curl-args" || return 1
+    grep -Fq "$BOT_TOKEN" "$work/curl-stdin"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_component_download_rejects_versionless_body() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/component-version.XXXXXX") || return 1
+    WORK_DIR="$work/installed"
+    RAW_BASE='https://example.invalid/release'
+    RED=''
+    GREEN=''
+    YELLOW=''
+    NC=''
+    mkdir -p "$WORK_DIR"
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" script_version_from_file || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" version_is_newer || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" validate_update_candidate || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" download_component || return 1
+    download_url_to_file() { printf '%s\n' 'upstream temporarily unavailable' > "$2"; }
+
+    if download_component trafficcop-lite-monitor.sh >/dev/null; then
+        return 1
+    fi
+    assert_absent "$WORK_DIR/trafficcop-lite-monitor.sh"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_period_date_boundaries() {
+    local CURRENT_DATE='2026-01-01'
+
+    load_function "$MONITOR_SCRIPT" is_leap_year || return 1
+    load_function "$MONITOR_SCRIPT" days_in_month || return 1
+    load_function "$MONITOR_SCRIPT" get_anchor_date || return 1
+    load_function "$MONITOR_SCRIPT" date_to_num || return 1
+    load_function "$MONITOR_SCRIPT" shift_month || return 1
+    load_function "$MONITOR_SCRIPT" previous_day || return 1
+    load_function "$MONITOR_SCRIPT" get_period_start_date || return 1
+    load_function "$MONITOR_SCRIPT" get_period_end_date || return 1
+    date() {
+        case "${1:-}" in
+            +%Y-%m-%d) printf '%s\n' "$CURRENT_DATE" ;;
+            +%Y) printf '%s\n' "${CURRENT_DATE:0:4}" ;;
+            +%m) printf '%s\n' "${CURRENT_DATE:5:2}" ;;
+            *) command date "$@" ;;
+        esac
+    }
+    check_case() {
+        local expected_start="$5"
+        local expected_end="$6"
+        CURRENT_DATE="$1"
+        TRAFFIC_PERIOD="$2"
+        PERIOD_START_MONTH="$3"
+        PERIOD_START_DAY="$4"
+        [ "$(get_period_start_date)" = "$expected_start" ] \
+            && [ "$(get_period_end_date)" = "$expected_end" ]
+    }
+
+    check_case 2026-07-22 yearly 7 23 2025-07-23 2026-07-22 || return 1
+    check_case 2026-07-23 yearly 7 23 2026-07-23 2027-07-22 || return 1
+    check_case 2026-02-28 monthly 1 31 2026-02-28 2026-03-30 || return 1
+    check_case 2026-03-30 monthly 1 31 2026-02-28 2026-03-30 || return 1
+    check_case 2026-04-30 quarterly 1 31 2026-04-30 2026-07-30 || return 1
+    check_case 2024-02-29 yearly 2 31 2024-02-29 2025-02-27
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_traffic_accounting_modes() {
+    command -v jq >/dev/null 2>&1 || return 1
+    MAIN_INTERFACE='eth0'
+    TRAFFIC_PERIOD='monthly'
+    TRAFFIC_UNIT='decimal'
+    ALLOW_PARTIAL_HISTORY='false'
+    WORK_DIR="$TEST_ROOT/nonexistent"
+    RETENTION_STATE_FILE="$WORK_DIR/coverage"
+
+    load_function "$MONITOR_SCRIPT" get_traffic_usage || return 1
+    get_period_start_date() { printf '%s\n' '2026-07-01'; }
+    get_period_end_date() { printf '%s\n' '2026-07-31'; }
+    date_num_to_iso() { printf '%s\n' "$1"; }
+    vnstat_config_value() {
+        case "$1" in
+            DailyDays) printf '%s\n' '-1' ;;
+            TrafficlessEntries) printf '%s\n' '0' ;;
+        esac
+    }
+    vnstat() {
+        cat <<'JSON'
+{"interfaces":[{"created":{"date":{"year":2025,"month":1,"day":1}},"traffic":{"day":[{"date":{"year":2026,"month":6,"day":30},"rx":10000000000,"tx":10000000000},{"date":{"year":2026,"month":7,"day":1},"rx":1000000000,"tx":2000000000},{"date":{"year":2026,"month":7,"day":2},"rx":3000000000,"tx":1000000000}]}}]}
+JSON
+    }
+    check_mode() {
+        TRAFFIC_MODE="$1"
+        [ "$(get_traffic_usage 2>/dev/null)" = "$2" ]
+    }
+
+    check_mode out 3.000 || return 1
+    check_mode in 4.000 || return 1
+    check_mode total 7.000 || return 1
+    check_mode max 4.000
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_invalid_limit_speed_is_rejected() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/invalid-speed.XXXXXX") || return 1
+    LOG_FILE="$work/log"
+    TRAFFIC_MODE='total'
+    TRAFFIC_PERIOD='monthly'
+    TRAFFIC_LIMIT='100'
+    TRAFFIC_TOLERANCE='0'
+    TRAFFIC_UNIT='decimal'
+    PERIOD_START_DAY='1'
+    PERIOD_START_MONTH='1'
+    TC_BOOT_GRACE_MINUTES='10'
+    ALLOW_PARTIAL_HISTORY='false'
+    MAIN_INTERFACE='eth0'
+    LIMIT_MODE='tc'
+
+    load_function "$MONITOR_SCRIPT" is_decimal || return 1
+    load_function "$MONITOR_SCRIPT" compare_decimal || return 1
+    load_function "$MONITOR_SCRIPT" validate_config || return 1
+    command_exists() { return 1; }
+
+    LIMIT_SPEED='corrupt'
+    if validate_config >/dev/null; then
+        return 1
+    fi
+    [ "$LIMIT_SPEED" = 'corrupt' ] || return 1
+
+    unset LIMIT_SPEED
+    validate_config >/dev/null || return 1
+    [ "$LIMIT_SPEED" = '20' ]
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_runtime_rejects_invalid_limit_speed() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/runtime-invalid-speed.XXXXXX") || return 1
+    LOG_FILE="$work/log"
+    TRAFFIC_UNIT='decimal'
+    TRAFFIC_LIMIT='100'
+    TRAFFIC_TOLERANCE='0'
+    LIMIT_MODE='tc'
+    LIMIT_SPEED='corrupt'
+
+    load_function "$MONITOR_SCRIPT" check_and_limit_traffic || return 1
+    get_traffic_usage() { printf '%s\n' '100.000'; }
+    bc() {
+        local expression
+        expression=$(cat)
+        case "$expression" in
+            *' - '*) printf '%s\n' '100' ;;
+            *' <= 0') printf '%s\n' '0' ;;
+            *' >= '*) printf '%s\n' '1' ;;
+            *) printf '%s\n' '0' ;;
+        esac
+    }
+    enforcement_guard_active() { return 1; }
+    tc_boot_grace_active() { return 1; }
+    apply_tc_limit() { printf '%s\n' 'called' > "$work/tc-called"; }
+    write_usage_state() { return 0; }
+
+    if check_and_limit_traffic >/dev/null; then
+        return 1
+    fi
+    assert_absent "$work/tc-called"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_legacy_shutdown_cancel_failure_is_reported() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/legacy-shutdown.XXXXXX") || return 1
+    WORK_DIR="$work"
+    SHUTDOWN_STATE_FILE="$work/shutdown-state"
+    RED=''
+    YELLOW=''
+    NC=''
+    printf '%s\n' 'LIMIT_MODE=shutdown' > "$work/traffic_monitor_config.txt"
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" cancel_shutdown_interactive || return 1
+    shutdown() { return 1; }
+    lite_has_pending_shutdown() { return 1; }
+    if cancel_shutdown_interactive <<< 'y' >/dev/null; then
+        return 1
+    fi
+
+    shutdown() { return 0; }
+    lite_has_pending_shutdown() { return 0; }
+    if cancel_shutdown_interactive <<< 'y' >/dev/null; then
+        return 1
+    fi
+
+    lite_has_pending_shutdown() { return 1; }
+    cancel_shutdown_interactive <<< 'y' >/dev/null
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_machine_legacy_shutdown_cancel_failure_is_reported() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/machine-legacy-shutdown.XXXXXX") || return 1
+    WORK_DIR="$work"
+    CONFIG_FILE="$work/config"
+    BACKUP_CONFIG_FILE="$work/config.disabled.backup"
+    SHUTDOWN_STATE_FILE="$work/shutdown-state"
+    ENFORCEMENT_STATE_FILE="$work/enforcement-state"
+    RED=''
+    GREEN=''
+    YELLOW=''
+    CYAN=''
+    NC=''
+    printf '%s\n' 'LIMIT_MODE=shutdown' > "$CONFIG_FILE"
+
+    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" disable_machine_limit || return 1
+    remove_cron_job() { return 0; }
+    stop_monitor_process() { return 0; }
+    acquire_monitor_cleanup_lock() { return 0; }
+    clear_tc_rules() { return 0; }
+    release_monitor_cleanup_lock() { return 0; }
+    cancel_owned_shutdown() { return 0; }
+    shutdown() { return 1; }
+    has_pending_shutdown() { return 1; }
+
+    if disable_machine_limit <<< 'y' >/dev/null; then
+        return 1
+    fi
+    [ -f "$BACKUP_CONFIG_FILE" ]
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_machine_tc_clear_always_uses_lock() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/machine-clear-lock.XXXXXX") || return 1
+
+    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" clear_tc_rules_with_lock || return 1
+    acquire_monitor_cleanup_lock() { printf '%s\n' 'acquire' >> "$work/order"; }
+    clear_tc_rules() { printf '%s\n' 'clear' >> "$work/order"; return 1; }
+    release_monitor_cleanup_lock() { printf '%s\n' 'release' >> "$work/order"; }
+
+    if clear_tc_rules_with_lock >/dev/null; then
+        return 1
+    fi
+    assert_file_content $'acquire\nclear\nrelease' "$work/order" || return 1
+
+    : > "$work/order"
+    acquire_monitor_cleanup_lock() { printf '%s\n' 'acquire' >> "$work/order"; return 1; }
+    clear_tc_rules_with_lock >/dev/null 2>&1 && return 1
+    assert_file_content 'acquire' "$work/order"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_shortcut_conflicts_are_preserved() {
+    local work broken_target
+    work=$(mktemp -d "$TEST_ROOT/shortcut-conflict.XXXXXX") || return 1
+    WORK_DIR="$work/installed"
+    SHORTCUT_PATH="$work/bin/ntc"
+    LEGACY_NCL_SHORTCUT_PATH="$work/bin/ncl"
+    LEGACY_TC_SHORTCUT_PATH="$work/bin/tc"
+    TC_BIN=''
+    RED=''
+    GREEN=''
+    YELLOW=''
+    CYAN=''
+    NC=''
+    mkdir -p "$WORK_DIR" "$(dirname "$SHORTCUT_PATH")"
+    printf '%s\n' '#!/bin/bash' > "$WORK_DIR/trafficcop-lite.sh"
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" install_shortcut_link || return 1
+    printf '%s\n' 'foreign-command' > "$SHORTCUT_PATH"
+    if install_shortcut_link >/dev/null; then
+        return 1
+    fi
+    assert_file_content 'foreign-command' "$SHORTCUT_PATH" || return 1
+
+    rm -f "$SHORTCUT_PATH"
+    broken_target="$work/missing-target"
+    if ln -s "$broken_target" "$SHORTCUT_PATH" 2>/dev/null && [ -L "$SHORTCUT_PATH" ]; then
+        if install_shortcut_link >/dev/null; then
+            return 1
+        fi
+        [ "$(readlink "$SHORTCUT_PATH")" = "$broken_target" ] || return 1
+    fi
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_main_copy_failure_preserves_installed_script() {
+    local work expected
+    work=$(mktemp -d "$TEST_ROOT/main-copy-failure.XXXXXX") || return 1
+    WORK_DIR="$work/installed"
+    SOURCE_PATH="$work/source.sh"
+    SCRIPT_VERSION='1.1.6'
+    RED=''
+    YELLOW=''
+    NC=''
+    mkdir -p "$WORK_DIR"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.6"' > "$SOURCE_PATH"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.5"' > "$WORK_DIR/trafficcop-lite.sh"
+    expected=$(cat "$WORK_DIR/trafficcop-lite.sh")
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" script_version_from_file || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" version_is_newer || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" copy_self_if_needed || return 1
+    cp() { return 1; }
+
+    if copy_self_if_needed >/dev/null; then
+        return 1
+    fi
+    assert_file_content "$expected" "$WORK_DIR/trafficcop-lite.sh" || return 1
+    assert_absent "$WORK_DIR/trafficcop-lite.sh.install.$$"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_restore_failure_restores_previous_config() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/restore-rollback.XXXXXX") || return 1
+    CONFIG_FILE="$work/config"
+    BACKUP_CONFIG_FILE="$work/config.disabled.backup"
+    RED=''
+    YELLOW=''
+    NC=''
+    printf '%s\n' 'DISABLED=true' > "$CONFIG_FILE"
+    printf '%s\n' 'LIMIT_MODE=tc' > "$BACKUP_CONFIG_FILE"
+
+    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" restore_machine_limit || return 1
+    enable_machine_limit() { return 1; }
+
+    if restore_machine_limit >/dev/null; then
+        return 1
+    fi
+    assert_file_content 'DISABLED=true' "$CONFIG_FILE" || return 1
+
+    rm -f "$CONFIG_FILE"
+    if restore_machine_limit >/dev/null; then
+        return 1
+    fi
+    assert_absent "$CONFIG_FILE"
 }
 
 run_test() {
@@ -625,6 +1170,26 @@ run_test 'single-file install refreshes every script' test_single_file_install_r
 run_test 'complete bundle install remains local' test_complete_bundle_install_stays_local
 run_test 'update replaces full release and preserves state' test_update_replaces_full_release_and_preserves_state
 run_test 'update rollback requires backup evidence' test_update_rollback_requires_backup_evidence
+run_test 'declining vnStat retention aborts configuration' test_retention_decline_aborts_configuration
+run_test 'vnStat history read errors abort configuration' test_vnstat_history_read_error_aborts_configuration
+run_test 'post-save read errors preserve runtime state' test_post_save_read_error_preserves_runtime_state
+run_test 'TC changes require a prepared ownership state' test_tc_change_requires_prepared_state
+run_test 'shutdown scheduling requires a prepared ownership state' test_shutdown_requires_prepared_state
+run_test 'Telegram config does not reuse stale secrets' test_telegram_config_does_not_reuse_stale_secret
+run_test 'Telegram legacy config is parsed without execution' test_telegram_legacy_config_is_parsed_without_execution
+run_test 'Telegram plain config round-trips special values' test_telegram_plain_config_round_trip
+run_test 'Telegram token is absent from curl arguments' test_telegram_token_is_not_in_curl_arguments
+run_test 'component download rejects versionless responses' test_component_download_rejects_versionless_body
+run_test 'period date boundaries remain correct' test_period_date_boundaries
+run_test 'traffic accounting modes remain correct' test_traffic_accounting_modes
+run_test 'invalid limit speed is rejected while missing values stay compatible' test_invalid_limit_speed_is_rejected
+run_test 'runtime rejects an invalid limit speed' test_runtime_rejects_invalid_limit_speed
+run_test 'legacy shutdown cancellation failures are reported' test_legacy_shutdown_cancel_failure_is_reported
+run_test 'machine disable reports legacy shutdown cancellation failures' test_machine_legacy_shutdown_cancel_failure_is_reported
+run_test 'manual TC cleanup always uses the monitor lock' test_machine_tc_clear_always_uses_lock
+run_test 'foreign shortcut paths are preserved' test_shortcut_conflicts_are_preserved
+run_test 'main script copy failures preserve the installed version' test_main_copy_failure_preserves_installed_script
+run_test 'restore failures recover the previous config' test_restore_failure_restores_previous_config
 
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

@@ -21,7 +21,7 @@ CRON_LOG="$WORK_DIR/tg_notifier_cron.log"
 TG_LOCK_FILE="$WORK_DIR/tg_notifier.lock"
 CRON_LOG_MAX_LINES="${CRON_LOG_MAX_LINES:-2000}"
 TG_DEBUG="${TG_DEBUG:-false}"
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.1.2"
 
 # 此函数只由 EXIT trap 调用，ShellCheck 无法沿字符串形式的 trap 识别调用关系。
 # shellcheck disable=SC2317,SC2329
@@ -153,8 +153,38 @@ is_valid_timezone() {
     [ -f "/usr/share/zoneinfo/$timezone" ]
 }
 
+decode_legacy_config_value() {
+    local encoded="$1"
+    local decoded=""
+    local char
+
+    if [ "$encoded" = "''" ] || [ "$encoded" = '""' ]; then
+        return 0
+    fi
+    if [ "${encoded:0:2}" = "\$'" ] && [ "${encoded: -1}" = "'" ] && [ "${#encoded}" -ge 3 ]; then
+        encoded=${encoded:2:${#encoded}-3}
+        printf '%b' "$encoded"
+        return 0
+    fi
+
+    while [ -n "$encoded" ]; do
+        char=${encoded:0:1}
+        if [ "$char" = "\\" ] && [ "${#encoded}" -ge 2 ]; then
+            decoded+="${encoded:1:1}"
+            encoded=${encoded:2}
+        else
+            decoded+="$char"
+            encoded=${encoded:1}
+        fi
+    done
+    printf '%s' "$decoded"
+}
+
 # 读取配置
 read_config() {
+    local key raw_value value
+    local config_format="legacy"
+
     if [ ! -f "$CONFIG_FILE" ] || [ ! -s "$CONFIG_FILE" ]; then
         echo "配置文件不存在或为空，需要进行初始化配置。"
         return 1
@@ -162,17 +192,46 @@ read_config() {
 
     chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 
+    unset BOT_TOKEN CHAT_ID DAILY_REPORT_TIME REPORT_TIMEZONE MACHINE_NAME TG_DISABLED
     # 旧配置没有开关字段时保持原行为：自动通知默认开启。
-    TG_DISABLED=false
-    # 读取配置文件
-    # shellcheck disable=SC1090
-    source "$CONFIG_FILE" || return 1
+    while IFS='=' read -r key raw_value || [ -n "$key$raw_value" ]; do
+        raw_value=${raw_value%$'\r'}
+        if [ "$key" = "CONFIG_FORMAT" ]; then
+            if [ "$raw_value" != "plain-v2" ]; then
+                echo "不支持的 Telegram 配置格式：$raw_value"
+                return 1
+            fi
+            config_format="$raw_value"
+            continue
+        fi
+        case "$key" in
+            BOT_TOKEN|CHAT_ID|DAILY_REPORT_TIME|REPORT_TIMEZONE|MACHINE_NAME|TG_DISABLED)
+                if [ "$config_format" = "plain-v2" ]; then
+                    value="$raw_value"
+                else
+                    value=$(decode_legacy_config_value "$raw_value") || return 1
+                fi
+                printf -v "$key" '%s' "$value"
+                ;;
+        esac
+    done < "$CONFIG_FILE"
+
     REPORT_TIMEZONE="${REPORT_TIMEZONE:-Asia/Shanghai}"
     TG_DISABLED="${TG_DISABLED:-false}"
 
     # 检查必要的配置项是否都存在
-    if [ -z "$BOT_TOKEN" ] || [ -z "$CHAT_ID" ] || [ -z "$MACHINE_NAME" ] || [ -z "$DAILY_REPORT_TIME" ]; then
+    if [ -z "${BOT_TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ] || [ -z "${MACHINE_NAME:-}" ] || [ -z "${DAILY_REPORT_TIME:-}" ]; then
         echo "配置文件不完整，需要重新进行配置。"
+        return 1
+    fi
+    case "$BOT_TOKEN$CHAT_ID$MACHINE_NAME$DAILY_REPORT_TIME$REPORT_TIMEZONE" in
+        *$'\n'*|*$'\r'*)
+            echo "Telegram 配置包含非法换行。"
+            return 1
+            ;;
+    esac
+    if [[ ! "$DAILY_REPORT_TIME" =~ ^([0-1][0-9]|2[0-3]):[0-5][0-9]$ ]]; then
+        echo "每日报告时间格式无效：$DAILY_REPORT_TIME"
         return 1
     fi
     if ! is_valid_timezone "$REPORT_TIMEZONE"; then
@@ -194,14 +253,13 @@ read_config() {
 write_config_value() {
     local key="$1"
     local value="$2"
-    local quoted
-    printf -v quoted '%q' "$value"
-    printf '%s=%s\n' "$key" "$quoted"
+    printf '%s=%s\n' "$key" "$value"
 }
 
 write_config() {
     local tmp_file="${CONFIG_FILE}.tmp.$$"
     if ! {
+        printf 'CONFIG_FORMAT=plain-v2\n'
         write_config_value "BOT_TOKEN" "$BOT_TOKEN"
         write_config_value "CHAT_ID" "$CHAT_ID"
         write_config_value "DAILY_REPORT_TIME" "$DAILY_REPORT_TIME"
@@ -331,11 +389,14 @@ initial_config() {
 telegram_send_message() {
     local message="$1"
     local response
+    local api_url curl_url
 
     message="${message//%0A/$'\n'}"
+    api_url="https://api.telegram.org/bot${BOT_TOKEN}/sendMessage"
+    curl_url="${api_url//\\/\\\\}"
+    curl_url="${curl_url//\"/\\\"}"
 
-    if ! response=$(curl -fsS --connect-timeout 10 --max-time 30 -X POST \
-        "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+    if ! response=$(printf 'url = "%s"\n' "$curl_url" | curl -fsS --connect-timeout 10 --max-time 30 --config - -X POST \
         --data-urlencode "chat_id=$CHAT_ID" \
         --data-urlencode "text=$message" 2>/dev/null); then
         return 1

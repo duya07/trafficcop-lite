@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.1.4"
-LAST_UPDATE="2026-08-12"
+SCRIPT_VERSION="1.1.6"
+LAST_UPDATE="2026-08-20"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
@@ -151,6 +151,10 @@ verify_installed_scripts() {
             echo -e "${RED}安装后校验失败：$script_name${NC}"
             return 1
         fi
+        if [ -z "$(script_version_from_file "$WORK_DIR/$script_name")" ]; then
+            echo -e "${RED}安装后版本校验失败：$script_name${NC}"
+            return 1
+        fi
         if ! chmod +x "$WORK_DIR/$script_name"; then
             echo -e "${RED}无法设置脚本执行权限：$script_name${NC}"
             return 1
@@ -161,7 +165,7 @@ verify_installed_scripts() {
 copy_self_if_needed() {
     local self_path="$SOURCE_PATH"
     local dest="$WORK_DIR/trafficcop-lite.sh"
-    local installed_version
+    local installed_version tmp_file
 
     if [ "$self_path" != "$WORK_DIR/trafficcop-lite.sh" ] && [ -f "$self_path" ]; then
         installed_version=$(script_version_from_file "$dest")
@@ -169,8 +173,17 @@ copy_self_if_needed() {
             echo -e "${YELLOW}! 已安装主脚本版本 $installed_version 高于当前副本 $SCRIPT_VERSION，已阻止降级。${NC}"
             return 0
         fi
-        cp "$self_path" "$dest"
-        chmod +x "$dest"
+        tmp_file="${dest}.install.$$"
+        if ! cp "$self_path" "$tmp_file"; then
+            rm -f "$tmp_file" 2>/dev/null || true
+            echo -e "${RED}主脚本复制失败，已保留现有安装。${NC}"
+            return 1
+        fi
+        if ! chmod +x "$tmp_file" || ! mv -f "$tmp_file" "$dest"; then
+            rm -f "$tmp_file" 2>/dev/null || true
+            echo -e "${RED}主脚本安装失败，已保留现有安装。${NC}"
+            return 1
+        fi
     fi
 }
 
@@ -195,6 +208,10 @@ download_component() {
 
     if ! bash -n "$tmp_file" 2>/dev/null; then
         echo -e "${RED}语法检查失败：$script_name，已取消安装。${NC}"
+        rm -f "$tmp_file" 2>/dev/null || true
+        return 1
+    fi
+    if ! validate_update_candidate "$script_name" "$tmp_file"; then
         rm -f "$tmp_file" 2>/dev/null || true
         return 1
     fi
@@ -232,6 +249,10 @@ ensure_component() {
             return 1
         fi
         source_version=$(script_version_from_file "$src")
+        if [ -z "$source_version" ]; then
+            echo -e "${RED}无法识别本地脚本版本：$src${NC}"
+            return 1
+        fi
         installed_version=$(script_version_from_file "$dest")
         if [ -n "$source_version" ] && [ -n "$installed_version" ] \
             && bash -n "$dest" 2>/dev/null \
@@ -246,11 +267,12 @@ ensure_component() {
     fi
 
     if [ -f "$dest" ]; then
-        if bash -n "$dest" 2>/dev/null; then
+        installed_version=$(script_version_from_file "$dest")
+        if bash -n "$dest" 2>/dev/null && [ -n "$installed_version" ]; then
             chmod +x "$dest"
             return 0
         fi
-        echo -e "${YELLOW}! 已存在的 $script_name 语法检查失败，将重新下载。${NC}"
+        echo -e "${YELLOW}! 已存在的 $script_name 语法或版本检查失败，将重新下载。${NC}"
     fi
 
     download_component "$script_name"
@@ -264,10 +286,11 @@ install_all_components() {
 }
 
 install_shortcut_link() {
-    if [ -e "$SHORTCUT_PATH" ] && [ "$(readlink "$SHORTCUT_PATH" 2>/dev/null)" != "$WORK_DIR/trafficcop-lite.sh" ]; then
+    if { [ -e "$SHORTCUT_PATH" ] || [ -L "$SHORTCUT_PATH" ]; } \
+        && [ "$(readlink "$SHORTCUT_PATH" 2>/dev/null)" != "$WORK_DIR/trafficcop-lite.sh" ]; then
         echo -e "${YELLOW}! $SHORTCUT_PATH 已存在，未覆盖。${NC}"
         echo -e "${YELLOW}  你仍可使用：sudo bash $WORK_DIR/trafficcop-lite.sh${NC}"
-        return 0
+        return 1
     fi
 
     if ! mkdir -p "$(dirname "$SHORTCUT_PATH")" \
@@ -1287,8 +1310,15 @@ cancel_shutdown_interactive() {
         echo -e "${YELLOW}检测到独立版曾配置关机模式。${NC}"
         read -r -p "是否取消当前系统计划关机？[y/N]: " confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            shutdown -c 2>/dev/null || true
-            echo "✓ 已尝试取消计划关机"
+            if ! shutdown -c 2>/dev/null; then
+                echo -e "${RED}取消计划关机失败，请先手动确认系统关机任务。${NC}"
+                return 1
+            fi
+            if lite_has_pending_shutdown; then
+                echo -e "${RED}取消命令执行后仍检测到计划关机，请先手动处理。${NC}"
+                return 1
+            fi
+            echo "✓ 已取消计划关机"
         fi
     fi
 }

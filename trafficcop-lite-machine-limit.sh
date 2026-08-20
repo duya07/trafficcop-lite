@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# TrafficCop 机器限速管理脚本 v2.5
+# TrafficCop 机器限速管理脚本 v2.6
 # 提供完整的启用/禁用/恢复机器限速功能
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -238,6 +238,19 @@ release_monitor_cleanup_lock() {
     exec 9>&-
 }
 
+clear_tc_rules_with_lock() {
+    local clear_status
+
+    if ! acquire_monitor_cleanup_lock; then
+        echo "✗ 无法取得监控锁，未清理 TC 规则"
+        return 1
+    fi
+    clear_tc_rules
+    clear_status=$?
+    release_monitor_cleanup_lock
+    return "$clear_status"
+}
+
 # 移除定时任务
 remove_cron_job() {
     local current_crontab new_crontab
@@ -333,8 +346,15 @@ disable_machine_limit() {
     if ! $had_owned_shutdown && grep -q "LIMIT_MODE=shutdown" "$CONFIG_FILE" 2>/dev/null; then
         read -r -p "检测到关机模式配置，是否取消当前系统计划关机？[y/N]: " cancel_shutdown
         if [[ $cancel_shutdown =~ ^[Yy]$ ]]; then
-            shutdown -c 2>/dev/null || true
-            echo "✓ 已尝试取消关机计划"
+            if ! shutdown -c 2>/dev/null; then
+                echo "✗ 取消关机计划失败，请先手动确认系统关机任务"
+                has_error=true
+            elif has_pending_shutdown; then
+                echo "✗ 取消命令执行后仍检测到关机计划，请先手动处理"
+                has_error=true
+            else
+                echo "✓ 已取消关机计划"
+            fi
         fi
     fi
     
@@ -428,6 +448,8 @@ enable_machine_limit() {
 # 恢复之前的配置
 restore_machine_limit() {
     local restore_tmp="${CONFIG_FILE}.tmp.$$"
+    local rollback_file="${CONFIG_FILE}.restore-backup.$$"
+    local had_config=false
     echo -e "${YELLOW}==================== 恢复机器限速 ====================${NC}"
     echo ""
     
@@ -436,11 +458,21 @@ restore_machine_limit() {
         echo "无法恢复，请手动重新配置"
         return 1
     fi
+
+    if [ -f "$CONFIG_FILE" ]; then
+        if ! cp "$CONFIG_FILE" "$rollback_file" || ! chmod 600 "$rollback_file" 2>/dev/null; then
+            rm -f "$rollback_file"
+            echo -e "${RED}无法备份当前配置，未执行恢复。${NC}"
+            return 1
+        fi
+        had_config=true
+    fi
     
     # 恢复配置文件
     echo "恢复备份配置..."
     if ! cp "$BACKUP_CONFIG_FILE" "$restore_tmp" || ! chmod 600 "$restore_tmp" 2>/dev/null || ! mv -f "$restore_tmp" "$CONFIG_FILE"; then
         rm -f "$restore_tmp"
+        rm -f "$rollback_file"
         echo -e "${RED}配置恢复失败，未启动监控。${NC}"
         return 1
     fi
@@ -448,7 +480,24 @@ restore_machine_limit() {
     echo "✓ 配置已恢复"
     
     # 启用监控
-    enable_machine_limit
+    if enable_machine_limit; then
+        rm -f "$rollback_file"
+        return 0
+    fi
+
+    if $had_config; then
+        if mv -f "$rollback_file" "$CONFIG_FILE"; then
+            chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+            echo -e "${YELLOW}启用失败，已恢复操作前配置。${NC}"
+        else
+            echo -e "${RED}启用失败且操作前配置回滚失败，备份保留在 $rollback_file。${NC}"
+        fi
+    elif rm -f "$CONFIG_FILE"; then
+        echo -e "${YELLOW}启用失败，已移除本次恢复的配置。${NC}"
+    else
+        echo -e "${RED}启用失败且无法移除本次恢复的配置，请手动检查 $CONFIG_FILE。${NC}"
+    fi
+    return 1
 }
 
 manage_enforcement_control() {
@@ -764,7 +813,7 @@ main() {
                 ;;
             5)
                 echo ""
-                clear_tc_rules
+                clear_tc_rules_with_lock
                 read -r -p "按回车键继续..."
                 ;;
             6)

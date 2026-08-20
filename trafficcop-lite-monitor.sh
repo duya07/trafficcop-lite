@@ -20,7 +20,7 @@ USAGE_STATE_FILE="$WORK_DIR/current_traffic_state"
 ENFORCEMENT_STATE_FILE="$WORK_DIR/enforcement_state"
 SHUTDOWN_STATE_FILE="$WORK_DIR/shutdown_limit_state"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.1.2"
+SCRIPT_VERSION="1.1.4"
 mkdir -p "$WORK_DIR"
 chmod 700 "$WORK_DIR" 2>/dev/null || true
 
@@ -185,7 +185,12 @@ ensure_vnstat_daily_retention() {
 
     echo "当前 vnStat DailyDays=${current_days:-未知}，${TRAFFIC_PERIOD} 周期建议至少保留 $required_days 天日数据。"
     read -r -p "是否由脚本调整 vnStat 日数据保留期？[Y/n]: " answer
-    case "$answer" in n|N) return 0 ;; esac
+    case "$answer" in
+        n|N)
+            echo "未调整 vnStat 日数据保留期，已取消本次配置；原监控配置不会被覆盖。"
+            return 1
+            ;;
+    esac
 
     for config_path in /etc/vnstat.conf /etc/vnstat/vnstat.conf; do
         [ -f "$config_path" ] && break
@@ -530,7 +535,8 @@ validate_config() {
 
     LIMIT_SPEED="${LIMIT_SPEED:-20}"
     if ! [[ "$LIMIT_SPEED" =~ ^[1-9][0-9]*$ ]]; then
-        LIMIT_SPEED=20
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：LIMIT_SPEED 必须是大于 0 的整数。" | tee -a "$LOG_FILE"
+        has_error=true
     fi
     TC_BOOT_GRACE_MINUTES="${TC_BOOT_GRACE_MINUTES:-10}"
     if ! [[ "$TC_BOOT_GRACE_MINUTES" =~ ^[0-9]+$ ]] || [ "$TC_BOOT_GRACE_MINUTES" -gt 1440 ]; then
@@ -746,8 +752,8 @@ history_incomplete_for_current_period() {
     local period_start available_start retention_start trafficless_entries
     local period_num available_num retention_num
 
-    period_start=$(get_period_start_date) || return 1
-    available_start=$(get_vnstat_available_start) || return 1
+    period_start=$(get_period_start_date) || return 2
+    available_start=$(get_vnstat_available_start) || return 2
     retention_start=$(cat "$RETENTION_STATE_FILE" 2>/dev/null || true)
     trafficless_entries=$(vnstat_config_value "TrafficlessEntries")
     trafficless_entries=${trafficless_entries:-1}
@@ -765,11 +771,19 @@ history_incomplete_for_current_period() {
 
 configure_history_policy() {
     local period_start available_start available_num retention_start retention_num trafficless_entries history_choice
+    local history_status
 
     ALLOW_PARTIAL_HISTORY=false
-    if ! history_incomplete_for_current_period; then
-        return 0
-    fi
+    history_incomplete_for_current_period
+    history_status=$?
+    case "$history_status" in
+        0) ;;
+        1) return 0 ;;
+        *)
+            echo "无法可靠读取 vnStat 历史起点，已取消本次配置；请确认 vnStat 服务和接口数据正常。"
+            return 1
+            ;;
+    esac
 
     period_start=$(get_period_start_date)
     available_start=$(get_vnstat_available_start 2>/dev/null || echo "未知")
@@ -854,11 +868,14 @@ clear_owned_shutdown_schedule() {
 configure_post_save_enforcement() {
     local current_usage limit_threshold unit_label policy_choice grace_minutes until_epoch
 
+    if ! current_usage=$(get_traffic_usage); then
+        echo "无法可靠读取当前流量，已取消本次配置；原监控配置不会被覆盖。"
+        return 1
+    fi
     clear_owned_shutdown_schedule || return 1
     rm -f "$ENFORCEMENT_STATE_FILE"
     clear_owned_tc_rules "配置已更新" || return 1
     [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && unit_label="GB" || unit_label="GiB"
-    current_usage=$(get_traffic_usage) || return 0
     limit_threshold=$(echo "$TRAFFIC_LIMIT - $TRAFFIC_TOLERANCE" | bc 2>/dev/null || echo "0")
     if ! compare_decimal "$current_usage" "$limit_threshold" "ge"; then
         return 0
@@ -1337,10 +1354,11 @@ write_tc_state() {
     local interface="$1"
     local speed="$2"
     local qdisc_line="$3"
+    local state_file="${4:-$TC_STATE_FILE}"
     local period_start tmp_file
 
     period_start=$(get_period_start_date)
-    tmp_file="${TC_STATE_FILE}.tmp.$$"
+    tmp_file="${state_file}.tmp.$$"
     {
         printf 'INTERFACE=%s\n' "$interface"
         printf 'LIMIT_SPEED=%s\n' "$speed"
@@ -1350,13 +1368,15 @@ write_tc_state() {
         printf 'APPLIED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     } > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
     chmod 600 "$tmp_file" 2>/dev/null || true
-    mv -f "$tmp_file" "$TC_STATE_FILE"
+    mv -f "$tmp_file" "$state_file" || { rm -f "$tmp_file"; return 1; }
 }
 
 apply_tc_limit() {
     local speed="$1"
     local existing_qdisc state_interface state_qdisc_line state_speed state_boot_id boot_id new_qdisc
     local previous_owned_speed=""
+    local prepared_state="${TC_STATE_FILE}.prepared.$$"
+    local rollback_ok=false
 
     if [ -z "$TC_BIN" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 未找到系统 tc 命令，无法执行限速" | tee -a "$LOG_FILE"
@@ -1417,22 +1437,50 @@ apply_tc_limit() {
         fi
     fi
 
+    if ! write_tc_state "$MAIN_INTERFACE" "$speed" "" "$prepared_state"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 无法预写 TC 归属状态，已拒绝修改系统 qdisc。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+
     if "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root tbf rate "${speed}kbit" burst 32kbit latency 400ms; then
         new_qdisc=$(tc_root_qdisc "$MAIN_INTERFACE")
-        if write_tc_state "$MAIN_INTERFACE" "$speed" "$new_qdisc"; then
+        if mv -f "$prepared_state" "$TC_STATE_FILE"; then
+            if ! write_tc_state "$MAIN_INTERFACE" "$speed" "$new_qdisc"; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') TC 精确状态更新失败，已保留预写的兼容归属状态。" | tee -a "$LOG_FILE"
+            fi
             echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则已应用/更新" | tee -a "$LOG_FILE"
             return 0
         fi
 
-        echo "$(date '+%Y-%m-%d %H:%M:%S') TC 规则已修改但状态写入失败，正在回滚。" | tee -a "$LOG_FILE"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') TC 规则已修改但归属状态提交失败，正在回滚。" | tee -a "$LOG_FILE"
         if [[ "$previous_owned_speed" =~ ^[1-9][0-9]*$ ]]; then
-            "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root tbf rate "${previous_owned_speed}kbit" burst 32kbit latency 400ms 2>/dev/null || true
+            if "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root tbf rate "${previous_owned_speed}kbit" burst 32kbit latency 400ms 2>/dev/null; then
+                rollback_ok=true
+            fi
         else
-            "$TC_BIN" qdisc del dev "$MAIN_INTERFACE" root 2>/dev/null || true
+            if "$TC_BIN" qdisc del dev "$MAIN_INTERFACE" root 2>/dev/null; then
+                rollback_ok=true
+            fi
+        fi
+        if ! $rollback_ok; then
+            new_qdisc=$(tc_root_qdisc "$MAIN_INTERFACE")
+            if [[ "$previous_owned_speed" =~ ^[1-9][0-9]*$ ]] \
+                && echo "$new_qdisc" | grep -Eq " tbf .*rate[[:space:]]+${previous_owned_speed}[Kk]bit"; then
+                rollback_ok=true
+            elif [ -z "$previous_owned_speed" ] && [ -n "$new_qdisc" ] && ! echo "$new_qdisc" | grep -q " tbf "; then
+                rollback_ok=true
+            fi
+        fi
+        if $rollback_ok; then
+            rm -f "$prepared_state"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') TC 规则已回滚，原归属状态保持不变。" | tee -a "$LOG_FILE"
+        else
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 严重错误：TC 回滚失败；预写状态保留在 $prepared_state，请立即检查 qdisc。" | tee -a "$LOG_FILE"
         fi
         return 1
     fi
 
+    rm -f "$prepared_state"
     echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则应用失败，请检查接口或 tc 状态" | tee -a "$LOG_FILE"
     return 1
 }
@@ -1699,8 +1747,8 @@ check_and_limit_traffic() {
             echo "$(date '+%Y-%m-%d %H:%M:%S') 使用 TC 模式限速" | tee -a "$LOG_FILE"
             local safe_limit_speed="${LIMIT_SPEED:-20}"
             if ! [[ "$safe_limit_speed" =~ ^[1-9][0-9]*$ ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到限速值异常：$safe_limit_speed，已使用默认值 20 kbit/s" | tee -a "$LOG_FILE"
-                safe_limit_speed=20
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到限速值异常：$safe_limit_speed，本轮拒绝执行 TC 限速" | tee -a "$LOG_FILE"
+                return 1
             fi
             if ! apply_tc_limit "$safe_limit_speed"; then
                 return 1
@@ -1711,13 +1759,17 @@ check_and_limit_traffic() {
                 echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制，系统已有计划关机，未重复提交或覆盖" | tee -a "$LOG_FILE"
             else
                 echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制，系统将在 1 分钟后关机" | tee -a "$LOG_FILE"
-                if ! shutdown -h +1 "流量超出限制，系统将在 1 分钟后关机"; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') 计划关机失败" | tee -a "$LOG_FILE"
+                if ! write_shutdown_state; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') 无法预写关机保护状态，本轮拒绝提交计划关机" | tee -a "$LOG_FILE"
                     return 1
                 fi
-                if ! write_shutdown_state; then
-                    shutdown -c 2>/dev/null || true
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') 关机保护状态写入失败，已取消本次计划关机" | tee -a "$LOG_FILE"
+                if ! shutdown -h +1 "流量超出限制，系统将在 1 分钟后关机"; then
+                    if has_pending_shutdown; then
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') 关机命令返回失败但仍检测到计划任务，已保留归属状态供安全清理" | tee -a "$LOG_FILE"
+                    elif ! rm -f "$SHUTDOWN_STATE_FILE"; then
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') 计划关机失败，且无法清理预写状态；下轮将继续安全核验" | tee -a "$LOG_FILE"
+                    fi
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') 计划关机失败" | tee -a "$LOG_FILE"
                     return 1
                 fi
             fi
@@ -1871,6 +1923,7 @@ main() {
             check_and_limit_traffic
         else
             echo "$(date '+%Y-%m-%d %H:%M:%S') 无法可靠获取流量数据，请检查 vnstat 配置；本轮不会清除现有限速。" | tee -a "$LOG_FILE"
+            return 1
         fi
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') 配置文件读取失败，请检查配置" | tee -a "$LOG_FILE"

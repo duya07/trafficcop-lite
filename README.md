@@ -36,6 +36,8 @@
 20. Telegram 交互菜单不再长期占用任务锁，定时任务与手动发送仍保持互斥。
 21. vnStat 保留期配置与覆盖起点标记同步提交，配置替换失败时会恢复旧标记。
 22. 取消计划关机前会核对 boot ID；重启后的陈旧标记不会取消本次开机由其他工具创建的关机任务。旧标记无法验证归属时会保留系统任务并停止自动清理。
+23. 所有 root crontab 读改写使用 TrafficCop Lite 自身的 `/etc/trafficcop-lite/root-crontab.lock`；它不依赖也不占用 Port Traffic Dog 的 cron 锁。
+24. TC 模式直接管理 `traffic-tools-unified-htb-v1`：`1:1` 实施整机上限，`1:30` 承接默认流量，并保留 Dog 的端口子类。TrafficCop Lite 可单独安装；检测到可验证的 Dog 层级时原地协调，不调用 Dog 程序，安装顺序不限。
 
 ## 下载方式说明
 
@@ -98,6 +100,7 @@ sudo ntc --update
 sudo ntc --stop
 sudo ntc --logs
 sudo ntc --config
+sudo ntc --self-check
 sudo ntc --uninstall
 ```
 
@@ -106,6 +109,7 @@ sudo ntc --uninstall
 - `--stop`: 停止独立版监控和通知任务。
 - `--logs`: 查看日志。
 - `--config`: 查看配置。
+- `--self-check [INTERFACE]`: 只读检查指定网卡（或自动识别网卡）的统一 HTB、状态归属与兼容性。
 - `--uninstall`: 卸载 TrafficCop Lite。
 
 主菜单入口:
@@ -277,7 +281,9 @@ sudo /usr/sbin/tc qdisc show
 ## 注意事项
 
 - 脚本会安装依赖、写入 crontab，并可能配置 TC 限速或关机模式，请先在测试机确认。
-- TC 模式会用 `/etc/trafficcop-lite/tc_limit_state` 标记本脚本应用过的限速；自动恢复只清理带有该标记的规则，未标记的系统原有 `tbf` 规则会被保留或要求确认。
+- TC 模式会用 `/etc/trafficcop-lite/tc_limit_state` 记录自身管理的整机上限。NTC 直接创建或更新统一 HTB；Dog 存在时保留其端口类和过滤器，不存在时也可独立工作。
+- NTC 与 Dog 各自使用自己的 root crontab 锁；只有修改同一内核 TC 层级时共用 `/run/lock/traffic-tools-tc.lock`。
+- tcpfit 当前会删除并重建 root qdisc，不能与统一 HTB 同时管理同一网卡。脚本会拒绝覆盖 tcpfit 或其他无法证明归属的配置；切换前请先停用对应服务，并运行 `sudo ntc --self-check`。
 - `enforcement_state` 只记录临时宽限或暂停状态；`shutdown_limit_state` 只记录本脚本计划的流量关机及其 boot ID。
 - 若状态记录与当前 qdisc 不一致，脚本会按外部规则处理并停止自动覆盖。
 - 停止服务/卸载时，未标记的 TC 规则和计划关机会要求确认后才处理。

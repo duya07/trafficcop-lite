@@ -19,9 +19,10 @@ USAGE_STATE_FILE="$WORK_DIR/current_traffic_state"
 SCRIPT_PATH="$WORK_DIR/trafficcop-lite-telegram.sh"
 CRON_LOG="$WORK_DIR/tg_notifier_cron.log"
 TG_LOCK_FILE="$WORK_DIR/tg_notifier.lock"
+ROOT_CRONTAB_LOCK_FILE="${TRAFFICCOP_ROOT_CRONTAB_LOCK_FILE:-$WORK_DIR/root-crontab.lock}"
 CRON_LOG_MAX_LINES="${CRON_LOG_MAX_LINES:-2000}"
 TG_DEBUG="${TG_DEBUG:-false}"
-SCRIPT_VERSION="1.1.2"
+SCRIPT_VERSION="1.1.3"
 
 # 此函数只由 EXIT trap 调用，ShellCheck 无法沿字符串形式的 trap 识别调用关系。
 # shellcheck disable=SC2317,SC2329
@@ -142,6 +143,30 @@ read_current_crontab() {
     return 1
 }
 
+
+acquire_root_crontab_lock() {
+    mkdir -p "$(dirname "$ROOT_CRONTAB_LOCK_FILE")" || return 1
+    exec 7>"$ROOT_CRONTAB_LOCK_FILE" || return 1
+    if ! flock -w 15 7; then
+        exec 7>&-
+        return 1
+    fi
+}
+
+release_root_crontab_lock() {
+    flock -u 7 2>/dev/null || true
+    exec 7>&-
+}
+
+read_root_crontab_locked() {
+    local current_crontab="" status=0
+
+    acquire_root_crontab_lock || return 1
+    current_crontab=$(read_current_crontab) || status=$?
+    release_root_crontab_lock
+    [ "$status" -eq 0 ] || return "$status"
+    printf '%s\n' "$current_crontab"
+}
 
 is_valid_timezone() {
     local timezone="$1"
@@ -636,35 +661,49 @@ setup_cron() {
     local correct_entry="* * * * * $SCRIPT_PATH -cron >/dev/null 2>&1 # TrafficCop-Lite Telegram"
     local current_crontab new_crontab
 
+    if ! acquire_root_crontab_lock; then
+        echo "无法取得 TrafficCop-Lite crontab 锁，未修改定时任务。"
+        return 1
+    fi
     if ! current_crontab="$(read_current_crontab)"; then
         echo "读取当前 crontab 失败，未修改定时任务。"
+        release_root_crontab_lock
         return 1
     fi
     new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
 
     if ! { printf '%s\n' "$new_crontab"; printf '%s\n' "$correct_entry"; } | sed '/^[[:space:]]*$/d' | crontab -; then
         echo "更新 Telegram crontab 失败。"
+        release_root_crontab_lock
         return 1
     fi
+    release_root_crontab_lock
     echo "已清理旧条目并设置唯一的 Telegram 每分钟任务。"
 
     # 显示当前的 crontab 内容
     echo "当前的 crontab 内容："
-    crontab -l
+    read_root_crontab_locked
 }
 
 remove_telegram_cron() {
     local current_crontab new_crontab
 
+    if ! acquire_root_crontab_lock; then
+        echo "无法取得 TrafficCop-Lite crontab 锁，未修改定时任务。"
+        return 1
+    fi
     if ! current_crontab="$(read_current_crontab)"; then
         echo "读取当前 crontab 失败，未修改定时任务。"
+        release_root_crontab_lock
         return 1
     fi
     new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
     if ! printf '%s\n' "$new_crontab" | sed '/^[[:space:]]*$/d' | crontab -; then
         echo "移除 Telegram crontab 失败。"
+        release_root_crontab_lock
         return 1
     fi
+    release_root_crontab_lock
     echo "已移除 TrafficCop-Lite Telegram 自动通知任务。"
 }
 

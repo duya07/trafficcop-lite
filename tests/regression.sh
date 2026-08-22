@@ -536,10 +536,10 @@ test_update_replaces_full_release_and_preserves_state() {
     printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.0' > "$WORK_DIR/$MACHINE_LIMIT_SCRIPT"
     printf '%s\n' 'CONFIG=keep-me' > "$WORK_DIR/traffic_monitor_config.txt"
 
-    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.6"' > "$remote_dir/trafficcop-lite.sh"
-    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.4"' > "$remote_dir/$MONITOR_SCRIPT"
-    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.2"' > "$remote_dir/$TELEGRAM_SCRIPT"
-    printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.6' > "$remote_dir/$MACHINE_LIMIT_SCRIPT"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.7"' > "$remote_dir/trafficcop-lite.sh"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.5"' > "$remote_dir/$MONITOR_SCRIPT"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.3"' > "$remote_dir/$TELEGRAM_SCRIPT"
+    printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.7' > "$remote_dir/$MACHINE_LIMIT_SCRIPT"
 
     load_function "$ROOT_DIR/trafficcop-lite.sh" script_version_from_file || return 1
     load_function "$ROOT_DIR/trafficcop-lite.sh" version_is_newer || return 1
@@ -552,16 +552,16 @@ test_update_replaces_full_release_and_preserves_state() {
     install_shortcut_link() { printf '%s\n' 'called' > "$work/shortcut-called"; }
 
     update_scripts 'https://example.invalid/release' >/dev/null || return 1
-    grep -Fqx 'SCRIPT_VERSION="1.1.6"' "$WORK_DIR/trafficcop-lite.sh" || return 1
-    grep -Fqx 'SCRIPT_VERSION="1.1.4"' "$WORK_DIR/$MONITOR_SCRIPT" || return 1
-    grep -Fqx 'SCRIPT_VERSION="1.1.2"' "$WORK_DIR/$TELEGRAM_SCRIPT" || return 1
-    grep -Fqx '# TrafficCop Lite Machine Limit v2.6' "$WORK_DIR/$MACHINE_LIMIT_SCRIPT" || return 1
+    grep -Fqx 'SCRIPT_VERSION="1.1.7"' "$WORK_DIR/trafficcop-lite.sh" || return 1
+    grep -Fqx 'SCRIPT_VERSION="1.1.5"' "$WORK_DIR/$MONITOR_SCRIPT" || return 1
+    grep -Fqx 'SCRIPT_VERSION="1.1.3"' "$WORK_DIR/$TELEGRAM_SCRIPT" || return 1
+    grep -Fqx '# TrafficCop Lite Machine Limit v2.7' "$WORK_DIR/$MACHINE_LIMIT_SCRIPT" || return 1
     assert_file_content 'CONFIG=keep-me' "$WORK_DIR/traffic_monitor_config.txt" || return 1
     backup_main=$(find "$WORK_DIR/backups" -type f -name trafficcop-lite.sh -print -quit) || return 1
     [ -n "$backup_main" ] || return 1
     grep -Fqx 'SCRIPT_VERSION="1.0.2"' "$backup_main" || return 1
     [ "$UPDATE_PREVIOUS_VERSION" = '1.0.2' ] || return 1
-    [ "$UPDATE_NEW_VERSION" = '1.1.6' ] || return 1
+    [ "$UPDATE_NEW_VERSION" = '1.1.7' ] || return 1
     assert_file_content 'called' "$work/shortcut-called"
 }
 
@@ -650,10 +650,15 @@ test_tc_change_requires_prepared_state() {
     LOG_FILE="$work/log"
     MAIN_INTERFACE='eth0'
     TC_BIN='mock_tc'
+    local lock_held=false
 
     load_function "$MONITOR_SCRIPT" apply_tc_limit || return 1
+    acquire_tc_hierarchy_lock() { lock_held=true; }
+    release_tc_hierarchy_lock() { lock_held=false; }
     tc_root_qdisc() { printf '%s\n' 'qdisc fq_codel 0: root'; }
     tc_state_interface() { return 0; }
+    tc_root_is_unified_compatible() { return 1; }
+    tc_legacy_tbf_is_owned() { return 1; }
     is_default_qdisc_line() { return 0; }
     write_tc_state() {
         printf '%s\n' 'called' > "$work/state-prewrite"
@@ -665,7 +670,180 @@ test_tc_change_requires_prepared_state() {
         return 1
     fi
     assert_file_content 'called' "$work/state-prewrite" || return 1
-    assert_absent "$work/tc-called"
+    assert_absent "$work/tc-called" || return 1
+    [ "$lock_held" = "false" ]
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_tc_builds_unified_htb_directly() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/tc-direct-htb.XXXXXX") || return 1
+    TC_STATE_FILE="$work/tc-state"
+    LOG_FILE="$work/log"
+    MAIN_INTERFACE='eth0'
+    TC_BIN='mock_tc'
+    local lock_held=false
+
+    load_function "$MONITOR_SCRIPT" apply_tc_limit || return 1
+    acquire_tc_hierarchy_lock() { lock_held=true; }
+    release_tc_hierarchy_lock() { lock_held=false; }
+    tc_root_qdisc() { printf '%s\n' 'qdisc fq_codel 0: root'; }
+    tc_state_interface() { return 0; }
+    tc_root_is_unified_compatible() { return 1; }
+    tc_legacy_tbf_is_owned() { return 1; }
+    is_default_qdisc_line() { return 0; }
+    mock_tc() {
+        [ "$lock_held" = "true" ] || return 1
+        printf '%s\n' "$*" >> "$work/tc-called"
+    }
+    write_tc_state() { printf '%s\n' "$1|$2" > "$4"; }
+    tc_replace_base_classes() {
+        [ "$lock_held" = "true" ] || return 1
+        printf '%s\n' "$1|$2" > "$work/base-classes"
+    }
+    tc_verify_unified_hierarchy() { return 0; }
+
+    apply_tc_limit 90 >/dev/null || return 1
+    grep -Fq 'qdisc replace dev eth0 root handle 1: htb default 30' "$work/tc-called" || return 1
+    assert_file_content 'eth0|90kbit' "$work/base-classes" || return 1
+    assert_file_content 'eth0|90' "$TC_STATE_FILE" || return 1
+    [ "$lock_held" = "false" ] || return 1
+    ! grep -Eq 'dog_tc_manager|--apply-global-tc-limit|--remove-global-tc-limit' "$MONITOR_SCRIPT"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_tc_refuses_foreign_root_without_mutation() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/tc-foreign-root.XXXXXX") || return 1
+    TC_STATE_FILE="$work/tc-state"
+    LOG_FILE="$work/log"
+    MAIN_INTERFACE='eth0'
+    TC_BIN='mock_tc'
+    local lock_held=false
+
+    load_function "$MONITOR_SCRIPT" apply_tc_limit || return 1
+    acquire_tc_hierarchy_lock() { lock_held=true; }
+    release_tc_hierarchy_lock() { lock_held=false; }
+    tc_root_qdisc() { printf '%s\n' 'qdisc htb 1: root default 10'; }
+    tc_state_interface() { return 0; }
+    tc_root_is_unified_compatible() { return 1; }
+    tc_legacy_tbf_is_owned() { return 1; }
+    is_default_qdisc_line() { return 1; }
+    mock_tc() { printf '%s\n' "$*" > "$work/tc-called"; }
+    write_tc_state() { printf '%s\n' 'unexpected' > "$work/state-written"; }
+
+    if apply_tc_limit 90 >/dev/null; then
+        return 1
+    fi
+    assert_absent "$work/tc-called" || return 1
+    assert_absent "$work/state-written" || return 1
+    [ "$lock_held" = "false" ]
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_legacy_tbf_requires_matching_numeric_speed() {
+    TC_STATE_PROVIDER='trafficcop-lite'
+    local mock_state_speed='invalid'
+
+    load_function "$MONITOR_SCRIPT" tc_legacy_tbf_is_owned || return 1
+    tc_state_interface() { printf '%s\n' 'eth0'; }
+    tc_state_value() {
+        case "$1" in
+            SCHEMA) return 0 ;;
+            PROVIDER) printf '%s\n' 'trafficcop-lite' ;;
+            QDISC_LINE) printf '%s\n' 'qdisc tbf 8001: root rate 5Mbit burst 32Kb lat 400ms' ;;
+            LIMIT_SPEED) printf '%s\n' "$mock_state_speed" ;;
+        esac
+    }
+    normalize_tc_rate_to_bps() {
+        case "${1,,}" in
+            5mbit) printf '%s\n' '5000000' ;;
+            *) return 1 ;;
+        esac
+    }
+
+    if tc_legacy_tbf_is_owned eth0 'qdisc tbf 8001: root rate 5Mbit burst 32Kb lat 400ms'; then
+        return 1
+    fi
+    mock_state_speed='5000'
+    tc_legacy_tbf_is_owned eth0 'qdisc tbf 8001: root rate 5Mbit burst 32Kb lat 400ms'
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_invalid_dog_config_cannot_authorize_adoption() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/invalid-dog-config.XXXXXX") || return 1
+    DOG_CONFIG_FILE="$work/config.json"
+    printf '%s\n' '{"ports":' > "$DOG_CONFIG_FILE"
+
+    load_function "$MONITOR_SCRIPT" dog_configured_class_ids || return 1
+    if dog_configured_class_ids >/dev/null; then
+        return 1
+    fi
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_unified_hierarchy_verification_requires_full_contract() {
+    TC_DEFAULT_CLASS_RATE='1kbit'
+    load_function "$MONITOR_SCRIPT" tc_verify_unified_hierarchy || return 1
+    tc_root_is_htb_handle_one() { return 0; }
+    tc_root_has_default_30() { return 1; }
+    tc_root_has_parent_class() { return 0; }
+    tc_class_line() { printf '%s\n' 'class htb 1:30 parent 1:1'; }
+    tc_class_rate_matches() { return 0; }
+    if tc_verify_unified_hierarchy eth0 90kbit; then
+        return 1
+    fi
+
+    tc_root_has_default_30() { return 0; }
+    tc_root_has_parent_class() { return 1; }
+    if tc_verify_unified_hierarchy eth0 90kbit; then
+        return 1
+    fi
+
+    tc_root_has_parent_class() { return 0; }
+    tc_class_line() { printf '%s\n' 'class htb 1:30 parent 1:2'; }
+    if tc_verify_unified_hierarchy eth0 90kbit; then
+        return 1
+    fi
+
+    tc_class_line() { printf '%s\n' 'class htb 1:30 parent 1:1'; }
+    tc_verify_unified_hierarchy eth0 90kbit
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_monitor_crontab_update_holds_project_lock() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/root-cron-lock.XXXXXX") || return 1
+    LOG_FILE="$work/log"
+    SCRIPT_PATH='/etc/trafficcop-lite/trafficcop-lite-monitor.sh'
+    ROOT_CRONTAB_LOCK_FILE="$work/root-crontab.lock"
+    local lock_held=false
+
+    load_function "$MONITOR_SCRIPT" setup_crontab || return 1
+    acquire_root_crontab_lock() { lock_held=true; }
+    release_root_crontab_lock() { lock_held=false; }
+    read_current_crontab() {
+        [ "$lock_held" = "true" ] || return 1
+        printf '%s\n' '17 * * * * /usr/local/bin/unrelated-job'
+    }
+    crontab() {
+        [ "$lock_held" = "true" ] || return 1
+        [ "$1" = "-" ] || return 1
+        cat > "$work/crontab"
+    }
+
+    setup_crontab >/dev/null || return 1
+    [ "$lock_held" = "false" ] || return 1
+    grep -Fq '/usr/local/bin/unrelated-job' "$work/crontab" || return 1
+    grep -Fq "$SCRIPT_PATH --run" "$work/crontab" || return 1
+    for script in trafficcop-lite.sh trafficcop-lite-monitor.sh trafficcop-lite-telegram.sh trafficcop-lite-machine-limit.sh; do
+        grep -Fq '$WORK_DIR/root-crontab.lock' "$ROOT_DIR/$script" || return 1
+        ! grep -Fq '/run/lock/traffic-tools-root-crontab.lock' "$ROOT_DIR/$script" || return 1
+        grep -Fq 'read_root_crontab_locked()' "$ROOT_DIR/$script" || return 1
+        [ "$(grep -c 'crontab -l' "$ROOT_DIR/$script")" -eq 1 ] || return 1
+    done
+    grep -Fq '/run/lock/traffic-tools-tc.lock' "$MONITOR_SCRIPT"
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
@@ -1174,6 +1352,12 @@ run_test 'declining vnStat retention aborts configuration' test_retention_declin
 run_test 'vnStat history read errors abort configuration' test_vnstat_history_read_error_aborts_configuration
 run_test 'post-save read errors preserve runtime state' test_post_save_read_error_preserves_runtime_state
 run_test 'TC changes require a prepared ownership state' test_tc_change_requires_prepared_state
+run_test 'TC builds the unified HTB directly without invoking Dog' test_tc_builds_unified_htb_directly
+run_test 'TC refuses an unrecognized root qdisc without mutation' test_tc_refuses_foreign_root_without_mutation
+run_test 'legacy TBF adoption requires a matching numeric speed' test_legacy_tbf_requires_matching_numeric_speed
+run_test 'invalid Dog config cannot authorize HTB adoption' test_invalid_dog_config_cannot_authorize_adoption
+run_test 'unified HTB verification requires the full root and class contract' test_unified_hierarchy_verification_requires_full_contract
+run_test 'root crontab updates hold the TrafficCop project lock' test_monitor_crontab_update_holds_project_lock
 run_test 'shutdown scheduling requires a prepared ownership state' test_shutdown_requires_prepared_state
 run_test 'Telegram config does not reuse stale secrets' test_telegram_config_does_not_reuse_stale_secret
 run_test 'Telegram legacy config is parsed without execution' test_telegram_legacy_config_is_parsed_without_execution

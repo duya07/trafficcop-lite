@@ -19,8 +19,16 @@ RETENTION_STATE_FILE="$WORK_DIR/vnstat_daily_coverage_start"
 USAGE_STATE_FILE="$WORK_DIR/current_traffic_state"
 ENFORCEMENT_STATE_FILE="$WORK_DIR/enforcement_state"
 SHUTDOWN_STATE_FILE="$WORK_DIR/shutdown_limit_state"
+ROOT_CRONTAB_LOCK_FILE="${TRAFFICCOP_ROOT_CRONTAB_LOCK_FILE:-$WORK_DIR/root-crontab.lock}"
+TC_HIERARCHY_LOCK_FILE="${TRAFFIC_TOOLS_TC_LOCK_FILE:-/run/lock/traffic-tools-tc.lock}"
+TC_STATE_SCHEMA="traffic-tools-unified-htb-v1"
+TC_STATE_PROVIDER="trafficcop-lite"
+TC_PARENT_RATE="100gbit"
+TC_DEFAULT_CLASS_RATE="1kbit"
+DOG_CONFIG_FILE="/etc/port-traffic-dog/config.json"
+DOG_TC_OWNER_FILE="/etc/port-traffic-dog/tc-root-qdisc.owner"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.1.4"
+SCRIPT_VERSION="1.1.5"
 mkdir -p "$WORK_DIR"
 chmod 700 "$WORK_DIR" 2>/dev/null || true
 
@@ -103,6 +111,30 @@ read_current_crontab() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') 读取当前 crontab 失败：$(cat "$error_file" 2>/dev/null)" | tee -a "$LOG_FILE" >&2
     rm -f "$error_file"
     return 1
+}
+
+acquire_root_crontab_lock() {
+    mkdir -p "$(dirname "$ROOT_CRONTAB_LOCK_FILE")" || return 1
+    exec 7>"$ROOT_CRONTAB_LOCK_FILE" || return 1
+    if ! flock -w 15 7; then
+        exec 7>&-
+        return 1
+    fi
+}
+
+release_root_crontab_lock() {
+    flock -u 7 2>/dev/null || true
+    exec 7>&-
+}
+
+read_root_crontab_locked() {
+    local current_crontab="" status=0
+
+    acquire_root_crontab_lock || return 1
+    current_crontab=$(read_current_crontab) || status=$?
+    release_root_crontab_lock
+    [ "$status" -eq 0 ] || return "$status"
+    printf '%s\n' "$current_crontab"
 }
 
 align_timezone_with_vnstat() {
@@ -449,7 +481,7 @@ check_and_install_packages() {
 check_existing_setup() {
      if [ -s "$CONFIG_FILE" ] && read_config; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 配置已存在"| tee -a "$LOG_FILE"
-        if crontab -l 2>/dev/null | grep -q "$SCRIPT_PATH --run"; then
+        if read_root_crontab_locked 2>/dev/null | grep -Fq "$SCRIPT_PATH --run"; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 每分钟一次的定时任务已在执行。"| tee -a "$LOG_FILE"
         else
             echo "$(date '+%Y-%m-%d %H:%M:%S') 警告：定时任务未找到，可能需要重新设置。"| tee -a "$LOG_FILE"
@@ -1346,6 +1378,233 @@ tc_state_interface() {
     tc_state_value "INTERFACE"
 }
 
+acquire_tc_hierarchy_lock() {
+    mkdir -p "$(dirname "$TC_HIERARCHY_LOCK_FILE")" || return 1
+    exec 6>"$TC_HIERARCHY_LOCK_FILE" || return 1
+    if ! flock -w 15 6; then
+        exec 6>&-
+        return 1
+    fi
+}
+
+release_tc_hierarchy_lock() {
+    flock -u 6 2>/dev/null || true
+    exec 6>&-
+}
+
+normalize_tc_rate_to_bps() {
+    local value="${1,,}"
+    local number unit multiplier
+
+    value=${value//[[:space:]]/}
+    [[ "$value" =~ ^([0-9]+)(bit|kbit|mbit|gbit|tbit)$ ]] || return 1
+    number="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+        bit) multiplier=1 ;;
+        kbit) multiplier=1000 ;;
+        mbit) multiplier=1000000 ;;
+        gbit) multiplier=1000000000 ;;
+        tbit) multiplier=1000000000000 ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$((number * multiplier))"
+}
+
+tc_class_line() {
+    local interface="$1"
+    local class_id="$2"
+    "$TC_BIN" class show dev "$interface" 2>/dev/null |
+        awk -v class_id="$class_id" '$1 == "class" && $3 == class_id { print; exit }'
+}
+
+tc_class_value() {
+    local interface="$1"
+    local class_id="$2"
+    local key="$3"
+    tc_class_line "$interface" "$class_id" |
+        awk -v key="$key" '{ for (i = 1; i < NF; i++) if ($i == key) { print $(i + 1); exit } }'
+}
+
+tc_class_rate_matches() {
+    local interface="$1"
+    local class_id="$2"
+    local expected_rate="$3"
+    local expected_ceil="${4:-}"
+    local actual_rate actual_ceil expected_bps actual_bps
+
+    actual_rate=$(tc_class_value "$interface" "$class_id" rate)
+    expected_bps=$(normalize_tc_rate_to_bps "$expected_rate") || return 1
+    actual_bps=$(normalize_tc_rate_to_bps "$actual_rate") || return 1
+    [ "$actual_bps" = "$expected_bps" ] || return 1
+    if [ -n "$expected_ceil" ]; then
+        actual_ceil=$(tc_class_value "$interface" "$class_id" ceil)
+        expected_bps=$(normalize_tc_rate_to_bps "$expected_ceil") || return 1
+        actual_bps=$(normalize_tc_rate_to_bps "$actual_ceil") || return 1
+        [ "$actual_bps" = "$expected_bps" ] || return 1
+    fi
+}
+
+tc_root_is_htb_handle_one() {
+    local interface="$1"
+    tc_root_qdisc "$interface" | grep -Eq '^qdisc htb 1:([[:space:]]|$)'
+}
+
+tc_root_has_default_30() {
+    local interface="$1"
+    tc_root_qdisc "$interface" | grep -Eq ' default (0x)?30([[:space:]]|$)'
+}
+
+tc_root_has_parent_class() {
+    local interface="$1"
+    tc_class_line "$interface" "1:1" | grep -Eq '^class htb 1:1 root([[:space:]]|$)'
+}
+
+dog_owner_marker_matches() {
+    local interface="$1"
+    local recorded_interface="" recorded_machine_id="" machine_id=""
+
+    [ -r "$DOG_TC_OWNER_FILE" ] || return 1
+    IFS='|' read -r recorded_interface recorded_machine_id < "$DOG_TC_OWNER_FILE" || return 1
+    [ -r /etc/machine-id ] && machine_id=$(tr -d '\r\n' < /etc/machine-id)
+    [ "$recorded_interface" = "$interface" ] && [ "$recorded_machine_id" = "$machine_id" ]
+}
+
+tc_state_is_unified_for_interface() {
+    local interface="$1"
+    [ "$(tc_state_value SCHEMA)" = "$TC_STATE_SCHEMA" ] &&
+        [ "$(tc_state_value PROVIDER)" = "$TC_STATE_PROVIDER" ] &&
+        [ "$(tc_state_interface)" = "$interface" ]
+}
+
+dog_configured_class_ids() {
+    local port class_id start_port end_port mark_id minor
+
+    [ -r "$DOG_CONFIG_FILE" ] && command -v jq >/dev/null 2>&1 || return 1
+    jq -e '(.ports // {}) | type == "object"' "$DOG_CONFIG_FILE" >/dev/null 2>&1 || return 1
+    while IFS=$'\t' read -r port class_id; do
+        if [[ "$class_id" =~ ^1:([0-9a-fA-F]+)$ ]]; then
+            printf '%s\n' "$class_id"
+        elif [[ "$port" =~ ^[0-9]+$ ]]; then
+            printf '1:%x\n' "$((0x1000 + port))"
+        elif [[ "$port" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            start_port="${BASH_REMATCH[1]}"
+            end_port="${BASH_REMATCH[2]}"
+            mark_id=$(((start_port * 1000 + end_port) % 65536))
+            minor=$((0x2000 + mark_id))
+            [ "$minor" -le 65535 ] || continue
+            printf '1:%x\n' "$minor"
+        fi
+    done < <(jq -r '
+        .ports // {} | to_entries[] |
+        select((.value.enabled // true) == true) |
+        select((.value.bandwidth_limit.enabled // false) == true) |
+        select((.value.bandwidth_limit.rate // "unlimited") != "unlimited") |
+        [.key, (.value.bandwidth_limit.class_id // "")] | @tsv
+    ' "$DOG_CONFIG_FILE" 2>/dev/null) | sort -u
+}
+
+dog_live_objects_match_config() {
+    local interface="$1"
+    local configured_ids actual_ids filter_ids class_id
+
+    configured_ids=$(dog_configured_class_ids) || return 1
+    actual_ids=$("$TC_BIN" class show dev "$interface" 2>/dev/null |
+        awk '$1 == "class" && $2 == "htb" && $3 != "1:1" && $3 != "1:30" { print $3 }' |
+        sort -u)
+    filter_ids=$("$TC_BIN" filter show dev "$interface" parent 1:0 2>/dev/null |
+        grep -Eo '(flowid|classid)[[:space:]]+1:[0-9a-fA-F]+' |
+        awk '{ print $2 }' | sort -u)
+
+    while IFS= read -r class_id; do
+        [ -z "$class_id" ] && continue
+        printf '%s\n' "$configured_ids" | grep -Fqx "$class_id" || return 1
+    done <<< "$actual_ids"
+    while IFS= read -r class_id; do
+        [ -z "$class_id" ] && continue
+        printf '%s\n' "$configured_ids" | grep -Fqx "$class_id" || return 1
+    done <<< "$filter_ids"
+    while IFS= read -r class_id; do
+        [ -z "$class_id" ] && continue
+        printf '%s\n' "$actual_ids" | grep -Fqx "$class_id" || return 1
+        printf '%s\n' "$filter_ids" | grep -Fqx "$class_id" || return 1
+    done <<< "$configured_ids"
+}
+
+tc_root_is_recognized_dog_htb() {
+    local interface="$1"
+    dog_owner_marker_matches "$interface" &&
+        tc_root_is_htb_handle_one "$interface" &&
+        tc_root_has_default_30 "$interface" &&
+        tc_root_has_parent_class "$interface" &&
+        dog_live_objects_match_config "$interface"
+}
+
+tc_root_is_unified_compatible() {
+    local interface="$1"
+    tc_root_is_htb_handle_one "$interface" || return 1
+    tc_root_has_default_30 "$interface" || return 1
+    tc_root_has_parent_class "$interface" || return 1
+    tc_state_is_unified_for_interface "$interface" || tc_root_is_recognized_dog_htb "$interface"
+}
+
+dog_config_reserves_default_class() {
+    [ -f "$DOG_CONFIG_FILE" ] || return 1
+    command -v jq >/dev/null 2>&1 || return 0
+    jq -e '
+        [.ports // {} | to_entries[] |
+            select((.value.bandwidth_limit.class_id // "") == "1:30")] |
+        length > 0
+    ' "$DOG_CONFIG_FILE" >/dev/null 2>&1
+}
+
+tc_default_class_is_safe() {
+    local interface="$1"
+    local default_line
+
+    dog_config_reserves_default_class && return 1
+    default_line=$(tc_class_line "$interface" "1:30")
+    [ -z "$default_line" ] && return 0
+    printf '%s\n' "$default_line" | grep -Eq '^class htb 1:30 parent 1:1([[:space:]]|$)' &&
+        tc_class_rate_matches "$interface" "1:30" "$TC_DEFAULT_CLASS_RATE"
+}
+
+tc_has_other_consumers() {
+    local interface="$1"
+    local class_output filter_output
+
+    class_output=$("$TC_BIN" class show dev "$interface" 2>/dev/null || true)
+    if printf '%s\n' "$class_output" |
+        awk '$1 == "class" && $3 != "1:1" && $3 != "1:30" { found=1 } END { exit found ? 0 : 1 }'; then
+        return 0
+    fi
+    filter_output=$("$TC_BIN" filter show dev "$interface" parent 1:0 2>/dev/null || true)
+    [ -n "$filter_output" ]
+}
+
+tc_legacy_tbf_is_owned() {
+    local interface="$1"
+    local qdisc_line="$2"
+    local state_interface state_schema state_provider state_qdisc state_speed actual_rate
+
+    printf '%s\n' "$qdisc_line" | grep -q ' tbf ' || return 1
+    state_interface=$(tc_state_interface)
+    state_schema=$(tc_state_value SCHEMA)
+    state_provider=$(tc_state_value PROVIDER)
+    state_qdisc=$(tc_state_value QDISC_LINE)
+    state_speed=$(tc_state_value LIMIT_SPEED)
+    [ "$state_interface" = "$interface" ] || return 1
+    [ -z "$state_schema" ] || return 1
+    [ -z "$state_provider" ] || [ "$state_provider" = "$TC_STATE_PROVIDER" ] || return 1
+    [[ "$state_speed" =~ ^[1-9][0-9]*$ ]] || return 1
+    if [ -n "$state_qdisc" ]; then
+        [ "$qdisc_line" = "$state_qdisc" ] || return 1
+    fi
+    actual_rate=$(printf '%s\n' "$qdisc_line" |
+        awk '{ for (i = 1; i < NF; i++) if ($i == "rate") { print $(i + 1); exit } }')
+    [ "$(normalize_tc_rate_to_bps "$actual_rate" 2>/dev/null)" = "$((state_speed * 1000))" ]
+}
+
 current_boot_id() {
     cat /proc/sys/kernel/random/boot_id 2>/dev/null || true
 }
@@ -1360,6 +1619,8 @@ write_tc_state() {
     period_start=$(get_period_start_date)
     tmp_file="${state_file}.tmp.$$"
     {
+        printf 'SCHEMA=%s\n' "$TC_STATE_SCHEMA"
+        printf 'PROVIDER=%s\n' "$TC_STATE_PROVIDER"
         printf 'INTERFACE=%s\n' "$interface"
         printf 'LIMIT_SPEED=%s\n' "$speed"
         printf 'QDISC_LINE=%s\n' "$qdisc_line"
@@ -1371,123 +1632,175 @@ write_tc_state() {
     mv -f "$tmp_file" "$state_file" || { rm -f "$tmp_file"; return 1; }
 }
 
+tc_verify_unified_hierarchy() {
+    local interface="$1"
+    local parent_rate="$2"
+
+    tc_root_is_htb_handle_one "$interface" || return 1
+    tc_root_has_default_30 "$interface" || return 1
+    tc_root_has_parent_class "$interface" || return 1
+    tc_class_line "$interface" "1:30" |
+        grep -Eq '^class htb 1:30 parent 1:1([[:space:]]|$)' || return 1
+    tc_class_rate_matches "$interface" "1:1" "$parent_rate" "$parent_rate" || return 1
+    tc_class_rate_matches "$interface" "1:30" "$TC_DEFAULT_CLASS_RATE" "$parent_rate"
+}
+
+tc_replace_base_classes() {
+    local interface="$1"
+    local parent_rate="$2"
+
+    normalize_tc_rate_to_bps "$parent_rate" >/dev/null 2>&1 || return 1
+    tc_default_class_is_safe "$interface" || return 1
+    "$TC_BIN" class replace dev "$interface" parent 1: classid 1:1 htb \
+        rate "$parent_rate" ceil "$parent_rate" 2>/dev/null || return 1
+    "$TC_BIN" class replace dev "$interface" parent 1:1 classid 1:30 htb \
+        rate "$TC_DEFAULT_CLASS_RATE" ceil "$parent_rate" 2>/dev/null
+}
+
+tc_state_allows_boot_rebuild() {
+    local interface="$1"
+    local state_boot_id boot_id state_provider state_speed
+
+    [ "$(tc_state_interface)" = "$interface" ] || return 1
+    state_provider=$(tc_state_value PROVIDER)
+    [ -z "$state_provider" ] || [ "$state_provider" = "$TC_STATE_PROVIDER" ] || return 1
+    state_speed=$(tc_state_value LIMIT_SPEED)
+    [[ "$state_speed" =~ ^[1-9][0-9]*$ ]] || return 1
+    state_boot_id=$(tc_state_value BOOT_ID)
+    boot_id=$(current_boot_id)
+    [ -n "$state_boot_id" ] && [ -n "$boot_id" ] && [ "$state_boot_id" != "$boot_id" ]
+}
+
 apply_tc_limit() {
     local speed="$1"
-    local existing_qdisc state_interface state_qdisc_line state_speed state_boot_id boot_id new_qdisc
-    local previous_owned_speed=""
+    local existing_qdisc state_interface mode=""
     local prepared_state="${TC_STATE_FILE}.prepared.$$"
-    local rollback_ok=false
+    local old_parent_rate="" old_parent_ceil=""
+    local old_default_line="" old_default_rate="" old_default_ceil=""
+    local legacy_speed="" rollback_ok=false
 
-    if [ -z "$TC_BIN" ]; then
+    if [ -z "$TC_BIN" ] || ! [[ "$speed" =~ ^[1-9][0-9]*$ ]]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 未找到系统 tc 命令，无法执行限速" | tee -a "$LOG_FILE"
         return 1
     fi
 
-    existing_qdisc=$(tc_root_qdisc "$MAIN_INTERFACE")
-    state_interface=$(tc_state_interface)
+    if ! acquire_tc_hierarchy_lock; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 无法取得统一 TC 层级锁，未修改 qdisc。" | tee -a "$LOG_FILE"
+        return 1
+    fi
 
+    state_interface=$(tc_state_interface)
     if [ -n "$state_interface" ] && [ "$state_interface" != "$MAIN_INTERFACE" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') TC 状态文件属于接口 $state_interface，当前配置接口为 $MAIN_INTERFACE，将先清理旧接口限速。" | tee -a "$LOG_FILE"
-        if ! clear_owned_tc_rules "配置接口已变更"; then
+        if ! clear_owned_tc_rules_locked "配置接口已变更"; then
+            release_tc_hierarchy_lock
             return 1
         fi
-        existing_qdisc=$(tc_root_qdisc "$MAIN_INTERFACE")
         state_interface=""
     fi
 
-    if [ -n "$state_interface" ]; then
-        if echo "$existing_qdisc" | grep -q " tbf "; then
-            state_qdisc_line=$(tc_state_value "QDISC_LINE")
-            state_speed=$(tc_state_value "LIMIT_SPEED")
-            if [ -n "$state_qdisc_line" ] && [ "$existing_qdisc" != "$state_qdisc_line" ]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') 当前 tbf 与本脚本状态记录不一致，保留现有规则和状态标记并停止自动覆盖。" | tee -a "$LOG_FILE"
-                return 1
-            fi
-            if [ -z "$state_qdisc_line" ] && { ! [[ "$state_speed" =~ ^[0-9]+$ ]] || ! echo "$existing_qdisc" | grep -Eq "rate[[:space:]]+${state_speed}[Kk]bit"; }; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') 当前 tbf 与旧状态记录不一致，保留现有规则和状态标记并停止自动覆盖。" | tee -a "$LOG_FILE"
-                return 1
-            fi
-            if ! [[ "$state_speed" =~ ^[1-9][0-9]*$ ]]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') TC 状态记录缺少有效速率，保留现有规则并停止自动覆盖。" | tee -a "$LOG_FILE"
-                return 1
-            fi
-            previous_owned_speed="$state_speed"
-            if [ "$state_speed" = "$speed" ]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则保持生效" | tee -a "$LOG_FILE"
-                return 0
-            fi
-        else
-            state_boot_id=$(tc_state_value "BOOT_ID")
-            boot_id=$(current_boot_id)
-            if ! is_default_qdisc_line "$existing_qdisc" \
-                || { [ -n "$state_boot_id" ] && [ -n "$boot_id" ] && [ "$state_boot_id" = "$boot_id" ]; }; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') 本脚本应用限速后 qdisc 已被外部修改：$existing_qdisc，保留现有网络策略和状态标记并停止自动覆盖。" | tee -a "$LOG_FILE"
-                return 1
-            fi
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到系统已重启且本脚本旧 tbf 不再存在，将按当前周期重新应用限速。" | tee -a "$LOG_FILE"
+    existing_qdisc=$(tc_root_qdisc "$MAIN_INTERFACE")
+    if tc_root_is_unified_compatible "$MAIN_INTERFACE"; then
+        mode="existing"
+        if tc_state_is_unified_for_interface "$MAIN_INTERFACE" &&
+           [ "$(tc_state_value LIMIT_SPEED)" = "$speed" ] &&
+           tc_verify_unified_hierarchy "$MAIN_INTERFACE" "${speed}kbit"; then
+            release_tc_hierarchy_lock
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 统一 HTB 整机限速规则保持生效" | tee -a "$LOG_FILE"
+            return 0
         fi
-    else
-        if echo "$existing_qdisc" | grep -q " tbf "; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到接口 $MAIN_INTERFACE 已存在 tbf 规则且无本脚本状态标记，跳过限速以避免覆盖系统原有限速。" | tee -a "$LOG_FILE"
+        old_parent_rate=$(tc_class_value "$MAIN_INTERFACE" "1:1" rate)
+        old_parent_ceil=$(tc_class_value "$MAIN_INTERFACE" "1:1" ceil)
+        normalize_tc_rate_to_bps "$old_parent_rate" >/dev/null 2>&1 || mode=""
+        normalize_tc_rate_to_bps "$old_parent_ceil" >/dev/null 2>&1 || mode=""
+        old_default_line=$(tc_class_line "$MAIN_INTERFACE" "1:30")
+        if [ -n "$old_default_line" ]; then
+            old_default_rate=$(tc_class_value "$MAIN_INTERFACE" "1:30" rate)
+            old_default_ceil=$(tc_class_value "$MAIN_INTERFACE" "1:30" ceil)
+            normalize_tc_rate_to_bps "$old_default_rate" >/dev/null 2>&1 || mode=""
+            normalize_tc_rate_to_bps "$old_default_ceil" >/dev/null 2>&1 || mode=""
+        fi
+    elif tc_legacy_tbf_is_owned "$MAIN_INTERFACE" "$existing_qdisc"; then
+        mode="legacy-tbf"
+        legacy_speed=$(tc_state_value LIMIT_SPEED)
+    elif is_default_qdisc_line "$existing_qdisc"; then
+        if [ -f "$TC_STATE_FILE" ] && ! tc_state_allows_boot_rebuild "$MAIN_INTERFACE"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') TC 状态存在，但当前 root qdisc 在本次开机中已变化；为避免覆盖外部策略，已停止。" | tee -a "$LOG_FILE"
+            release_tc_hierarchy_lock
             return 1
         fi
-        if ! is_default_qdisc_line "$existing_qdisc"; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到接口 $MAIN_INTERFACE 已存在非默认 qdisc：$existing_qdisc，跳过限速以避免覆盖系统网络策略。" | tee -a "$LOG_FILE"
-            return 1
-        fi
+        mode="new"
+    fi
+
+    if [ -z "$mode" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到无法证明归属的 root qdisc：${existing_qdisc:-空}，未作修改。" | tee -a "$LOG_FILE"
+        release_tc_hierarchy_lock
+        return 1
     fi
 
     if ! write_tc_state "$MAIN_INTERFACE" "$speed" "" "$prepared_state"; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 无法预写 TC 归属状态，已拒绝修改系统 qdisc。" | tee -a "$LOG_FILE"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 无法预写统一 HTB 状态，已拒绝修改系统 qdisc。" | tee -a "$LOG_FILE"
+        release_tc_hierarchy_lock
         return 1
     fi
 
-    if "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root tbf rate "${speed}kbit" burst 32kbit latency 400ms; then
-        new_qdisc=$(tc_root_qdisc "$MAIN_INTERFACE")
-        if mv -f "$prepared_state" "$TC_STATE_FILE"; then
-            if ! write_tc_state "$MAIN_INTERFACE" "$speed" "$new_qdisc"; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') TC 精确状态更新失败，已保留预写的兼容归属状态。" | tee -a "$LOG_FILE"
-            fi
-            echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则已应用/更新" | tee -a "$LOG_FILE"
-            return 0
-        fi
-
-        echo "$(date '+%Y-%m-%d %H:%M:%S') TC 规则已修改但归属状态提交失败，正在回滚。" | tee -a "$LOG_FILE"
-        if [[ "$previous_owned_speed" =~ ^[1-9][0-9]*$ ]]; then
-            if "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root tbf rate "${previous_owned_speed}kbit" burst 32kbit latency 400ms 2>/dev/null; then
-                rollback_ok=true
-            fi
-        else
-            if "$TC_BIN" qdisc del dev "$MAIN_INTERFACE" root 2>/dev/null; then
-                rollback_ok=true
-            fi
-        fi
-        if ! $rollback_ok; then
-            new_qdisc=$(tc_root_qdisc "$MAIN_INTERFACE")
-            if [[ "$previous_owned_speed" =~ ^[1-9][0-9]*$ ]] \
-                && echo "$new_qdisc" | grep -Eq " tbf .*rate[[:space:]]+${previous_owned_speed}[Kk]bit"; then
-                rollback_ok=true
-            elif [ -z "$previous_owned_speed" ] && [ -n "$new_qdisc" ] && ! echo "$new_qdisc" | grep -q " tbf "; then
-                rollback_ok=true
-            fi
-        fi
-        if $rollback_ok; then
-            rm -f "$prepared_state"
-            echo "$(date '+%Y-%m-%d %H:%M:%S') TC 规则已回滚，原归属状态保持不变。" | tee -a "$LOG_FILE"
-        else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 严重错误：TC 回滚失败；预写状态保留在 $prepared_state，请立即检查 qdisc。" | tee -a "$LOG_FILE"
-        fi
+    if [ "$mode" != "existing" ] &&
+       ! "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root handle 1: htb default 30 2>/dev/null; then
+        rm -f "$prepared_state"
+        release_tc_hierarchy_lock
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 无法创建统一 HTB root qdisc。" | tee -a "$LOG_FILE"
         return 1
     fi
 
-    rm -f "$prepared_state"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') TC 限速规则应用失败，请检查接口或 tc 状态" | tee -a "$LOG_FILE"
+    if tc_replace_base_classes "$MAIN_INTERFACE" "${speed}kbit" &&
+       tc_verify_unified_hierarchy "$MAIN_INTERFACE" "${speed}kbit" &&
+       mv -f "$prepared_state" "$TC_STATE_FILE"; then
+        release_tc_hierarchy_lock
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 统一 HTB 整机限速已应用，现有端口子类保持不变。" | tee -a "$LOG_FILE"
+        return 0
+    fi
+
+    case "$mode" in
+        existing)
+            if "$TC_BIN" class replace dev "$MAIN_INTERFACE" parent 1: classid 1:1 htb \
+                    rate "$old_parent_rate" ceil "$old_parent_ceil" 2>/dev/null; then
+                if [ -n "$old_default_line" ]; then
+                    "$TC_BIN" class replace dev "$MAIN_INTERFACE" parent 1:1 classid 1:30 htb \
+                        rate "$old_default_rate" ceil "$old_default_ceil" 2>/dev/null && rollback_ok=true
+                else
+                    "$TC_BIN" class del dev "$MAIN_INTERFACE" classid 1:30 2>/dev/null || true
+                    rollback_ok=true
+                fi
+            fi
+            ;;
+        legacy-tbf)
+            if "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root tbf rate "${legacy_speed}kbit" \
+                burst 32kbit latency 400ms 2>/dev/null; then
+                rollback_ok=true
+            fi
+            ;;
+        new)
+            if "$TC_BIN" qdisc del dev "$MAIN_INTERFACE" root handle 1: 2>/dev/null ||
+               ! tc_root_is_htb_handle_one "$MAIN_INTERFACE"; then
+                rollback_ok=true
+            fi
+            ;;
+    esac
+
+    if $rollback_ok; then
+        rm -f "$prepared_state"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 统一 HTB 应用失败，已恢复修改前的 TC 状态。" | tee -a "$LOG_FILE"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 严重错误：统一 HTB 回滚失败；预写状态保留在 $prepared_state。" | tee -a "$LOG_FILE"
+    fi
+    release_tc_hierarchy_lock
     return 1
 }
 
-clear_owned_tc_rules() {
+clear_owned_tc_rules_locked() {
     local reason="$1"
-    local state_interface qdisc_line state_qdisc_line state_speed
+    local state_interface qdisc_line state_speed state_schema state_provider
+    local rollback_ok=false
 
     if [ ! -f "$TC_STATE_FILE" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：未发现本脚本 TC 状态标记，保留现有 qdisc。" | tee -a "$LOG_FILE"
@@ -1507,40 +1820,98 @@ clear_owned_tc_rules() {
     fi
 
     qdisc_line=$(tc_root_qdisc "$state_interface")
-    if echo "$qdisc_line" | grep -q " tbf "; then
-        state_qdisc_line=$(tc_state_value "QDISC_LINE")
-        state_speed=$(tc_state_value "LIMIT_SPEED")
-        if [ -n "$state_qdisc_line" ] && [ "$qdisc_line" != "$state_qdisc_line" ]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：当前 tbf 与本脚本状态记录不一致，保留现有规则并移除状态标记。" | tee -a "$LOG_FILE"
+    state_speed=$(tc_state_value LIMIT_SPEED)
+    state_schema=$(tc_state_value SCHEMA)
+    state_provider=$(tc_state_value PROVIDER)
+
+    if [ -z "$state_schema" ]; then
+        if is_default_qdisc_line "$qdisc_line" && tc_state_allows_boot_rebuild "$state_interface"; then
             rm -f "$TC_STATE_FILE"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：旧 TBF 已随重启消失，仅清理旧状态。" | tee -a "$LOG_FILE"
             return 0
         fi
-        if [ -z "$state_qdisc_line" ]; then
-            if ! echo "$state_speed" | grep -Eq '^[0-9]+$'; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：旧状态记录缺失限速速率，保留现有规则并移除状态标记。" | tee -a "$LOG_FILE"
-                rm -f "$TC_STATE_FILE"
-                return 0
-            fi
-            if ! echo "$qdisc_line" | grep -Eq "rate[[:space:]]+${state_speed}[Kk]bit"; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：当前 tbf 速率与旧状态记录不一致，保留现有规则并移除状态标记。" | tee -a "$LOG_FILE"
-                rm -f "$TC_STATE_FILE"
-                return 0
-            fi
+        if ! tc_legacy_tbf_is_owned "$state_interface" "$qdisc_line"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：旧 TBF 与状态记录不一致，保留规则和状态。" | tee -a "$LOG_FILE"
+            return 1
         fi
-        if "$TC_BIN" qdisc del dev "$state_interface" root 2>/dev/null; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：已清理本脚本在接口 $state_interface 上应用的 TC 限速。" | tee -a "$LOG_FILE"
-        else
-            qdisc_line=$(tc_root_qdisc "$state_interface")
-            if echo "$qdisc_line" | grep -q " tbf "; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：TC 限速清理失败，保留状态文件以便下次重试。" | tee -a "$LOG_FILE"
-                return 1
-            fi
-            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：接口已不存在 tbf 规则。" | tee -a "$LOG_FILE"
+        if ! "$TC_BIN" qdisc del dev "$state_interface" root 2>/dev/null; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：旧 TBF 清理失败，保留状态。" | tee -a "$LOG_FILE"
+            return 1
         fi
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：接口 $state_interface 当前没有 tbf 规则，仅移除本脚本状态文件。" | tee -a "$LOG_FILE"
+        if rm -f "$TC_STATE_FILE"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：已清理本脚本旧 TBF。" | tee -a "$LOG_FILE"
+            return 0
+        fi
+        "$TC_BIN" qdisc replace dev "$state_interface" root tbf rate "${state_speed}kbit" \
+            burst 32kbit latency 400ms 2>/dev/null || true
+        return 1
     fi
-    rm -f "$TC_STATE_FILE"
+
+    if [ "$state_schema" != "$TC_STATE_SCHEMA" ] || [ "$state_provider" != "$TC_STATE_PROVIDER" ] ||
+       ! [[ "$state_speed" =~ ^[1-9][0-9]*$ ]]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：TC 状态格式或归属无效，未修改 qdisc。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+
+    if is_default_qdisc_line "$qdisc_line"; then
+        rm -f "$TC_STATE_FILE"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB 已不存在，仅清理本脚本状态。" | tee -a "$LOG_FILE"
+        return 0
+    fi
+    if ! tc_root_is_unified_compatible "$state_interface" ||
+       ! tc_verify_unified_hierarchy "$state_interface" "${state_speed}kbit"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB 与本脚本状态不一致，保留规则和状态。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+
+    if tc_has_other_consumers "$state_interface"; then
+        if ! tc_replace_base_classes "$state_interface" "$TC_PARENT_RATE" ||
+           ! tc_verify_unified_hierarchy "$state_interface" "$TC_PARENT_RATE"; then
+            tc_replace_base_classes "$state_interface" "${state_speed}kbit" >/dev/null 2>&1 || true
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：无法撤销全局父限速，已尝试恢复。" | tee -a "$LOG_FILE"
+            return 1
+        fi
+        if rm -f "$TC_STATE_FILE"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：已撤销整机上限，现有端口子类和过滤器保持不变。" | tee -a "$LOG_FILE"
+            return 0
+        fi
+        tc_replace_base_classes "$state_interface" "${state_speed}kbit" >/dev/null 2>&1 && rollback_ok=true
+    else
+        if ! "$TC_BIN" qdisc del dev "$state_interface" root handle 1: 2>/dev/null &&
+           tc_root_is_htb_handle_one "$state_interface"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB root 清理失败，保留状态。" | tee -a "$LOG_FILE"
+            return 1
+        fi
+        if rm -f "$TC_STATE_FILE"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：已清理仅由 TrafficCop 使用的统一 HTB root。" | tee -a "$LOG_FILE"
+            return 0
+        fi
+        if "$TC_BIN" qdisc replace dev "$state_interface" root handle 1: htb default 30 2>/dev/null &&
+           tc_replace_base_classes "$state_interface" "${state_speed}kbit"; then
+            rollback_ok=true
+        fi
+    fi
+
+    if $rollback_ok; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：状态文件删除失败，已恢复原整机限速。" | tee -a "$LOG_FILE"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：状态文件删除失败且 TC 回滚失败，请立即检查。" | tee -a "$LOG_FILE"
+    fi
+    return 1
+}
+
+clear_owned_tc_rules() {
+    local reason="$1"
+    local result
+
+    if ! acquire_tc_hierarchy_lock; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：无法取得统一 TC 层级锁。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+    clear_owned_tc_rules_locked "$reason"
+    result=$?
+    release_tc_hierarchy_lock
+    return "$result"
 }
 
 write_usage_state() {
@@ -1660,21 +2031,22 @@ enforcement_guard_active() {
 }
 
 owned_tc_limit_active() {
-    local state_interface qdisc_line state_qdisc_line state_speed
+    local state_interface qdisc_line state_speed state_provider state_schema
 
     [ -f "$TC_STATE_FILE" ] || return 1
     state_interface=$(tc_state_interface)
     [ "$state_interface" = "$MAIN_INTERFACE" ] || return 1
+    state_provider=$(tc_state_value PROVIDER)
+    state_schema=$(tc_state_value SCHEMA)
+    state_speed=$(tc_state_value LIMIT_SPEED)
+    [[ "$state_speed" =~ ^[1-9][0-9]*$ ]] || return 1
     qdisc_line=$(tc_root_qdisc "$state_interface")
-    echo "$qdisc_line" | grep -q " tbf " || return 1
-    state_qdisc_line=$(tc_state_value "QDISC_LINE")
-    state_speed=$(tc_state_value "LIMIT_SPEED")
-    if [ -n "$state_qdisc_line" ]; then
-        [ "$qdisc_line" = "$state_qdisc_line" ]
-    else
-        [[ "$state_speed" =~ ^[0-9]+$ ]] \
-            && echo "$qdisc_line" | grep -Eq "rate[[:space:]]+${state_speed}[Kk]bit"
+    if [ "$state_schema" = "$TC_STATE_SCHEMA" ] && [ "$state_provider" = "$TC_STATE_PROVIDER" ]; then
+        tc_root_is_unified_compatible "$state_interface" &&
+            tc_verify_unified_hierarchy "$state_interface" "${state_speed}kbit"
+        return $?
     fi
+    tc_legacy_tbf_is_owned "$state_interface" "$qdisc_line"
 }
 
 TC_BOOT_GRACE_REMAINING=0
@@ -1822,10 +2194,103 @@ check_reset_limit() {
     return 0
 }
 
+resolve_tc_self_check_interface() {
+    local requested_interface="${1:-}"
+    local configured_interface="" state_interface="" detected_interface=""
+
+    if [ -n "$requested_interface" ]; then
+        printf '%s\n' "$requested_interface"
+        return 0
+    fi
+    configured_interface=$(grep '^MAIN_INTERFACE=' "$CONFIG_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-)
+    state_interface=$(tc_state_interface)
+    if [ -n "$configured_interface" ] && [ -n "$state_interface" ] &&
+       [ "$configured_interface" != "$state_interface" ]; then
+        return 1
+    fi
+    if [ -n "$configured_interface" ]; then
+        printf '%s\n' "$configured_interface"
+        return 0
+    fi
+    if [ -n "$state_interface" ]; then
+        printf '%s\n' "$state_interface"
+        return 0
+    fi
+    detected_interface=$(ip route show default 2>/dev/null |
+        awk '{ for (i = 1; i <= NF; i++) if ($i == "dev" && (i + 1) <= NF) { print $(i + 1); exit } }')
+    [ -n "$detected_interface" ] || return 1
+    printf '%s\n' "$detected_interface"
+}
+
+tc_self_check() {
+    local interface qdisc_line state_speed result=1
+
+    if [ -z "$TC_BIN" ]; then
+        echo "TC_SELF_CHECK=ERROR REASON=tc-not-found"
+        return 1
+    fi
+    if ! interface=$(resolve_tc_self_check_interface "${1:-}") ||
+       ! [[ "$interface" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+        echo "TC_SELF_CHECK=ERROR REASON=interface-unresolved"
+        return 1
+    fi
+    if ! acquire_tc_hierarchy_lock; then
+        echo "TC_SELF_CHECK=ERROR INTERFACE=$interface REASON=lock-timeout"
+        return 1
+    fi
+
+    qdisc_line=$(tc_root_qdisc "$interface")
+    if is_default_qdisc_line "$qdisc_line"; then
+        if [ -f "$TC_STATE_FILE" ]; then
+            echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=state-without-unified-htb"
+        else
+            echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=absent"
+            result=0
+        fi
+    elif printf '%s\n' "$qdisc_line" | grep -q ' tbf '; then
+        if tc_legacy_tbf_is_owned "$interface" "$qdisc_line"; then
+            echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=legacy-trafficcop-tbf ACTION=migrate-on-next-apply"
+            result=0
+        else
+            echo "TC_SELF_CHECK=CONFLICT INTERFACE=$interface REASON=foreign-tbf"
+        fi
+    elif tc_root_is_unified_compatible "$interface"; then
+        if ! tc_default_class_is_safe "$interface"; then
+            echo "TC_SELF_CHECK=CONFLICT INTERFACE=$interface REASON=reserved-class-1:30"
+        elif tc_state_is_unified_for_interface "$interface"; then
+            state_speed=$(tc_state_value LIMIT_SPEED)
+            if [[ "$state_speed" =~ ^[1-9][0-9]*$ ]] &&
+               tc_verify_unified_hierarchy "$interface" "${state_speed}kbit"; then
+                echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=$TC_STATE_SCHEMA OWNER=trafficcop-lite"
+                result=0
+            else
+                echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=trafficcop-parent-mismatch"
+            fi
+        elif tc_class_line "$interface" "1:30" >/dev/null &&
+             [ -n "$(tc_class_line "$interface" "1:30")" ]; then
+            echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=$TC_STATE_SCHEMA OWNER=port-traffic-dog"
+            result=0
+        else
+            echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=legacy-dog-htb ACTION=add-default-class-on-next-apply"
+            result=0
+        fi
+    else
+        echo "TC_SELF_CHECK=CONFLICT INTERFACE=$interface REASON=foreign-root-qdisc"
+    fi
+
+    release_tc_hierarchy_lock
+    return "$result"
+}
+
 setup_crontab() {
     local current_crontab new_crontab cron_entry
 
+    if ! acquire_root_crontab_lock; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 无法取得 TrafficCop-Lite crontab 锁" | tee -a "$LOG_FILE"
+        return 1
+    fi
     if ! current_crontab="$(read_current_crontab)"; then
+        release_root_crontab_lock
         return 1
     fi
     new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
@@ -1833,15 +2298,28 @@ setup_crontab() {
 
     if ! { printf '%s\n' "$new_crontab"; printf '%s\n' "$cron_entry"; } | sed '/^[[:space:]]*$/d' | crontab -; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') Crontab 设置失败" | tee -a "$LOG_FILE"
+        release_root_crontab_lock
         return 1
     fi
 
+    release_root_crontab_lock
     echo "$(date '+%Y-%m-%d %H:%M:%S') Crontab 已设置，每分钟运行一次"| tee -a "$LOG_FILE"
 }
 
 
 # 主函数
 main() {
+    case "${1:-}" in
+        --self-check|--tc-self-check)
+            tc_self_check "${2:-}"
+            return $?
+            ;;
+        --tc-clear-owned)
+            clear_owned_tc_rules "${2:-手动清理}"
+            return $?
+            ;;
+    esac
+
     # 在脚本开始时调用迁移函数
     migrate_files
 

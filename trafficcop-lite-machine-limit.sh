@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# TrafficCop 机器限速管理脚本 v2.6
+# TrafficCop 机器限速管理脚本 v2.7
 # 提供完整的启用/禁用/恢复机器限速功能
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -11,6 +11,9 @@ TC_STATE_FILE="$WORK_DIR/tc_limit_state"
 ENFORCEMENT_STATE_FILE="$WORK_DIR/enforcement_state"
 SHUTDOWN_STATE_FILE="$WORK_DIR/shutdown_limit_state"
 MONITOR_LOCK_FILE="$WORK_DIR/traffic_monitor.lock"
+ROOT_CRONTAB_LOCK_FILE="${TRAFFICCOP_ROOT_CRONTAB_LOCK_FILE:-$WORK_DIR/root-crontab.lock}"
+TC_STATE_SCHEMA="traffic-tools-unified-htb-v1"
+TC_STATE_PROVIDER="trafficcop-lite"
 CRON_COMMENT="# TrafficCop-Lite Monitor"
 
 find_tc_bin() {
@@ -45,6 +48,30 @@ read_current_crontab() {
     echo "读取当前 crontab 失败：$(cat "$error_file" 2>/dev/null)" >&2
     rm -f "$error_file"
     return 1
+}
+
+acquire_root_crontab_lock() {
+    mkdir -p "$(dirname "$ROOT_CRONTAB_LOCK_FILE")" || return 1
+    exec 7>"$ROOT_CRONTAB_LOCK_FILE" || return 1
+    if ! flock -w 15 7; then
+        exec 7>&-
+        return 1
+    fi
+}
+
+release_root_crontab_lock() {
+    flock -u 7 2>/dev/null || true
+    exec 7>&-
+}
+
+read_root_crontab_locked() {
+    local current_crontab="" status=0
+
+    acquire_root_crontab_lock || return 1
+    current_crontab=$(read_current_crontab) || status=$?
+    release_root_crontab_lock
+    [ "$status" -eq 0 ] || return "$status"
+    printf '%s\n' "$current_crontab"
 }
 
 tc_state_value() {
@@ -152,65 +179,15 @@ get_main_interface() {
 
 # 清除TC限速规则
 clear_tc_rules() {
-    local interface state_interface qdisc_line state_qdisc_line state_speed
-
-    interface=$(get_main_interface)
-    if [ -z "$TC_BIN" ]; then
-        echo "未找到系统 tc 命令，跳过TC规则清理"
-        [ -f "$TC_STATE_FILE" ] && return 1
+    if [ ! -f "$TC_STATE_FILE" ]; then
+        echo "✓ 未发现本脚本拥有的 TC 限速状态"
         return 0
     fi
-
-    if [ -f "$TC_STATE_FILE" ]; then
-        state_interface="$(tc_state_value "INTERFACE")"
-        if [ -z "$state_interface" ]; then
-            rm -f "$TC_STATE_FILE"
-            echo "✓ TC状态文件无效，已清理状态文件"
-            return
-        fi
-
-        qdisc_line="$(tc_root_qdisc "$state_interface")"
-        if echo "$qdisc_line" | grep -q " tbf "; then
-            state_qdisc_line="$(tc_state_value "QDISC_LINE")"
-            state_speed="$(tc_state_value "LIMIT_SPEED")"
-            if [ -n "$state_qdisc_line" ] && [ "$qdisc_line" != "$state_qdisc_line" ]; then
-                echo "检测到当前 tbf 与本脚本状态记录不一致，已保留现有规则并清理状态标记。"
-                rm -f "$TC_STATE_FILE"
-                return
-            fi
-            if [ -z "$state_qdisc_line" ]; then
-                if ! echo "$state_speed" | grep -Eq '^[0-9]+$'; then
-                    echo "检测到旧状态记录缺失限速速率，已保留现有规则并清理状态标记。"
-                    rm -f "$TC_STATE_FILE"
-                    return
-                fi
-                if ! echo "$qdisc_line" | grep -Eq "rate[[:space:]]+${state_speed}[Kk]bit"; then
-                    echo "检测到当前 tbf 速率与旧状态记录不一致，已保留现有规则并清理状态标记。"
-                    rm -f "$TC_STATE_FILE"
-                    return
-                fi
-            fi
-            echo "清除本脚本在网络接口 $state_interface 上应用的TC限速规则..."
-            if "$TC_BIN" qdisc del dev "$state_interface" root 2>/dev/null; then
-                echo "✓ 本脚本TC限速规则已清除"
-            else
-                qdisc_line="$(tc_root_qdisc "$state_interface")"
-                if echo "$qdisc_line" | grep -q " tbf "; then
-                    echo "✗ TC限速规则清除失败，已保留状态文件以便重试"
-                    return 1
-                fi
-                echo "✓ 接口已不存在 tbf 限速规则"
-            fi
-        else
-            echo "✓ 接口 $state_interface 当前没有 tbf 限速规则"
-        fi
-        rm -f "$TC_STATE_FILE"
-    elif [ -n "$interface" ] && "$TC_BIN" qdisc show dev "$interface" root 2>/dev/null | grep -q " tbf "; then
-        echo "检测到网络接口 $interface 存在 tbf 规则，但没有本脚本状态标记。"
-        echo "为避免误删系统原有限速，已保留该 TC 规则。"
-    else
-        echo "✓ 未发现需要清除的TC限速规则"
+    if [ ! -f "$SCRIPT_PATH" ]; then
+        echo "找不到 TrafficCop 监控脚本，无法安全清理统一 HTB。"
+        return 1
     fi
+    bash "$SCRIPT_PATH" --tc-clear-owned "机器限速管理"
 }
 
 # 停止监控进程
@@ -257,16 +234,23 @@ remove_cron_job() {
 
     echo "移除定时任务..."
 
+    if ! acquire_root_crontab_lock; then
+        echo "✗ 无法取得 TrafficCop-Lite crontab 锁，未作修改"
+        return 1
+    fi
     if ! current_crontab="$(read_current_crontab)"; then
         echo "✗ 读取当前定时任务失败，未作修改"
+        release_root_crontab_lock
         return 1
     fi
     new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
     if ! printf '%s\n' "$new_crontab" | crontab - 2>/dev/null; then
         echo "✗ 定时任务移除失败"
+        release_root_crontab_lock
         return 1
     fi
 
+    release_root_crontab_lock
     echo "✓ 定时任务已移除"
 }
 
@@ -276,17 +260,24 @@ add_cron_job() {
 
     echo "添加定时任务..."
 
+    if ! acquire_root_crontab_lock; then
+        echo "✗ 无法取得 TrafficCop-Lite crontab 锁，未作修改"
+        return 1
+    fi
     if ! current_crontab="$(read_current_crontab)"; then
         echo "✗ 读取当前定时任务失败，未作修改"
+        release_root_crontab_lock
         return 1
     fi
     new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
     cron_entry="* * * * * $SCRIPT_PATH --run >/dev/null 2>&1 $CRON_COMMENT"
     if ! { printf '%s\n' "$new_crontab"; printf '%s\n' "$cron_entry"; } | sed '/^[[:space:]]*$/d' | crontab -; then
         echo "✗ 定时任务添加失败"
+        release_root_crontab_lock
         return 1
     fi
 
+    release_root_crontab_lock
     echo "✓ 定时任务已添加"
 }
 
@@ -643,23 +634,34 @@ show_status() {
     fi
     
     # 检查定时任务
-    if crontab -l 2>/dev/null | grep -F -q "$SCRIPT_PATH"; then
+    if read_root_crontab_locked 2>/dev/null | grep -F -q "$SCRIPT_PATH"; then
         echo -e "定时任务: ${GREEN}已设置${NC}"
     else
         echo -e "定时任务: ${RED}未设置${NC}"
     fi
     
     # 检查TC规则
-    local interface state_interface qdisc_line state_qdisc_line state_speed
+    local interface state_interface qdisc_line state_qdisc_line state_speed state_schema state_provider class_output
     interface=$(get_main_interface)
     state_interface="$(tc_state_value "INTERFACE")"
     if [ -z "$TC_BIN" ]; then
         echo -e "TC限速: ${YELLOW}无法检测（未找到 tc）${NC}"
     elif [ -n "$state_interface" ]; then
         qdisc_line="$(tc_root_qdisc "$state_interface")"
-        if echo "$qdisc_line" | grep -q " tbf "; then
+        state_schema="$(tc_state_value SCHEMA)"
+        state_provider="$(tc_state_value PROVIDER)"
+        state_speed="$(tc_state_value LIMIT_SPEED)"
+        if [ "$state_schema" = "$TC_STATE_SCHEMA" ] && [ "$state_provider" = "$TC_STATE_PROVIDER" ]; then
+            class_output="$("$TC_BIN" class show dev "$state_interface" 2>/dev/null || true)"
+            if echo "$qdisc_line" | grep -Eq '^qdisc htb 1:([[:space:]]|$)' &&
+               printf '%s\n' "$class_output" | grep -Eq '^class htb 1:1([[:space:]]|$)' &&
+               printf '%s\n' "$class_output" | grep -Eq '^class htb 1:30([[:space:]]|$)'; then
+                echo -e "TC限速: ${YELLOW}统一 HTB 已激活（整机 ${state_speed} kbit/s）${NC}"
+            else
+                echo -e "TC限速: ${YELLOW}统一 HTB 状态与当前层级不一致，请运行 ntc --tc-self-check${NC}"
+            fi
+        elif echo "$qdisc_line" | grep -q " tbf "; then
             state_qdisc_line="$(tc_state_value "QDISC_LINE")"
-            state_speed="$(tc_state_value "LIMIT_SPEED")"
             if { [ -n "$state_qdisc_line" ] && [ "$qdisc_line" = "$state_qdisc_line" ]; } \
                 || { [ -z "$state_qdisc_line" ] && [[ "$state_speed" =~ ^[0-9]+$ ]] && echo "$qdisc_line" | grep -Eq "rate[[:space:]]+${state_speed}[Kk]bit"; }; then
                 echo -e "TC限速: ${YELLOW}已激活（本脚本）${NC}"
@@ -675,6 +677,8 @@ show_status() {
         qdisc_line="$(tc_root_qdisc "$interface")"
         if echo "$qdisc_line" | grep -q " tbf "; then
             echo -e "TC限速: ${YELLOW}检测到外部 tbf（非本脚本）${NC}"
+        elif echo "$qdisc_line" | grep -Eq '^qdisc htb 1:([[:space:]]|$)'; then
+            echo -e "TC限速: ${GREEN}检测到统一 HTB，TrafficCop 当前未施加整机上限${NC}"
         else
             echo -e "TC限速: ${GREEN}未激活${NC}"
         fi
@@ -710,7 +714,7 @@ show_detailed_status() {
     
     # 检查定时任务详情
     echo -e "${CYAN}定时任务详情:${NC}"
-    crontab -l 2>/dev/null | grep -v "^#" | grep -F "$WORK_DIR" || echo "无相关定时任务"
+    read_root_crontab_locked 2>/dev/null | grep -v "^#" | grep -F "$WORK_DIR" || echo "无相关定时任务"
     echo ""
     
     # 检查最近的日志

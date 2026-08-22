@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.1.6"
-LAST_UPDATE="2026-08-20"
+SCRIPT_VERSION="1.1.7"
+LAST_UPDATE="2026-08-22"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
@@ -14,6 +14,7 @@ TC_STATE_FILE="$WORK_DIR/tc_limit_state"
 ENFORCEMENT_STATE_FILE="$WORK_DIR/enforcement_state"
 SHUTDOWN_STATE_FILE="$WORK_DIR/shutdown_limit_state"
 MONITOR_LOCK_FILE="$WORK_DIR/traffic_monitor.lock"
+ROOT_CRONTAB_LOCK_FILE="${TRAFFICCOP_ROOT_CRONTAB_LOCK_FILE:-$WORK_DIR/root-crontab.lock}"
 SHORTCUT_PATH="/usr/local/bin/ntc"
 LEGACY_NCL_SHORTCUT_PATH="/usr/local/bin/ncl"
 LEGACY_TC_SHORTCUT_PATH="/usr/local/bin/tc"
@@ -57,6 +58,22 @@ pause() {
     read -r -p "按回车键继续..."
 }
 
+run_tc_self_check() {
+    local interface="${1:-}"
+    local monitor_path="$WORK_DIR/$MONITOR_SCRIPT"
+
+    [ -f "$monitor_path" ] || monitor_path="$SCRIPT_DIR/$MONITOR_SCRIPT"
+    if [ ! -f "$monitor_path" ]; then
+        echo -e "${RED}找不到 $MONITOR_SCRIPT，无法执行 TC 自检。${NC}"
+        return 1
+    fi
+    if [ -n "$interface" ]; then
+        bash "$monitor_path" --tc-self-check "$interface"
+    else
+        bash "$monitor_path" --tc-self-check
+    fi
+}
+
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
         echo -e "${RED}请使用 root 权限运行此脚本。${NC}"
@@ -97,6 +114,30 @@ read_current_crontab() {
     echo -e "${RED}读取当前 crontab 失败，已中止操作：$(cat "$error_file" 2>/dev/null)${NC}" >&2
     rm -f "$error_file"
     return 1
+}
+
+acquire_root_crontab_lock() {
+    mkdir -p "$(dirname "$ROOT_CRONTAB_LOCK_FILE")" || return 1
+    exec 7>"$ROOT_CRONTAB_LOCK_FILE" || return 1
+    if ! flock -w 15 7; then
+        exec 7>&-
+        return 1
+    fi
+}
+
+release_root_crontab_lock() {
+    flock -u 7 2>/dev/null || true
+    exec 7>&-
+}
+
+read_root_crontab_locked() {
+    local current_crontab="" status=0
+
+    acquire_root_crontab_lock || return 1
+    current_crontab=$(read_current_crontab) || status=$?
+    release_root_crontab_lock
+    [ "$status" -eq 0 ] || return "$status"
+    printf '%s\n' "$current_crontab"
 }
 
 script_version_from_file() {
@@ -557,11 +598,13 @@ show_status_line() {
     local monitor_cron="未设置"
     local telegram_cron="未设置"
     local config_state="未配置"
+    local root_crontab=""
 
-    if crontab -l 2>/dev/null | grep -F -q "$WORK_DIR/$MONITOR_SCRIPT"; then
+    root_crontab=$(read_root_crontab_locked 2>/dev/null || true)
+    if printf '%s\n' "$root_crontab" | grep -F -q "$WORK_DIR/$MONITOR_SCRIPT"; then
         monitor_cron="已设置"
     fi
-    if crontab -l 2>/dev/null | grep -F -q "$WORK_DIR/$TELEGRAM_SCRIPT"; then
+    if printf '%s\n' "$root_crontab" | grep -F -q "$WORK_DIR/$TELEGRAM_SCRIPT"; then
         telegram_cron="已设置"
     fi
     if [ -f "$WORK_DIR/traffic_monitor_config.txt" ]; then
@@ -1098,7 +1141,7 @@ view_logs() {
             2) tail_file "$WORK_DIR/tg_notifier_cron.log" "Telegram 通知日志"; pause ;;
             3)
                 echo -e "${CYAN}TrafficCop-Lite 定时任务:${NC}"
-                crontab -l 2>/dev/null | grep -F "$WORK_DIR" || echo "无相关定时任务"
+                read_root_crontab_locked 2>/dev/null | grep -F "$WORK_DIR" || echo "无相关定时任务"
                 pause
                 ;;
             0) return ;;
@@ -1146,7 +1189,12 @@ view_config() {
 
 remove_lite_cron() {
     local current_crontab filtered_crontab
+    if ! acquire_root_crontab_lock; then
+        echo -e "${RED}无法取得 TrafficCop-Lite crontab 锁，未作修改。${NC}"
+        return 1
+    fi
     if ! current_crontab="$(read_current_crontab)"; then
+        release_root_crontab_lock
         return 1
     fi
     if [ -n "$current_crontab" ]; then
@@ -1155,9 +1203,11 @@ remove_lite_cron() {
             | grep -v -F "$WORK_DIR/$TELEGRAM_SCRIPT" || true)"
         if ! printf '%s\n' "$filtered_crontab" | crontab - 2>/dev/null; then
             echo -e "${RED}移除独立版 crontab 条目失败，已保留安装目录。${NC}"
+            release_root_crontab_lock
             return 1
         fi
     fi
+    release_root_crontab_lock
     return 0
 }
 
@@ -1183,93 +1233,26 @@ release_monitor_cleanup_lock() {
 
 clear_lite_tc_rules_interactive() {
     local config="$WORK_DIR/traffic_monitor_config.txt"
-    local interface=""
     local limit_mode=""
-    local state_interface=""
-    local qdisc_line=""
-    local state_qdisc_line=""
-    local state_speed=""
+    local monitor_path="$WORK_DIR/$MONITOR_SCRIPT"
 
     if [ -f "$config" ]; then
-        interface="$(grep '^MAIN_INTERFACE=' "$config" | tail -1 | cut -d'=' -f2-)"
         limit_mode="$(grep '^LIMIT_MODE=' "$config" | tail -1 | cut -d'=' -f2-)"
     fi
 
-    if { [ "$limit_mode" != "tc" ] || [ -z "$interface" ]; } && [ ! -f "$TC_STATE_FILE" ]; then
+    if [ "$limit_mode" != "tc" ] && [ ! -f "$TC_STATE_FILE" ]; then
         echo "✓ 未检测到独立版 TC 限速配置"
         return
     fi
 
-    if [ -z "$TC_BIN" ]; then
-        echo -e "${YELLOW}未找到系统 tc 命令，跳过 TC 规则检查。${NC}"
-        [ -f "$TC_STATE_FILE" ] && return 1
-        return 0
+    if [ ! -f "$monitor_path" ]; then
+        monitor_path="$SCRIPT_DIR/$MONITOR_SCRIPT"
     fi
-
-    if [ -f "$TC_STATE_FILE" ]; then
-        state_interface="$(grep '^INTERFACE=' "$TC_STATE_FILE" 2>/dev/null | tail -1 | cut -d'=' -f2-)"
-        if [ -z "$state_interface" ]; then
-            rm -f "$TC_STATE_FILE"
-            echo "✓ 已清理无效 TC 状态文件"
-            return
-        fi
-
-        qdisc_line="$("$TC_BIN" qdisc show dev "$state_interface" root 2>/dev/null | head -n 1)"
-        if echo "$qdisc_line" | grep -q " tbf "; then
-            state_qdisc_line="$(grep '^QDISC_LINE=' "$TC_STATE_FILE" 2>/dev/null | tail -1 | cut -d'=' -f2-)"
-            state_speed="$(grep '^LIMIT_SPEED=' "$TC_STATE_FILE" 2>/dev/null | tail -1 | cut -d'=' -f2-)"
-            if [ -n "$state_qdisc_line" ] && [ "$qdisc_line" != "$state_qdisc_line" ]; then
-                echo "检测到当前 tbf 与本脚本状态记录不一致，已保留现有规则并清理状态标记。"
-                rm -f "$TC_STATE_FILE"
-                return
-            fi
-            if [ -z "$state_qdisc_line" ]; then
-                if ! echo "$state_speed" | grep -Eq '^[0-9]+$'; then
-                    echo "检测到旧状态记录缺失限速速率，已保留现有规则并清理状态标记。"
-                    rm -f "$TC_STATE_FILE"
-                    return
-                fi
-                if ! echo "$qdisc_line" | grep -Eq "rate[[:space:]]+${state_speed}[Kk]bit"; then
-                    echo "检测到当前 tbf 速率与旧状态记录不一致，已保留现有规则并清理状态标记。"
-                    rm -f "$TC_STATE_FILE"
-                    return
-                fi
-            fi
-            if "$TC_BIN" qdisc del dev "$state_interface" root 2>/dev/null; then
-                echo "✓ 已清理本脚本在接口 $state_interface 上应用的 TC 限速"
-            else
-                qdisc_line="$("$TC_BIN" qdisc show dev "$state_interface" root 2>/dev/null | head -n 1)"
-                if echo "$qdisc_line" | grep -q " tbf "; then
-                    echo -e "${RED}清理接口 $state_interface 的 TC 限速失败，已保留状态文件以便重试。${NC}"
-                    return 1
-                fi
-                echo "✓ 接口 $state_interface 已不存在 tbf 规则"
-            fi
-        else
-            echo "✓ 接口 $state_interface 当前没有本脚本可清理的 tbf 规则"
-        fi
-        rm -f "$TC_STATE_FILE"
-        return
+    if [ ! -f "$monitor_path" ]; then
+        echo -e "${RED}找不到 TrafficCop 监控脚本，无法安全清理统一 HTB。${NC}"
+        return 1
     fi
-
-    if ! "$TC_BIN" qdisc show dev "$interface" 2>/dev/null | grep -q "tbf"; then
-        echo "✓ 接口 $interface 未发现 tbf 限速规则"
-        return
-    fi
-
-    echo -e "${YELLOW}检测到接口 $interface 上存在 tbf 限速规则。${NC}"
-    echo -e "${YELLOW}Linux 无法可靠区分该规则是否由本脚本创建，默认不清除以免影响系统其他限速。${NC}"
-    read -r -p "确认清除该接口 root TC 规则？[y/N]: " confirm
-    if [[ "$confirm" =~ ^[Yy]$ ]]; then
-        if "$TC_BIN" qdisc del dev "$interface" root 2>/dev/null; then
-            echo "✓ 已清除 TC 规则"
-        else
-            echo -e "${RED}清除 TC 规则失败，请检查接口和系统 tc 状态。${NC}"
-            return 1
-        fi
-    else
-        echo "已保留 TC 规则"
-    fi
+    bash "$monitor_path" --tc-clear-owned "停止或卸载 TrafficCop-Lite"
 }
 
 lite_has_pending_shutdown() {
@@ -1498,13 +1481,17 @@ main() {
             view_config
             exit 0
             ;;
+        --self-check|--tc-self-check)
+            run_tc_self_check "${2:-}"
+            exit $?
+            ;;
         --update)
             update_scripts "$RAW_BASE"
             exit $?
             ;;
         --help|-h)
             echo "TrafficCop Lite"
-            echo "用法: sudo ntc [--install|--update|--uninstall|--stop|--logs|--config]"
+            echo "用法: sudo ntc [--install|--update|--uninstall|--stop|--logs|--config|--self-check [INTERFACE]]"
             echo "无参数运行进入交互菜单。"
             exit 0
             ;;

@@ -28,7 +28,7 @@ TC_DEFAULT_CLASS_RATE="1kbit"
 DOG_CONFIG_FILE="/etc/port-traffic-dog/config.json"
 DOG_TC_OWNER_FILE="/etc/port-traffic-dog/tc-root-qdisc.owner"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.1.5"
+SCRIPT_VERSION="1.1.6"
 mkdir -p "$WORK_DIR"
 chmod 700 "$WORK_DIR" 2>/dev/null || true
 
@@ -1353,7 +1353,9 @@ get_traffic_usage() {
 }
 
 tc_root_qdisc() {
-    "$TC_BIN" qdisc show dev "$1" root 2>/dev/null | head -n 1
+    local qdisc_state
+    qdisc_state=$("$TC_BIN" qdisc show dev "$1" root 2>/dev/null) || return 1
+    awk 'NR == 1 { print }' <<< "$qdisc_state"
 }
 
 is_default_qdisc_line() {
@@ -1414,8 +1416,10 @@ normalize_tc_rate_to_bps() {
 tc_class_line() {
     local interface="$1"
     local class_id="$2"
-    "$TC_BIN" class show dev "$interface" 2>/dev/null |
-        awk -v class_id="$class_id" '$1 == "class" && $3 == class_id { print; exit }'
+    local class_state
+    class_state=$("$TC_BIN" class show dev "$interface" 2>/dev/null) || return 1
+    awk -v class_id="$class_id" '$1 == "class" && $3 == class_id { print; exit }' \
+        <<< "$class_state"
 }
 
 tc_class_value() {
@@ -2222,6 +2226,128 @@ resolve_tc_self_check_interface() {
     printf '%s\n' "$detected_interface"
 }
 
+# 这是显式接管入口；普通 cron 的 apply_tc_limit 仍会对外部 root fail-closed。
+# --auto 只恢复已有 NTC 状态，--manual 还允许在 TC 模式下清除首次发现的冲突。
+recover_owned_tc_hierarchy() {
+    local mode="${1:---manual}"
+    case "$mode" in
+        --auto|--manual) ;;
+        *)
+            echo "不支持的 TC 恢复模式: $mode" >&2
+            return 2
+            ;;
+    esac
+
+    [ -n "$TC_BIN" ] || {
+        echo "未找到系统 tc 命令，无法恢复。" >&2
+        return 1
+    }
+    [[ "${MAIN_INTERFACE:-}" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || {
+        echo "TrafficCop 配置中的网卡无效，拒绝修改 TC。" >&2
+        return 1
+    }
+
+    local state_expected=false
+    local state_interface=""
+    local state_schema=""
+    local state_provider=""
+    local state_speed=""
+    if [ -e "$TC_STATE_FILE" ]; then
+        state_interface=$(tc_state_interface)
+        state_schema=$(tc_state_value SCHEMA)
+        state_provider=$(tc_state_value PROVIDER)
+        state_speed=$(tc_state_value LIMIT_SPEED)
+        if [ "$state_interface" != "$MAIN_INTERFACE" ] ||
+           [ "$state_schema" != "$TC_STATE_SCHEMA" ] ||
+           [ "$state_provider" != "$TC_STATE_PROVIDER" ] ||
+           ! [[ "$state_speed" =~ ^[1-9][0-9]*$ ]]; then
+            echo "TrafficCop TC 状态文件无法安全解释，拒绝删除 qdisc。" >&2
+            return 1
+        fi
+        state_expected=true
+    fi
+
+    if [ "${DISABLED:-false}" = "true" ] && [ "$state_expected" = "false" ]; then
+        echo "TrafficCop 当前已禁用，没有需要恢复的 TC 规则。"
+        return 0
+    fi
+    if [ "${LIMIT_MODE:-}" != "tc" ] && [ "$state_expected" = "false" ]; then
+        echo "TrafficCop 当前不是 TC 限速模式，没有需要恢复的 TC 规则。"
+        return 0
+    fi
+    if [ "$mode" = "--auto" ] && [ "$state_expected" = "false" ]; then
+        echo "当前没有需要自动恢复的 TrafficCop TC 状态。"
+        return 0
+    fi
+
+    if ! acquire_tc_hierarchy_lock; then
+        echo "无法取得统一 TC 层级锁，未修改 qdisc。" >&2
+        return 1
+    fi
+
+    local qdisc_line
+    qdisc_line=$(tc_root_qdisc "$MAIN_INTERFACE")
+    if [ "$state_expected" = "true" ] &&
+       tc_root_is_unified_compatible "$MAIN_INTERFACE" &&
+       tc_verify_unified_hierarchy "$MAIN_INTERFACE" "${state_speed}kbit"; then
+        release_tc_hierarchy_lock
+        echo "Dog/NTC TC 规则完整，无需重建。"
+        return 0
+    fi
+
+    # Dog 已恢复统一层级但 NTC 状态尚未建立时，不删树，交给现有全局限速逻辑原地协调。
+    if [ "$state_expected" = "false" ] && tc_root_is_unified_compatible "$MAIN_INTERFACE"; then
+        release_tc_hierarchy_lock
+        check_and_limit_traffic
+        return $?
+    fi
+
+    # 其余情况下只要仍配置了 Dog 端口类，就必须由共享入口先恢复整棵树。
+    local dog_classes=""
+    dog_classes=$(dog_configured_class_ids 2>/dev/null || true)
+    if [ -n "$dog_classes" ]; then
+        release_tc_hierarchy_lock
+        echo "检测到 Dog 端口限速配置，请使用共享 traffic-tools-tc-recovery 服务恢复。" >&2
+        return 1
+    fi
+
+    local prepared_state="${TC_STATE_FILE}.recovery.$$"
+    if [ "$state_expected" = "true" ] &&
+       ! write_tc_state "$MAIN_INTERFACE" "$state_speed" "" "$prepared_state"; then
+        release_tc_hierarchy_lock
+        echo "无法预写 TrafficCop TC 恢复状态，未删除当前 qdisc。" >&2
+        return 1
+    fi
+
+    if ! is_default_qdisc_line "$qdisc_line" &&
+       ! "$TC_BIN" qdisc del dev "$MAIN_INTERFACE" root 2>/dev/null; then
+        rm -f "$prepared_state"
+        release_tc_hierarchy_lock
+        echo "无法删除当前冲突 root qdisc，TrafficCop 规则未重建。" >&2
+        return 1
+    fi
+    rm -f "$DOG_TC_OWNER_FILE"
+
+    if [ "$state_expected" = "true" ]; then
+        if "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root handle 1: htb default 30 2>/dev/null &&
+           tc_replace_base_classes "$MAIN_INTERFACE" "${state_speed}kbit" &&
+           tc_verify_unified_hierarchy "$MAIN_INTERFACE" "${state_speed}kbit" &&
+           mv -f "$prepared_state" "$TC_STATE_FILE"; then
+            release_tc_hierarchy_lock
+            echo "TrafficCop 统一 HTB 已按现有状态重建。"
+            return 0
+        fi
+        rm -f "$prepared_state"
+        release_tc_hierarchy_lock
+        echo "冲突 qdisc 已清除，但 TrafficCop 统一 HTB 未能完整重建。" >&2
+        return 1
+    fi
+
+    release_tc_hierarchy_lock
+    # 首次冲突没有旧状态时，删除完成后重新计算流量；只有确实超额才创建 NTC 层级。
+    check_and_limit_traffic
+}
+
 tc_self_check() {
     local interface qdisc_line state_speed state_schema result=1
 
@@ -2337,14 +2463,29 @@ main() {
     touch "${LOCK_FILE}"
     chmod 600 "$LOCK_FILE" 2>/dev/null || true
 
-    # 尝试获取文件锁。cron 模式拿不到锁直接退出，避免打断正在进行的交互配置。
+    # cron 模式拿不到锁直接退出；显式/开机恢复允许短暂等待正在结束的 cron，
+    # 避免两者恰好在开机同一分钟启动时让 recovery unit 偶发失败。
     exec 9>"${LOCK_FILE}"
-    if ! flock -n 9; then
+    if [ "${1:-}" = "--tc-recover-owned" ]; then
+        if ! flock -w 15 9; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 另一个脚本实例长时间占用监控锁，TC 恢复未执行。" | tee -a "$LOG_FILE"
+            exit 1
+        fi
+    elif ! flock -n 9; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 另一个脚本实例正在运行，退出。" | tee -a "$LOG_FILE"
         exit 1
     fi
     trap 'trim_log_file "$LOG_FILE" "$LOG_MAX_LINES"; flock -u 9 2>/dev/null || true' EXIT
     command_exists vnstat && align_timezone_with_vnstat
+
+    if [ "${1:-}" = "--tc-recover-owned" ]; then
+        if ! read_config; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置文件读取失败，未修改 TC。" | tee -a "$LOG_FILE"
+            return 1
+        fi
+        recover_owned_tc_hierarchy "${2:---manual}"
+        return $?
+    fi
 
     # 检查是否以 --run 模式运行
     if [ "$1" = "--run" ] || [ "$1" = "--cron" ]; then

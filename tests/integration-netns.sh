@@ -96,6 +96,7 @@ dog_action() {
         case "$action" in
             apply) apply_tc_limit "$port" "$rate" ;;
             remove) remove_tc_limit "$port" ;;
+            recover) recover_tc_runtime "$port" ;;
             *) exit 2 ;;
         esac
     ' "$DOG_SCRIPT" "$action" "$port" "$rate"
@@ -127,7 +128,8 @@ tc_root_has_default_30 eth0
 tc_class_rate_matches eth0 1:1 5mbit 5mbit
 tc_class_rate_matches eth0 1:30 1kbit 5mbit
 tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
-tc filter show dev eth0 parent 1:0 | grep -Eq "(flowid|classid)[[:space:]]+$dog_class_id([[:space:]]|$)"
+filter_state=$(tc filter show dev eth0 parent 1:0)
+grep -Eq "(flowid|classid)[[:space:]]+$dog_class_id([[:space:]]|$)" <<< "$filter_state"
 tc_self_check eth0 >/dev/null
 
 clear_owned_tc_rules "integration clear" >/dev/null
@@ -168,14 +170,43 @@ tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
 dog_action remove 3266
 ! tc_root_is_htb_handle_one eth0
 
-# 无法证明归属的 tcpfit 风格层级必须原样保留。
+# 普通限速继续拒绝外部层级；显式共享恢复则删除冲突并重建 Dog/NTC。
 tc qdisc replace dev eth0 root handle 1: htb default 10
 tc class replace dev eth0 parent 1: classid 1:10 htb rate 20mbit ceil 20mbit
 foreign_before="$(tc qdisc show dev eth0; tc class show dev eth0)"
 ! apply_tc_limit 2000 >/dev/null
 [ "$foreign_before" = "$(tc qdisc show dev eth0; tc class show dev eth0)" ]
 ! tc_self_check eth0 >/dev/null
+dog_action recover --auto
+tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
+
+# Dog 已先恢复、NTC 尚无活动状态时，NTC 手动恢复应在原树中协调而不是误报 Dog 冲突。
+LIMIT_MODE=tc
+ntc_recheck_called=false
+check_and_limit_traffic() { ntc_recheck_called=true; }
+recover_owned_tc_hierarchy --manual >/dev/null
+[ "$ntc_recheck_called" = "true" ]
+tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
+
+apply_tc_limit 2000 >/dev/null
+tc_class_rate_matches eth0 1:1 2mbit 2mbit
+tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
+
+# tcpfit 再次覆盖后，由 Dog 读取 NTC 权威状态并一次性恢复父类和端口子类。
 tc qdisc del dev eth0 root handle 1:
+tc qdisc add dev eth0 root handle 1: htb default 10
+tc class add dev eth0 parent 1: classid 1:10 htb rate 20mbit ceil 20mbit
+! tc_self_check eth0 >/dev/null
+dog_action recover --auto
+tc_class_rate_matches eth0 1:1 2mbit 2mbit
+tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
+tc_self_check eth0 >/dev/null
+recover_owned_tc_hierarchy --auto >/dev/null
+tc_self_check eth0 >/dev/null
+
+clear_owned_tc_rules "integration clear" >/dev/null
+dog_action remove 3266
+! tc_root_is_htb_handle_one eth0
 
 # Dog 迁移 NTC 旧 TBF 后，NTC 自检必须先报告漂移，再由 NTC 重建权威状态。
 tc qdisc replace dev eth0 root tbf rate 4mbit burst 32kbit latency 400ms
@@ -201,6 +232,21 @@ clear_owned_tc_rules "integration clear" >/dev/null
 [ ! -e "$TC_STATE_FILE" ]
 tc_root_is_htb_handle_one eth0
 dog_action remove 3266
+! tc_root_is_htb_handle_one eth0
+
+# 纯 NTC 的持久状态被外部 root 覆盖时，显式自动恢复入口可独立重建。
+jq '.ports = {}' "$DOG_TEST_CONFIG_FILE" > "$DOG_TEST_CONFIG_FILE.tmp"
+mv "$DOG_TEST_CONFIG_FILE.tmp" "$DOG_TEST_CONFIG_FILE"
+chmod 600 "$DOG_TEST_CONFIG_FILE"
+apply_tc_limit 4500 >/dev/null
+tc qdisc del dev eth0 root handle 1:
+tc qdisc add dev eth0 root handle 1: htb default 10
+tc class add dev eth0 parent 1: classid 1:10 htb rate 20mbit ceil 20mbit
+! tc_self_check eth0 >/dev/null
+recover_owned_tc_hierarchy --auto >/dev/null
+tc_class_rate_matches eth0 1:1 4500kbit 4500kbit
+tc_self_check eth0 >/dev/null
+clear_owned_tc_rules "integration clear" >/dev/null
 ! tc_root_is_htb_handle_one eth0
 
 echo "Dog/TrafficCop unified HTB integration tests passed"

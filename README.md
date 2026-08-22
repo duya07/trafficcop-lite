@@ -15,7 +15,7 @@
 ## 本仓库主要改动
 
 1. 独立工作目录改为 `/etc/trafficcop-lite`。
-2. 主菜单仅保留流量监控、Telegram 通知、机器限速、日志、配置、停止服务、更新和卸载。
+2. 主菜单保留流量监控、Telegram 通知、机器限速、日志、配置、停止服务、更新、卸载和 TC 冲突恢复管理。
 3. 年度统计周期支持选择起始月份，不再只能从每年 1 月开始。
 4. 安装后提供快捷命令 `ntc`，可直接执行 `sudo ntc` 打开管理菜单。
 5. 脚本内部调用系统限速命令时使用 `/usr/sbin/tc` 等原始路径，避免与 Linux 自带 `tc` 限速命令冲突。
@@ -37,7 +37,9 @@
 21. vnStat 保留期配置与覆盖起点标记同步提交，配置替换失败时会恢复旧标记。
 22. 取消计划关机前会核对 boot ID；重启后的陈旧标记不会取消本次开机由其他工具创建的关机任务。旧标记无法验证归属时会保留系统任务并停止自动清理。
 23. 所有 root crontab 读改写使用 TrafficCop Lite 自身的 `/etc/trafficcop-lite/root-crontab.lock`；它不依赖也不占用 Port Traffic Dog 的 cron 锁。
-24. TC 模式直接管理 `traffic-tools-unified-htb-v1`：`1:1` 实施整机上限，`1:30` 承接默认流量，并保留 Dog 的端口子类。TrafficCop Lite 可单独安装；检测到可验证的 Dog 层级时原地协调，不调用 Dog 程序，安装顺序不限。
+24. TC 模式直接管理 `traffic-tools-unified-htb-v1`：`1:1` 实施整机上限，`1:30` 承接默认流量，并保留 Dog 的端口子类。TrafficCop Lite 可单独安装；日常应用在可验证的 Dog 层级中原地协调，共享恢复入口在两者并存时按顺序调用两边的恢复接口，安装顺序不限。
+25. 主页只读显示 TC 状态；用户明确确认后，可删除冲突 root 并按 Dog/NTC 现有状态重建。第三方 TC 配置不会被识别、迁移或保留。
+26. Dog 与 NTC 共用唯一的 `traffic-tools-tc-recovery.service`。服务默认关闭；启用后通过 systemd 排在 `tcpfit.service` / `tcpfit-qdisc.service` 之后执行，不使用固定延迟，也不做运行期高频抢占。
 
 ## 下载方式说明
 
@@ -101,6 +103,7 @@ sudo ntc --stop
 sudo ntc --logs
 sudo ntc --config
 sudo ntc --self-check
+sudo ntc --recover-tc --manual
 sudo ntc --uninstall
 ```
 
@@ -110,6 +113,7 @@ sudo ntc --uninstall
 - `--logs`: 查看日志。
 - `--config`: 查看配置。
 - `--self-check [INTERFACE]`: 只读检查指定网卡（或自动识别网卡）的统一 HTB、状态归属与兼容性。
+- `--recover-tc --manual`: 显式调用共享恢复入口；它可能删除当前 root qdisc，通常应优先在主菜单 `9` 阅读提示并确认。
 - `--uninstall`: 卸载 TrafficCop Lite。
 
 主菜单入口:
@@ -123,6 +127,7 @@ sudo ntc --uninstall
 6) 停止所有服务
 7) 更新脚本
 8) 卸载 TrafficCop-Lite
+9) TC 冲突处理/自动恢复
 ```
 
 Telegram 管理菜单提供 `8. 开启/关闭自动通知`。关闭后会移除本项目的 Telegram 定时任务并保存关闭状态，但不会删除 Bot 配置，也不影响测试消息和手动发送；再次开启时会恢复唯一的每分钟检查任务。
@@ -283,7 +288,8 @@ sudo /usr/sbin/tc qdisc show
 - 脚本会安装依赖、写入 crontab，并可能配置 TC 限速或关机模式，请先在测试机确认。
 - TC 模式会用 `/etc/trafficcop-lite/tc_limit_state` 记录自身管理的整机上限。NTC 直接创建或更新统一 HTB；Dog 存在时保留其端口类和过滤器，不存在时也可独立工作。
 - NTC 与 Dog 各自使用自己的 root crontab 锁；只有修改同一内核 TC 层级时共用 `/run/lock/traffic-tools-tc.lock`。
-- tcpfit 当前会删除并重建 root qdisc，不能与统一 HTB 同时管理同一网卡。脚本会拒绝覆盖 tcpfit 或其他无法证明归属的配置；切换前请先停用对应服务，并运行 `sudo ntc --self-check`。
+- tcpfit 或其他工具重建 root qdisc 后，主页会报告外部/未知 TC 冲突，普通监控 cron 仍会拒绝覆盖。主菜单 `9` 可在明确确认后删除冲突并只重建 Dog/NTC；不会保留任何第三方规则。
+- 可选的 `traffic-tools-tc-recovery.service` 只负责开机阶段的最终执行顺序。运行期间手动重启 tcpfit 仍会覆盖 Dog/NTC，需要再次手动恢复；建议卸载或禁用其他 TC 管理服务。
 - `enforcement_state` 只记录临时宽限或暂停状态；`shutdown_limit_state` 只记录本脚本计划的流量关机及其 boot ID。
 - 若状态记录与当前 qdisc 不一致，脚本会按外部规则处理并停止自动覆盖。
 - 停止服务/卸载时，未标记的 TC 规则和计划关机会要求确认后才处理。

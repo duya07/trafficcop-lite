@@ -3,7 +3,7 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.1.7"
+SCRIPT_VERSION="1.1.8"
 LAST_UPDATE="2026-08-22"
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -15,6 +15,10 @@ ENFORCEMENT_STATE_FILE="$WORK_DIR/enforcement_state"
 SHUTDOWN_STATE_FILE="$WORK_DIR/shutdown_limit_state"
 MONITOR_LOCK_FILE="$WORK_DIR/traffic_monitor.lock"
 ROOT_CRONTAB_LOCK_FILE="${TRAFFICCOP_ROOT_CRONTAB_LOCK_FILE:-$WORK_DIR/root-crontab.lock}"
+TC_RECOVERY_RUNNER="${TRAFFIC_TOOLS_TC_RECOVERY_RUNNER:-/usr/local/sbin/traffic-tools-tc-recovery.sh}"
+TC_RECOVERY_UNIT_FILE="${TRAFFIC_TOOLS_TC_RECOVERY_UNIT_FILE:-/etc/systemd/system/traffic-tools-tc-recovery.service}"
+TC_RECOVERY_SERVICE="traffic-tools-tc-recovery.service"
+TC_RECOVERY_SYSTEMCTL="${TRAFFIC_TOOLS_SYSTEMCTL:-systemctl}"
 SHORTCUT_PATH="/usr/local/bin/ntc"
 LEGACY_NCL_SHORTCUT_PATH="/usr/local/bin/ncl"
 LEGACY_TC_SHORTCUT_PATH="/usr/local/bin/tc"
@@ -72,6 +76,130 @@ run_tc_self_check() {
     else
         bash "$monitor_path" --tc-self-check
     fi
+}
+
+# Dog 与 NTC 共用同一个恢复入口和同一个 systemd oneshot，避免两边各自抢 root。
+tc_recovery_systemd_available() {
+    command -v "$TC_RECOVERY_SYSTEMCTL" >/dev/null 2>&1 && [ -d /run/systemd/system ]
+}
+
+install_tc_recovery_service_files() {
+    local runner_dir unit_dir runner_tmp unit_tmp
+    runner_dir=$(dirname "$TC_RECOVERY_RUNNER")
+    unit_dir=$(dirname "$TC_RECOVERY_UNIT_FILE")
+    runner_tmp="${TC_RECOVERY_RUNNER}.tmp.$$"
+    unit_tmp="${TC_RECOVERY_UNIT_FILE}.tmp.$$"
+
+    if [ -e "$TC_RECOVERY_RUNNER" ] &&
+       ! grep -Fq '# traffic-tools-tc-recovery-v1' "$TC_RECOVERY_RUNNER" 2>/dev/null; then
+        echo "共享 TC 恢复入口已被其他文件占用: $TC_RECOVERY_RUNNER" >&2
+        return 1
+    fi
+    mkdir -p "$runner_dir" || return 1
+    cat > "$runner_tmp" <<'EOF'
+#!/bin/bash
+# traffic-tools-tc-recovery-v1
+set -euo pipefail
+
+mode="${1:---auto}"
+case "$mode" in
+    --auto|--manual) ;;
+    *) echo "usage: $0 [--auto|--manual]" >&2; exit 2 ;;
+esac
+
+dog_script=/usr/local/bin/port-traffic-dog.sh
+dog_config=/etc/port-traffic-dog/config.json
+ntc_monitor=/etc/trafficcop-lite/trafficcop-lite-monitor.sh
+ntc_config=/etc/trafficcop-lite/traffic_monitor_config.txt
+handled=false
+
+if [ -r "$dog_script" ] && [ -r "$dog_config" ]; then
+    bash "$dog_script" --recover-tc "$mode"
+    handled=true
+fi
+if [ -r "$ntc_monitor" ] && [ -r "$ntc_config" ]; then
+    bash "$ntc_monitor" --tc-recover-owned "$mode"
+    handled=true
+fi
+
+$handled || exit 0
+EOF
+    chmod 755 "$runner_tmp" || { rm -f "$runner_tmp"; return 1; }
+    if ! cmp -s "$runner_tmp" "$TC_RECOVERY_RUNNER"; then
+        mv -f "$runner_tmp" "$TC_RECOVERY_RUNNER" || { rm -f "$runner_tmp"; return 1; }
+    else
+        rm -f "$runner_tmp"
+    fi
+
+    tc_recovery_systemd_available || return 0
+    if [ -e "$TC_RECOVERY_UNIT_FILE" ] &&
+       ! grep -Fq '# traffic-tools-tc-recovery-v1' "$TC_RECOVERY_UNIT_FILE" 2>/dev/null; then
+        echo "共享 TC 恢复服务名已被其他 unit 占用: $TC_RECOVERY_UNIT_FILE" >&2
+        return 1
+    fi
+    mkdir -p "$unit_dir" || return 1
+    cat > "$unit_tmp" <<EOF
+# traffic-tools-tc-recovery-v1
+[Unit]
+Description=Recover Dog and TrafficCop Lite unified HTB after other TC services
+Wants=network-online.target
+After=network-online.target vnstat.service tcpfit.service tcpfit-qdisc.service
+
+[Service]
+Type=oneshot
+ExecStart=$TC_RECOVERY_RUNNER --auto
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    chmod 644 "$unit_tmp" || { rm -f "$unit_tmp"; return 1; }
+    if ! cmp -s "$unit_tmp" "$TC_RECOVERY_UNIT_FILE"; then
+        mv -f "$unit_tmp" "$TC_RECOVERY_UNIT_FILE" || { rm -f "$unit_tmp"; return 1; }
+    else
+        rm -f "$unit_tmp"
+    fi
+    "$TC_RECOVERY_SYSTEMCTL" daemon-reload >/dev/null 2>&1
+}
+
+tc_auto_recovery_state() {
+    if ! tc_recovery_systemd_available; then
+        echo "不可用（当前系统未运行 systemd）"
+    elif "$TC_RECOVERY_SYSTEMCTL" is-enabled --quiet "$TC_RECOVERY_SERVICE" 2>/dev/null; then
+        echo "已启用"
+    else
+        echo "未启用"
+    fi
+}
+
+enable_tc_auto_recovery() {
+    tc_recovery_systemd_available || {
+        echo -e "${RED}当前系统未运行 systemd，无法启用开机自动恢复。${NC}"
+        return 1
+    }
+    install_tc_recovery_service_files || return 1
+    "$TC_RECOVERY_SYSTEMCTL" enable "$TC_RECOVERY_SERVICE" >/dev/null
+}
+
+disable_tc_auto_recovery() {
+    tc_recovery_systemd_available || return 0
+    "$TC_RECOVERY_SYSTEMCTL" disable "$TC_RECOVERY_SERVICE" >/dev/null 2>&1 || true
+}
+
+cleanup_tc_recovery_files_if_unused() {
+    if { [ -r /usr/local/bin/port-traffic-dog.sh ] && [ -r /etc/port-traffic-dog/config.json ]; } ||
+       { [ -r /etc/trafficcop-lite/trafficcop-lite-monitor.sh ] && [ -r /etc/trafficcop-lite/traffic_monitor_config.txt ]; }; then
+        return 0
+    fi
+    if tc_recovery_systemd_available; then
+        "$TC_RECOVERY_SYSTEMCTL" disable --now "$TC_RECOVERY_SERVICE" >/dev/null 2>&1 || true
+    fi
+    if grep -Fq '# traffic-tools-tc-recovery-v1' "$TC_RECOVERY_UNIT_FILE" 2>/dev/null; then
+        rm -f "$TC_RECOVERY_UNIT_FILE"
+    fi
+    if grep -Fq '# traffic-tools-tc-recovery-v1' "$TC_RECOVERY_RUNNER" 2>/dev/null; then
+        rm -f "$TC_RECOVERY_RUNNER"
+    fi
+    tc_recovery_systemd_available && "$TC_RECOVERY_SYSTEMCTL" daemon-reload >/dev/null 2>&1 || true
 }
 
 check_root() {
@@ -323,7 +451,10 @@ install_all_components() {
     ensure_component "$MONITOR_SCRIPT" || return 1
     ensure_component "$TELEGRAM_SCRIPT" || return 1
     ensure_component "$MACHINE_LIMIT_SCRIPT" || return 1
-    copy_self_if_needed
+    copy_self_if_needed || return 1
+    if ! install_tc_recovery_service_files; then
+        echo -e "${YELLOW}! 共享 TC 恢复入口安装失败；现有监控仍可使用，自动恢复暂不可用。${NC}"
+    fi
 }
 
 install_shortcut_link() {
@@ -524,6 +655,7 @@ update_scripts() {
         rm -f "${temp_files[@]}" 2>/dev/null || true
         verify_installed_scripts || return 1
         install_shortcut_link || return 1
+        install_tc_recovery_service_files || return 1
         echo ""
         echo -e "${GREEN}当前已是最新版本：${UPDATE_NEW_VERSION:-未知}${NC}"
         return 0
@@ -570,6 +702,7 @@ update_scripts() {
     fi
 
     install_shortcut_link || return 1
+    install_tc_recovery_service_files || return 1
 
     echo ""
     echo -e "${GREEN}脚本更新完成：${UPDATE_PREVIOUS_VERSION:-未安装} → ${UPDATE_NEW_VERSION:-未知}${NC}"
@@ -591,6 +724,91 @@ update_scripts_interactive() {
         exec bash "$WORK_DIR/trafficcop-lite.sh"
         echo -e "${RED}新版菜单载入失败，请重新执行 sudo ntc。${NC}"
     fi
+    pause
+}
+
+ntc_tc_status_label() {
+    local status_output=""
+    status_output=$(run_tc_self_check 2>/dev/null || true)
+    case "$status_output" in
+        *"TC_SELF_CHECK=OK"*"MODEL=absent"*) echo "空闲" ;;
+        *"TC_SELF_CHECK=OK"*) echo "正常" ;;
+        *"TC_SELF_CHECK=CONFLICT"*) echo "冲突（外部/未知 TC）" ;;
+        *"TC_SELF_CHECK=DRIFT"*) echo "异常（自身规则已失效）" ;;
+        *) echo "无法检测" ;;
+    esac
+}
+
+show_tc_takeover_warning() {
+    echo -e "${RED}检测到当前 TC 配置可能已被其他程序修改。${NC}"
+    echo "继续操作将删除当前冲突的 TC/qdisc 配置，"
+    echo "并只重新建立 Dog/NTC 体系自身管理的规则。"
+    echo "其他程序创建的 TC 配置不会被保留。"
+    echo ""
+    echo -e "${YELLOW}如果其他 TC 管理脚本或服务仍然存在，其之后再次启动或重启时，"
+    echo -e "仍可能覆盖 Dog/NTC。建议卸载、关闭或禁用这些冲突程序。${NC}"
+}
+
+run_shared_tc_recovery() {
+    local mode="${1:---manual}"
+    install_tc_recovery_service_files || return 1
+    bash "$TC_RECOVERY_RUNNER" "$mode"
+}
+
+manage_tc_recovery() {
+    clear
+    echo -e "${BLUE}${BOLD}TC 冲突处理 / 自动恢复${NC}"
+    echo ""
+    echo "TC 状态: $(ntc_tc_status_label)"
+    echo "自动恢复: $(tc_auto_recovery_state)"
+    echo "恢复方式: 单一 systemd oneshot；在 tcpfit 服务之后排序，无固定延迟"
+    echo ""
+    menu_item "1" "立即检测并重建 Dog/NTC 规则"
+    menu_item "2" "立即重建，并启用开机自动恢复"
+    menu_item "3" "启用开机自动恢复"
+    menu_item "4" "关闭开机自动恢复"
+    menu_item "0" "返回主菜单"
+    echo ""
+    read -r -p "请输入选项: " tc_choice
+    case "$tc_choice" in
+        1|2)
+            show_tc_takeover_warning
+            echo ""
+            read -r -p "确认继续请输入 REBUILD: " confirm
+            if [ "$confirm" = "REBUILD" ] && run_shared_tc_recovery --manual; then
+                echo -e "${GREEN}TC 检测/重建完成。${NC}"
+                if [ "$tc_choice" = "2" ]; then
+                    if enable_tc_auto_recovery; then
+                        echo -e "${GREEN}开机自动恢复已启用。${NC}"
+                    else
+                        echo -e "${RED}TC 已重建，但开机自动恢复启用失败。${NC}"
+                    fi
+                fi
+            elif [ "$confirm" != "REBUILD" ]; then
+                echo "已取消。"
+            else
+                echo -e "${RED}TC 重建失败，请运行 sudo ntc --self-check 查看详情。${NC}"
+            fi
+            ;;
+        3)
+            show_tc_takeover_warning
+            echo ""
+            echo "启用后，恢复服务在开机时检测到既有 Dog/NTC 规则失效，"
+            echo "会按上述授权删除冲突 root 并重建；运行期间不会高频轮询或抢占。"
+            read -r -p "确认启用请输入 ENABLE: " confirm
+            if [ "$confirm" = "ENABLE" ] && enable_tc_auto_recovery; then
+                echo -e "${GREEN}开机自动恢复已启用。${NC}"
+            else
+                echo "未启用。"
+            fi
+            ;;
+        4)
+            disable_tc_auto_recovery
+            echo -e "${GREEN}开机自动恢复已关闭。${NC}"
+            ;;
+        0) return ;;
+        *) echo -e "${RED}无效选择。${NC}" ;;
+    esac
     pause
 }
 
@@ -621,6 +839,7 @@ show_status_line() {
 
     echo -e "${CYAN}工作目录:${NC} $WORK_DIR"
     echo -e "${CYAN}监控配置:${NC} ${config_color}${config_state}${NC}   ${CYAN}监控任务:${NC} ${monitor_color}${monitor_cron}${NC}   ${CYAN}TG任务:${NC} ${telegram_color}${telegram_cron}${NC}"
+    echo -e "${CYAN}TC 状态:${NC} $(ntc_tc_status_label)   ${CYAN}自动恢复:${NC} $(tc_auto_recovery_state)"
 }
 
 lite_is_leap_year() {
@@ -1424,6 +1643,7 @@ uninstall_lite() {
         rm -f "$LEGACY_TC_SHORTCUT_PATH"
         echo "✓ 已删除旧快捷命令 $LEGACY_TC_SHORTCUT_PATH"
     fi
+    cleanup_tc_recovery_files_if_unused
 
     echo -e "${GREEN}卸载完成。${NC}"
     pause
@@ -1449,6 +1669,7 @@ show_main_menu() {
     menu_item "6" "停止所有服务"
     menu_item "7" "更新脚本"
     menu_item "8" "卸载 TrafficCop-Lite" "$RED" "$RED"
+    menu_item "9" "TC 冲突处理/自动恢复"
     menu_item "0" "退出"
     echo ""
 }
@@ -1485,13 +1706,18 @@ main() {
             run_tc_self_check "${2:-}"
             exit $?
             ;;
+        --recover-tc)
+            local recovery_mode="${2:---manual}"
+            run_shared_tc_recovery "$recovery_mode"
+            exit $?
+            ;;
         --update)
             update_scripts "$RAW_BASE"
             exit $?
             ;;
         --help|-h)
             echo "TrafficCop Lite"
-            echo "用法: sudo ntc [--install|--update|--uninstall|--stop|--logs|--config|--self-check [INTERFACE]]"
+            echo "用法: sudo ntc [--install|--update|--uninstall|--stop|--logs|--config|--self-check [INTERFACE]|--recover-tc [--auto|--manual]]"
             echo "无参数运行进入交互菜单。"
             exit 0
             ;;
@@ -1515,6 +1741,7 @@ main() {
             6) stop_all_services ;;
             7) update_scripts_interactive ;;
             8) uninstall_lite ;;
+            9) manage_tc_recovery ;;
             0) echo -e "${GREEN}已退出 TrafficCop-Lite。${NC}"; exit 0 ;;
             *) echo -e "${RED}无效选择，请重新输入。${NC}"; sleep 1 ;;
         esac

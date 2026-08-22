@@ -536,8 +536,8 @@ test_update_replaces_full_release_and_preserves_state() {
     printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.0' > "$WORK_DIR/$MACHINE_LIMIT_SCRIPT"
     printf '%s\n' 'CONFIG=keep-me' > "$WORK_DIR/traffic_monitor_config.txt"
 
-    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.7"' > "$remote_dir/trafficcop-lite.sh"
-    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.5"' > "$remote_dir/$MONITOR_SCRIPT"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.8"' > "$remote_dir/trafficcop-lite.sh"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.6"' > "$remote_dir/$MONITOR_SCRIPT"
     printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.3"' > "$remote_dir/$TELEGRAM_SCRIPT"
     printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.7' > "$remote_dir/$MACHINE_LIMIT_SCRIPT"
 
@@ -550,10 +550,11 @@ test_update_replaces_full_release_and_preserves_state() {
     ensure_work_dir() { mkdir -p "$WORK_DIR"; }
     download_url_to_file() { cp "$remote_dir/$(basename "$1")" "$2"; }
     install_shortcut_link() { printf '%s\n' 'called' > "$work/shortcut-called"; }
+    install_tc_recovery_service_files() { :; }
 
     update_scripts 'https://example.invalid/release' >/dev/null || return 1
-    grep -Fqx 'SCRIPT_VERSION="1.1.7"' "$WORK_DIR/trafficcop-lite.sh" || return 1
-    grep -Fqx 'SCRIPT_VERSION="1.1.5"' "$WORK_DIR/$MONITOR_SCRIPT" || return 1
+    grep -Fqx 'SCRIPT_VERSION="1.1.8"' "$WORK_DIR/trafficcop-lite.sh" || return 1
+    grep -Fqx 'SCRIPT_VERSION="1.1.6"' "$WORK_DIR/$MONITOR_SCRIPT" || return 1
     grep -Fqx 'SCRIPT_VERSION="1.1.3"' "$WORK_DIR/$TELEGRAM_SCRIPT" || return 1
     grep -Fqx '# TrafficCop Lite Machine Limit v2.7' "$WORK_DIR/$MACHINE_LIMIT_SCRIPT" || return 1
     assert_file_content 'CONFIG=keep-me' "$WORK_DIR/traffic_monitor_config.txt" || return 1
@@ -561,7 +562,7 @@ test_update_replaces_full_release_and_preserves_state() {
     [ -n "$backup_main" ] || return 1
     grep -Fqx 'SCRIPT_VERSION="1.0.2"' "$backup_main" || return 1
     [ "$UPDATE_PREVIOUS_VERSION" = '1.0.2' ] || return 1
-    [ "$UPDATE_NEW_VERSION" = '1.1.7' ] || return 1
+    [ "$UPDATE_NEW_VERSION" = '1.1.8' ] || return 1
     assert_file_content 'called' "$work/shortcut-called"
 }
 
@@ -1357,6 +1358,75 @@ test_restore_failure_restores_previous_config() {
     assert_absent "$CONFIG_FILE"
 }
 
+test_tc_auto_recovery_without_state_is_noop() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/tc-auto-no-state.XXXXXX") || return 1
+    TC_BIN='mock_tc'
+    TC_STATE_FILE="$work/tc-state"
+    MAIN_INTERFACE='eth0'
+    LIMIT_MODE='tc'
+    DISABLED='false'
+
+    load_function "$MONITOR_SCRIPT" recover_owned_tc_hierarchy || return 1
+    mock_tc() { printf '%s\n' "$*" > "$work/tc-called"; }
+
+    recover_owned_tc_hierarchy --auto > "$work/output" || return 1
+    assert_absent "$work/tc-called" || return 1
+    grep -Fq '没有需要自动恢复' "$work/output"
+}
+
+test_shared_recovery_service_is_opt_in() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/tc-recovery-service.XXXXXX") || return 1
+    TC_RECOVERY_RUNNER="$work/bin/traffic-tools-tc-recovery.sh"
+    TC_RECOVERY_UNIT_FILE="$work/systemd/traffic-tools-tc-recovery.service"
+    TC_RECOVERY_SERVICE='traffic-tools-tc-recovery.service'
+    TC_RECOVERY_SYSTEMCTL="$work/systemctl-mock"
+    export SYSTEMCTL_LOG="$work/systemctl.log"
+
+    printf '%s\n' '#!/bin/bash' 'printf "%s\n" "$*" >> "$SYSTEMCTL_LOG"' > "$TC_RECOVERY_SYSTEMCTL"
+    chmod 755 "$TC_RECOVERY_SYSTEMCTL"
+    load_function "$ROOT_DIR/trafficcop-lite.sh" install_tc_recovery_service_files || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" enable_tc_auto_recovery || return 1
+    tc_recovery_systemd_available() { return 0; }
+
+    install_tc_recovery_service_files || return 1
+    grep -Fq '# traffic-tools-tc-recovery-v1' "$TC_RECOVERY_RUNNER" || return 1
+    grep -Fq 'After=network-online.target vnstat.service tcpfit.service tcpfit-qdisc.service' \
+        "$TC_RECOVERY_UNIT_FILE" || return 1
+    grep -Fq "ExecStart=$TC_RECOVERY_RUNNER --auto" "$TC_RECOVERY_UNIT_FILE" || return 1
+    grep -Fxq 'daemon-reload' "$SYSTEMCTL_LOG" || return 1
+    ! grep -Eq '^enable([[:space:]]|$)' "$SYSTEMCTL_LOG" || return 1
+
+    enable_tc_auto_recovery || return 1
+    grep -Fxq 'enable traffic-tools-tc-recovery.service' "$SYSTEMCTL_LOG"
+}
+
+test_tc_recovery_waits_for_monitor_lock() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/tc-recovery-monitor-lock.XXXXXX") || return 1
+
+    (
+        load_function "$MONITOR_SCRIPT" main || exit 1
+        WORK_DIR="$work/runtime"
+        LOCK_FILE="$WORK_DIR/monitor.lock"
+        LOG_FILE="$WORK_DIR/monitor.log"
+        LOG_MAX_LINES=100
+        mkdir -p "$WORK_DIR"
+
+        migrate_files() { :; }
+        command_exists() { return 1; }
+        read_config() { :; }
+        recover_owned_tc_hierarchy() { :; }
+        trim_log_file() { :; }
+        flock() { printf '%s\n' "$*" >> "$work/flock.calls"; }
+
+        main --tc-recover-owned --auto >/dev/null || exit 1
+    ) || return 1
+
+    [ "$(head -n 1 "$work/flock.calls")" = '-w 15 9' ]
+}
+
 run_test() {
     local name="$1"
     local test_function="$2"
@@ -1396,6 +1466,9 @@ run_test 'TC changes require a prepared ownership state' test_tc_change_requires
 run_test 'TC builds the unified HTB directly without invoking Dog' test_tc_builds_unified_htb_directly
 run_test 'TC self-check flags legacy state after Dog migrates the hierarchy' test_self_check_flags_legacy_state_after_dog_migration
 run_test 'TC refuses an unrecognized root qdisc without mutation' test_tc_refuses_foreign_root_without_mutation
+run_test 'TC auto recovery is a no-op without an existing owned state' test_tc_auto_recovery_without_state_is_noop
+run_test 'shared TC recovery service remains disabled until explicitly enabled' test_shared_recovery_service_is_opt_in
+run_test 'TC recovery waits briefly for the monitor lock' test_tc_recovery_waits_for_monitor_lock
 run_test 'legacy TBF adoption requires a matching numeric speed' test_legacy_tbf_requires_matching_numeric_speed
 run_test 'invalid Dog config cannot authorize HTB adoption' test_invalid_dog_config_cannot_authorize_adoption
 run_test 'unified HTB verification requires the full root and class contract' test_unified_hierarchy_verification_requires_full_contract

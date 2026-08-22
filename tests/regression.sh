@@ -712,6 +712,47 @@ test_tc_builds_unified_htb_directly() {
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_self_check_flags_legacy_state_after_dog_migration() {
+    local work status=0
+    work=$(mktemp -d "$TEST_ROOT/self-check-legacy-state.XXXXXX") || return 1
+    TC_BIN='mock_tc'
+    TC_STATE_FILE="$work/tc-state"
+    TC_STATE_SCHEMA='traffic-tools-unified-htb-v1'
+    TC_STATE_PROVIDER='trafficcop-lite'
+    printf '%s\n' \
+        'INTERFACE=eth0' \
+        'LIMIT_SPEED=5000' \
+        'PROVIDER=trafficcop-lite' > "$TC_STATE_FILE"
+    local lock_held=false
+
+    load_function "$MONITOR_SCRIPT" tc_self_check || return 1
+    resolve_tc_self_check_interface() { printf '%s\n' "${1:-eth0}"; }
+    acquire_tc_hierarchy_lock() { lock_held=true; }
+    release_tc_hierarchy_lock() { lock_held=false; }
+    tc_root_qdisc() { printf '%s\n' 'qdisc htb 1: root default 30'; }
+    is_default_qdisc_line() { return 1; }
+    tc_root_is_unified_compatible() { return 0; }
+    tc_default_class_is_safe() { return 0; }
+    tc_state_is_unified_for_interface() { return 1; }
+    tc_state_interface() { printf '%s\n' 'eth0'; }
+    tc_state_value() {
+        case "$1" in
+            SCHEMA) return 0 ;;
+            LIMIT_SPEED) printf '%s\n' '5000' ;;
+            PROVIDER) printf '%s\n' 'trafficcop-lite' ;;
+        esac
+    }
+    tc_class_line() { printf '%s\n' 'class htb 1:30 parent 1:1 rate 1Kbit ceil 5Mbit'; }
+
+    tc_self_check eth0 > "$work/output" || status=$?
+    [ "$status" -eq 1 ] || return 1
+    assert_file_content \
+        'TC_SELF_CHECK=DRIFT INTERFACE=eth0 REASON=legacy-trafficcop-state-with-unified-htb ACTION=reapply-trafficcop-limit' \
+        "$work/output" || return 1
+    [ "$lock_held" = "false" ]
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
 test_tc_refuses_foreign_root_without_mutation() {
     local work
     work=$(mktemp -d "$TEST_ROOT/tc-foreign-root.XXXXXX") || return 1
@@ -1353,6 +1394,7 @@ run_test 'vnStat history read errors abort configuration' test_vnstat_history_re
 run_test 'post-save read errors preserve runtime state' test_post_save_read_error_preserves_runtime_state
 run_test 'TC changes require a prepared ownership state' test_tc_change_requires_prepared_state
 run_test 'TC builds the unified HTB directly without invoking Dog' test_tc_builds_unified_htb_directly
+run_test 'TC self-check flags legacy state after Dog migrates the hierarchy' test_self_check_flags_legacy_state_after_dog_migration
 run_test 'TC refuses an unrecognized root qdisc without mutation' test_tc_refuses_foreign_root_without_mutation
 run_test 'legacy TBF adoption requires a matching numeric speed' test_legacy_tbf_requires_matching_numeric_speed
 run_test 'invalid Dog config cannot authorize HTB adoption' test_invalid_dog_config_cannot_authorize_adoption

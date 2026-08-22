@@ -177,7 +177,7 @@ foreign_before="$(tc qdisc show dev eth0; tc class show dev eth0)"
 ! tc_self_check eth0 >/dev/null
 tc qdisc del dev eth0 root handle 1:
 
-# NTC 自己的旧 TBF 可迁移；新状态和统一 HTB 必须同步提交。
+# Dog 迁移 NTC 旧 TBF 后，NTC 自检必须先报告漂移，再由 NTC 重建权威状态。
 tc qdisc replace dev eth0 root tbf rate 4mbit burst 32kbit latency 400ms
 legacy_qdisc=$(tc qdisc show dev eth0 root | head -n 1)
 {
@@ -187,11 +187,20 @@ legacy_qdisc=$(tc qdisc show dev eth0 root | head -n 1)
     printf 'PROVIDER=trafficcop-lite\n'
 } > "$TC_STATE_FILE"
 chmod 600 "$TC_STATE_FILE"
+dog_action apply 3266 10mbit
+legacy_self_check_status=0
+tc_self_check eth0 > "$TEST_DIR/legacy-self-check.out" || legacy_self_check_status=$?
+[ "$legacy_self_check_status" -eq 1 ]
+grep -Fxq \
+    'TC_SELF_CHECK=DRIFT INTERFACE=eth0 REASON=legacy-trafficcop-state-with-unified-htb ACTION=reapply-trafficcop-limit' \
+    "$TEST_DIR/legacy-self-check.out"
 apply_tc_limit 6000 >/dev/null
 tc_class_rate_matches eth0 1:1 6mbit 6mbit
 grep -Fxq 'SCHEMA=traffic-tools-unified-htb-v1' "$TC_STATE_FILE"
 clear_owned_tc_rules "integration clear" >/dev/null
-! tc_root_is_htb_handle_one eth0
 [ ! -e "$TC_STATE_FILE" ]
+tc_root_is_htb_handle_one eth0
+dog_action remove 3266
+! tc_root_is_htb_handle_one eth0
 
 echo "Dog/TrafficCop unified HTB integration tests passed"

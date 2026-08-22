@@ -2223,7 +2223,7 @@ resolve_tc_self_check_interface() {
 }
 
 tc_self_check() {
-    local interface qdisc_line state_speed result=1
+    local interface qdisc_line state_speed state_schema result=1
 
     if [ -z "$TC_BIN" ]; then
         echo "TC_SELF_CHECK=ERROR REASON=tc-not-found"
@@ -2265,6 +2265,13 @@ tc_self_check() {
                 result=0
             else
                 echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=trafficcop-parent-mismatch"
+            fi
+        elif [ -f "$TC_STATE_FILE" ] && [ "$(tc_state_interface)" = "$interface" ]; then
+            state_schema=$(tc_state_value SCHEMA)
+            if [ -z "$state_schema" ]; then
+                echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=legacy-trafficcop-state-with-unified-htb ACTION=reapply-trafficcop-limit"
+            else
+                echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=trafficcop-state-not-unified"
             fi
         elif tc_class_line "$interface" "1:30" >/dev/null &&
              [ -n "$(tc_class_line "$interface" "1:30")" ]; then

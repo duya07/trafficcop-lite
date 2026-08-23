@@ -39,7 +39,7 @@
 23. 所有 root crontab 读改写使用 TrafficCop Lite 自身的 `/etc/trafficcop-lite/root-crontab.lock`；它不依赖也不占用 Port Traffic Dog 的 cron 锁。
 24. TC 模式直接管理 `traffic-tools-unified-htb-v1`：`1:1` 实施整机上限，`1:30` 承接默认流量，并保留 Dog 的端口子类。TrafficCop Lite 可单独安装；日常应用在可验证的 Dog 层级中原地协调，共享恢复入口在两者并存时按顺序调用两边的恢复接口，安装顺序不限。
 25. 主页只读显示 TC 状态；用户明确确认后，可删除冲突 root 并按 Dog/NTC 现有状态重建。第三方 TC 配置不会被识别、迁移或保留。
-26. Dog 与 NTC 共用唯一的 `traffic-tools-tc-recovery.service`。服务默认关闭；启用后通过 systemd 排在 `tcpfit.service` / `tcpfit-qdisc.service` 之后执行，不使用固定延迟，也不做运行期高频抢占。
+26. Dog 与 NTC 共用唯一的 `traffic-tools-tc-recovery.service`。服务默认关闭；启用后在网络就绪时执行一次，不使用固定延迟，也不做运行期高频抢占。
 
 ## 下载方式说明
 
@@ -288,8 +288,8 @@ sudo /usr/sbin/tc qdisc show
 - 脚本会安装依赖、写入 crontab，并可能配置 TC 限速或关机模式，请先在测试机确认。
 - TC 模式会用 `/etc/trafficcop-lite/tc_limit_state` 记录自身管理的整机上限。NTC 直接创建或更新统一 HTB；Dog 存在时保留其端口类和过滤器，不存在时也可独立工作。
 - NTC 与 Dog 各自使用自己的 root crontab 锁；只有修改同一内核 TC 层级时共用 `/run/lock/traffic-tools-tc.lock`。
-- tcpfit 或其他工具重建 root qdisc 后，主页会报告外部/未知 TC 冲突，普通监控 cron 仍会拒绝覆盖。主菜单 `9` 可在明确确认后删除冲突并只重建 Dog/NTC；不会保留任何第三方规则。
-- 可选的 `traffic-tools-tc-recovery.service` 只负责开机阶段的最终执行顺序。运行期间手动重启 tcpfit 仍会覆盖 Dog/NTC，需要再次手动恢复；建议卸载或禁用其他 TC 管理服务。
+- 外部程序重建 root qdisc 后，主页会报告外部/未知 TC 冲突，普通监控 cron 仍会拒绝覆盖。主菜单 `9` 可在明确确认后删除冲突并只重建 Dog/NTC；不会保留任何第三方规则。
+- 可选的 `traffic-tools-tc-recovery.service` 只在开机网络就绪后执行一次。运行期间若 root qdisc 再次被其他程序覆盖，需要用户再次手动恢复；建议关闭其他 TC 管理服务。
 - `enforcement_state` 只记录临时宽限或暂停状态；`shutdown_limit_state` 只记录本脚本计划的流量关机及其 boot ID。
 - 若状态记录与当前 qdisc 不一致，脚本会按外部规则处理并停止自动覆盖。
 - 停止服务/卸载时，未标记的 TC 规则和计划关机会要求确认后才处理。

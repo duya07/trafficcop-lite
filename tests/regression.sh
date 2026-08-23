@@ -1427,6 +1427,62 @@ test_tc_recovery_waits_for_monitor_lock() {
     [ "$(head -n 1 "$work/flock.calls")" = '-w 15 9' ]
 }
 
+test_tc_recovery_menu_requires_confirm_only_for_conflict() {
+    local healthy_output
+    local conflict_output
+    local automatic_output
+
+    BLUE=''
+    BOLD=''
+    GREEN=''
+    YELLOW=''
+    RED=''
+    NC=''
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" ntc_tc_status_label || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" ntc_tc_status_kind || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" show_tc_auto_recovery_notice || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" confirm_enable_tc_auto_recovery || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" manage_tc_recovery || return 1
+
+    clear() { :; }
+    menu_item() { printf '%s. %s\n' "$1" "$2"; }
+    pause() { :; }
+    tc_auto_recovery_state() { echo '未启用'; }
+    show_tc_takeover_warning() { echo 'TAKEOVER_WARNING'; }
+    run_shared_tc_recovery() { echo 'RECOVERY_CALLED'; }
+    enable_tc_auto_recovery() { echo 'AUTO_RECOVERY_ENABLED'; }
+
+    [ "$(ntc_tc_status_kind 'TC_SELF_CHECK=OK INTERFACE=eth0 MODEL=traffic-tools-unified-htb-v1')" = 'ok' ] || return 1
+    [ "$(ntc_tc_status_kind 'TC_SELF_CHECK=OK INTERFACE=eth0 MODEL=absent')" = 'idle' ] || return 1
+    [ "$(ntc_tc_status_kind 'TC_SELF_CHECK=CONFLICT REASON=external-root-qdisc')" = 'conflict' ] || return 1
+    [ "$(ntc_tc_status_kind 'TC_SELF_CHECK=DRIFT REASON=missing-class')" = 'conflict' ] || return 1
+    [ "$(ntc_tc_status_kind 'TC_SELF_CHECK=ERROR REASON=tc-unavailable')" = 'error' ] || return 1
+
+    run_tc_self_check() {
+        echo 'TC_SELF_CHECK=OK INTERFACE=eth0 MODEL=traffic-tools-unified-htb-v1'
+    }
+    healthy_output=$(manage_tc_recovery <<< '1') || return 1
+    grep -Fq '当前 TC 状态正常，无需强制重建。' <<< "$healthy_output" || return 1
+    ! grep -Fq 'TAKEOVER_WARNING' <<< "$healthy_output" || return 1
+    ! grep -Fq 'RECOVERY_CALLED' <<< "$healthy_output" || return 1
+
+    run_tc_self_check() {
+        echo 'TC_SELF_CHECK=CONFLICT REASON=external-root-qdisc'
+    }
+    conflict_output=$(manage_tc_recovery <<< $'1\nREBUILD') || return 1
+    grep -Fq 'TAKEOVER_WARNING' <<< "$conflict_output" || return 1
+    grep -Fq 'RECOVERY_CALLED' <<< "$conflict_output" || return 1
+
+    run_tc_self_check() {
+        echo 'TC_SELF_CHECK=OK INTERFACE=eth0 MODEL=traffic-tools-unified-htb-v1'
+    }
+    automatic_output=$(manage_tc_recovery <<< $'3\nNO') || return 1
+    grep -Fq '规则正常或当前没有需要恢复的规则时，不会修改 TC。' <<< "$automatic_output" || return 1
+    ! grep -Fq 'TAKEOVER_WARNING' <<< "$automatic_output" || return 1
+    ! grep -Fq 'AUTO_RECOVERY_ENABLED' <<< "$automatic_output"
+}
+
 run_test() {
     local name="$1"
     local test_function="$2"
@@ -1469,6 +1525,7 @@ run_test 'TC refuses an unrecognized root qdisc without mutation' test_tc_refuse
 run_test 'TC auto recovery is a no-op without an existing owned state' test_tc_auto_recovery_without_state_is_noop
 run_test 'shared TC recovery service remains disabled until explicitly enabled' test_shared_recovery_service_is_opt_in
 run_test 'TC recovery waits briefly for the monitor lock' test_tc_recovery_waits_for_monitor_lock
+run_test 'TC recovery menu confirms takeover only after detecting a conflict' test_tc_recovery_menu_requires_confirm_only_for_conflict
 run_test 'legacy TBF adoption requires a matching numeric speed' test_legacy_tbf_requires_matching_numeric_speed
 run_test 'invalid Dog config cannot authorize HTB adoption' test_invalid_dog_config_cannot_authorize_adoption
 run_test 'unified HTB verification requires the full root and class contract' test_unified_hierarchy_verification_requires_full_contract

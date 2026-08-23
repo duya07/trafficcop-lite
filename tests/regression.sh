@@ -1392,7 +1392,7 @@ test_shared_recovery_service_is_opt_in() {
 
     install_tc_recovery_service_files || return 1
     grep -Fq '# traffic-tools-tc-recovery-v1' "$TC_RECOVERY_RUNNER" || return 1
-    grep -Fq 'After=network-online.target vnstat.service tcpfit.service tcpfit-qdisc.service' \
+    grep -Fq 'After=network-online.target vnstat.service' \
         "$TC_RECOVERY_UNIT_FILE" || return 1
     grep -Fq "ExecStart=$TC_RECOVERY_RUNNER --auto" "$TC_RECOVERY_UNIT_FILE" || return 1
     grep -Fxq 'daemon-reload' "$SYSTEMCTL_LOG" || return 1

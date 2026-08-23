@@ -192,7 +192,7 @@ apply_tc_limit 2000 >/dev/null
 tc_class_rate_matches eth0 1:1 2mbit 2mbit
 tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
 
-# tcpfit 再次覆盖后，由 Dog 读取 NTC 权威状态并一次性恢复父类和端口子类。
+# 外部程序再次覆盖后，由 Dog 读取 NTC 权威状态并一次性恢复父类和端口子类。
 tc qdisc del dev eth0 root handle 1:
 tc qdisc add dev eth0 root handle 1: htb default 10
 tc class add dev eth0 parent 1: classid 1:10 htb rate 20mbit ceil 20mbit

@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.1.8"
-LAST_UPDATE="2026-08-22"
+SCRIPT_VERSION="1.1.9"
+LAST_UPDATE="2026-08-26"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
@@ -14,6 +14,7 @@ TC_STATE_FILE="$WORK_DIR/tc_limit_state"
 ENFORCEMENT_STATE_FILE="$WORK_DIR/enforcement_state"
 SHUTDOWN_STATE_FILE="$WORK_DIR/shutdown_limit_state"
 MONITOR_LOCK_FILE="$WORK_DIR/traffic_monitor.lock"
+VNSTAT_CONFIG_PATH_FILE="$WORK_DIR/vnstat_config_path"
 ROOT_CRONTAB_LOCK_FILE="${TRAFFICCOP_ROOT_CRONTAB_LOCK_FILE:-$WORK_DIR/root-crontab.lock}"
 TC_RECOVERY_RUNNER="${TRAFFIC_TOOLS_TC_RECOVERY_RUNNER:-/usr/local/sbin/traffic-tools-tc-recovery.sh}"
 TC_RECOVERY_UNIT_FILE="${TRAFFIC_TOOLS_TC_RECOVERY_UNIT_FILE:-/etc/systemd/system/traffic-tools-tc-recovery.service}"
@@ -83,6 +84,16 @@ tc_recovery_systemd_available() {
     command -v "$TC_RECOVERY_SYSTEMCTL" >/dev/null 2>&1 && [ -d /run/systemd/system ]
 }
 
+tc_recovery_unit_is_owned() {
+    [ -f "$TC_RECOVERY_UNIT_FILE" ] &&
+        grep -Fqx '# traffic-tools-tc-recovery-v1' "$TC_RECOVERY_UNIT_FILE" 2>/dev/null
+}
+
+tc_recovery_runner_is_owned() {
+    [ -f "$TC_RECOVERY_RUNNER" ] &&
+        grep -Fqx '# traffic-tools-tc-recovery-v1' "$TC_RECOVERY_RUNNER" 2>/dev/null
+}
+
 install_tc_recovery_service_files() {
     local runner_dir unit_dir runner_tmp unit_tmp
     runner_dir=$(dirname "$TC_RECOVERY_RUNNER")
@@ -90,9 +101,12 @@ install_tc_recovery_service_files() {
     runner_tmp="${TC_RECOVERY_RUNNER}.tmp.$$"
     unit_tmp="${TC_RECOVERY_UNIT_FILE}.tmp.$$"
 
-    if [ -e "$TC_RECOVERY_RUNNER" ] &&
-       ! grep -Fq '# traffic-tools-tc-recovery-v1' "$TC_RECOVERY_RUNNER" 2>/dev/null; then
+    if [ -e "$TC_RECOVERY_RUNNER" ] && ! tc_recovery_runner_is_owned; then
         echo "共享 TC 恢复入口已被其他文件占用: $TC_RECOVERY_RUNNER" >&2
+        return 1
+    fi
+    if [ -e "$TC_RECOVERY_UNIT_FILE" ] && ! tc_recovery_unit_is_owned; then
+        echo "共享 TC 恢复服务名已被其他 unit 占用: $TC_RECOVERY_UNIT_FILE" >&2
         return 1
     fi
     mkdir -p "$runner_dir" || return 1
@@ -112,17 +126,19 @@ dog_config=/etc/port-traffic-dog/config.json
 ntc_monitor=/etc/trafficcop-lite/trafficcop-lite-monitor.sh
 ntc_config=/etc/trafficcop-lite/traffic_monitor_config.txt
 handled=false
+result=0
 
 if [ -r "$dog_script" ] && [ -r "$dog_config" ]; then
-    bash "$dog_script" --recover-tc "$mode"
+    bash "$dog_script" --recover-tc "$mode" || result=1
     handled=true
 fi
 if [ -r "$ntc_monitor" ] && [ -r "$ntc_config" ]; then
-    bash "$ntc_monitor" --tc-recover-owned "$mode"
+    bash "$ntc_monitor" --tc-recover-owned "$mode" || result=1
     handled=true
 fi
 
 $handled || exit 0
+exit "$result"
 EOF
     chmod 755 "$runner_tmp" || { rm -f "$runner_tmp"; return 1; }
     if ! cmp -s "$runner_tmp" "$TC_RECOVERY_RUNNER"; then
@@ -132,11 +148,6 @@ EOF
     fi
 
     tc_recovery_systemd_available || return 0
-    if [ -e "$TC_RECOVERY_UNIT_FILE" ] &&
-       ! grep -Fq '# traffic-tools-tc-recovery-v1' "$TC_RECOVERY_UNIT_FILE" 2>/dev/null; then
-        echo "共享 TC 恢复服务名已被其他 unit 占用: $TC_RECOVERY_UNIT_FILE" >&2
-        return 1
-    fi
     mkdir -p "$unit_dir" || return 1
     cat > "$unit_tmp" <<EOF
 # traffic-tools-tc-recovery-v1
@@ -164,6 +175,10 @@ EOF
 tc_auto_recovery_state() {
     if ! tc_recovery_systemd_available; then
         echo "不可用（当前系统未运行 systemd）"
+    elif [ -e "$TC_RECOVERY_UNIT_FILE" ] && ! tc_recovery_unit_is_owned; then
+        echo "冲突（同名 unit 不属于 Dog/NTC）"
+    elif [ ! -e "$TC_RECOVERY_UNIT_FILE" ]; then
+        echo "未启用"
     elif "$TC_RECOVERY_SYSTEMCTL" is-enabled --quiet "$TC_RECOVERY_SERVICE" 2>/dev/null; then
         echo "已启用"
     else
@@ -182,7 +197,12 @@ enable_tc_auto_recovery() {
 
 disable_tc_auto_recovery() {
     tc_recovery_systemd_available || return 0
-    "$TC_RECOVERY_SYSTEMCTL" disable "$TC_RECOVERY_SERVICE" >/dev/null 2>&1 || true
+    [ ! -e "$TC_RECOVERY_UNIT_FILE" ] && return 0
+    if ! tc_recovery_unit_is_owned; then
+        echo "同名恢复 unit 不属于 Dog/NTC，拒绝停用: $TC_RECOVERY_UNIT_FILE" >&2
+        return 1
+    fi
+    "$TC_RECOVERY_SYSTEMCTL" disable "$TC_RECOVERY_SERVICE" >/dev/null 2>&1
 }
 
 cleanup_tc_recovery_files_if_unused() {
@@ -190,16 +210,22 @@ cleanup_tc_recovery_files_if_unused() {
        { [ -r /etc/trafficcop-lite/trafficcop-lite-monitor.sh ] && [ -r /etc/trafficcop-lite/traffic_monitor_config.txt ]; }; then
         return 0
     fi
+    if [ -e "$TC_RECOVERY_UNIT_FILE" ]; then
+        if ! tc_recovery_unit_is_owned; then
+            echo "同名恢复 unit 不属于 Dog/NTC，已保留且未调用 systemctl: $TC_RECOVERY_UNIT_FILE" >&2
+            return 1
+        fi
+        if tc_recovery_systemd_available; then
+            "$TC_RECOVERY_SYSTEMCTL" disable --now "$TC_RECOVERY_SERVICE" >/dev/null 2>&1 || return 1
+        fi
+        rm -f "$TC_RECOVERY_UNIT_FILE" || return 1
+    fi
+    if tc_recovery_runner_is_owned; then
+        rm -f "$TC_RECOVERY_RUNNER" || return 1
+    fi
     if tc_recovery_systemd_available; then
-        "$TC_RECOVERY_SYSTEMCTL" disable --now "$TC_RECOVERY_SERVICE" >/dev/null 2>&1 || true
+        "$TC_RECOVERY_SYSTEMCTL" daemon-reload >/dev/null 2>&1 || return 1
     fi
-    if grep -Fq '# traffic-tools-tc-recovery-v1' "$TC_RECOVERY_UNIT_FILE" 2>/dev/null; then
-        rm -f "$TC_RECOVERY_UNIT_FILE"
-    fi
-    if grep -Fq '# traffic-tools-tc-recovery-v1' "$TC_RECOVERY_RUNNER" 2>/dev/null; then
-        rm -f "$TC_RECOVERY_RUNNER"
-    fi
-    tc_recovery_systemd_available && "$TC_RECOVERY_SYSTEMCTL" daemon-reload >/dev/null 2>&1 || true
 }
 
 check_root() {
@@ -361,6 +387,7 @@ download_component() {
     local dest="$WORK_DIR/$script_name"
     local url="$RAW_BASE/$script_name"
     local tmp_file="$WORK_DIR/.${script_name}.install.$$"
+    local candidate_version installed_version
 
     echo -e "${YELLOW}正在下载 $script_name...${NC}"
     if ! download_url_to_file "$url" "$tmp_file"; then
@@ -384,9 +411,23 @@ download_component() {
         rm -f "$tmp_file" 2>/dev/null || true
         return 1
     fi
+    candidate_version=$(script_version_from_file "$tmp_file")
+    if [ -z "$candidate_version" ]; then
+        rm -f "$tmp_file" 2>/dev/null || true
+        return 1
+    fi
 
-    chmod +x "$tmp_file"
-    mv -f "$tmp_file" "$dest"
+    if ! chmod +x "$tmp_file" || ! mv -f "$tmp_file" "$dest"; then
+        rm -f "$tmp_file" 2>/dev/null || true
+        echo -e "${RED}安装失败：$script_name，目标文件未通过复制/权限设置。${NC}"
+        return 1
+    fi
+    installed_version=$(script_version_from_file "$dest")
+    if [ ! -s "$dest" ] || [ ! -x "$dest" ] ||
+       ! bash -n "$dest" 2>/dev/null || [ "$installed_version" != "$candidate_version" ]; then
+        echo -e "${RED}安装失败：$script_name，目标文件校验失败。${NC}"
+        return 1
+    fi
     echo -e "${GREEN}✓ 已下载/安装 $script_name${NC}"
 }
 
@@ -408,7 +449,7 @@ ensure_component() {
     local script_name="$1"
     local src="$SCRIPT_DIR/$script_name"
     local dest="$WORK_DIR/$script_name"
-    local source_version installed_version
+    local source_version installed_version tmp_file
 
     ensure_work_dir
 
@@ -429,8 +470,21 @@ ensure_component() {
             echo -e "${YELLOW}! 已安装 $script_name 版本 $installed_version 高于当前副本 $source_version，已阻止降级。${NC}"
             return 0
         fi
-        cp "$src" "$dest"
-        chmod +x "$dest"
+        tmp_file="$WORK_DIR/.${script_name}.install.$$"
+        if ! cp "$src" "$tmp_file" || ! chmod +x "$tmp_file" ||
+           ! bash -n "$tmp_file" 2>/dev/null ||
+           [ "$(script_version_from_file "$tmp_file")" != "$source_version" ] ||
+           ! mv -f "$tmp_file" "$dest"; then
+            rm -f "$tmp_file" 2>/dev/null || true
+            echo -e "${RED}本地脚本安装失败：$script_name，已保留现有安装。${NC}"
+            return 1
+        fi
+        installed_version=$(script_version_from_file "$dest")
+        if [ ! -s "$dest" ] || [ ! -x "$dest" ] ||
+           ! bash -n "$dest" 2>/dev/null || [ "$installed_version" != "$source_version" ]; then
+            echo -e "${RED}本地脚本安装失败：$script_name，目标文件校验失败。${NC}"
+            return 1
+        fi
         echo -e "${GREEN}✓ 已安装/更新 $script_name${NC}"
         return 0
     fi
@@ -438,7 +492,10 @@ ensure_component() {
     if [ -f "$dest" ]; then
         installed_version=$(script_version_from_file "$dest")
         if bash -n "$dest" 2>/dev/null && [ -n "$installed_version" ]; then
-            chmod +x "$dest"
+            if ! chmod +x "$dest" || [ ! -x "$dest" ]; then
+                echo -e "${RED}无法设置执行权限：$dest${NC}"
+                return 1
+            fi
             return 0
         fi
         echo -e "${YELLOW}! 已存在的 $script_name 语法或版本检查失败，将重新下载。${NC}"
@@ -761,8 +818,8 @@ show_tc_takeover_warning() {
 show_tc_auto_recovery_notice() {
     echo "启用后，恢复服务会在开机网络就绪时检查 Dog/NTC TC 规则。"
     echo "规则正常或当前没有需要恢复的规则时，不会修改 TC。"
-    echo "只有 Dog/NTC 自身规则失效时，才会删除冲突配置并按现有状态重建。"
-    echo "外部 TC 规则不会被保留。"
+    echo "默认 qdisc 缺失或已识别的 Dog/NTC 统一层级失效时，才会按现有状态重建。"
+    echo "检测到外部或未知 root qdisc 时会拒绝自动接管，须由主菜单 9 手动确认。"
 }
 
 confirm_enable_tc_auto_recovery() {
@@ -856,8 +913,11 @@ manage_tc_recovery() {
             confirm_enable_tc_auto_recovery || true
             ;;
         4)
-            disable_tc_auto_recovery
-            echo -e "${GREEN}开机自动恢复已关闭。${NC}"
+            if disable_tc_auto_recovery; then
+                echo -e "${GREEN}开机自动恢复已关闭。${NC}"
+            else
+                echo -e "${RED}开机自动恢复关闭失败；现有启用状态未被确认改变。${NC}"
+            fi
             ;;
         0) return ;;
         *) echo -e "${RED}无效选择。${NC}" ;;
@@ -1093,7 +1153,7 @@ lite_compare_ge() {
 
 lite_vnstat_config_value() {
     local target="$1"
-    vnstat --showconfig 2>/dev/null | awk -v target="$target" '
+    lite_vnstat_cmd --showconfig 2>/dev/null | awk -v target="$target" '
         {
             key=$1
             sub(/^[;#]/, "", key)
@@ -1105,11 +1165,97 @@ lite_vnstat_config_value() {
     '
 }
 
+lite_vnstat_cmd() {
+    local config_path=""
+    config_path=$(cat "$VNSTAT_CONFIG_PATH_FILE" 2>/dev/null || true)
+    if [ -n "$config_path" ] && [ "${config_path#/}" != "$config_path" ] && [ -f "$config_path" ]; then
+        vnstat --config "$config_path" "$@"
+    else
+        vnstat "$@"
+    fi
+}
+
+lite_vnstat_daemon_is_running() {
+    local comm_file
+    for comm_file in /proc/[0-9]*/comm; do
+        [ -r "$comm_file" ] || continue
+        [ "$(cat "$comm_file" 2>/dev/null)" = "vnstatd" ] && return 0
+    done
+    return 1
+}
+
+lite_normalize_vnstat_json_for_interface() {
+    local vnstat_json="$1"
+    local expected_interface="$2"
+
+    [[ "$expected_interface" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || return 1
+    printf '%s' "$vnstat_json" | jq -ce --arg expected "$expected_interface" '
+        def uint: type == "number" and . >= 0 and floor == .;
+        def leap_year($year):
+            ($year % 400 == 0) or (($year % 4 == 0) and ($year % 100 != 0));
+        def month_days($year; $month):
+            if $month == 2 then (if leap_year($year) then 29 else 28 end)
+            elif $month == 4 or $month == 6 or $month == 9 or $month == 11 then 30
+            else 31 end;
+        def valid_date:
+            type == "object" and
+            (.year | uint) and .year >= 1970 and .year <= 9999 and
+            (.month | uint) and .month >= 1 and .month <= 12 and
+            (.day | uint) and .day >= 1 and .day <= month_days(.year; .month);
+        select(.jsonversion == "2" or .jsonversion == 2) |
+        select((.interfaces | type) == "array") |
+        [.interfaces[] | select(.name == $expected)] as $matches |
+        select(($matches | length) == 1) |
+        $matches[0] as $interface |
+        select(($interface | type) == "object") |
+        select($interface.created.date | valid_date) |
+        select(($interface.updated | type) == "object") |
+        select(($interface.traffic | type) == "object") |
+        select(($interface.traffic.day | type) == "array") |
+        select(all($interface.traffic.day[];
+            (.date | valid_date) and (.rx | uint) and (.tx | uint))) |
+        {jsonversion: "2", interfaces: [$interface]}
+    ' 2>/dev/null
+}
+
+lite_vnstat_data_is_fresh() {
+    local vnstat_json="$1"
+    local updated_epoch updated_text now age save_interval update_interval max_age use_utc
+
+    lite_vnstat_daemon_is_running || return 1
+    updated_epoch=$(printf '%s' "$vnstat_json" |
+        jq -r '.interfaces[0].updated.timestamp // empty' 2>/dev/null) || return 1
+    if ! [[ "$updated_epoch" =~ ^[0-9]+$ ]]; then
+        updated_text=$(printf '%s' "$vnstat_json" | jq -r '
+            .interfaces[0].updated as $u |
+            if ($u.date.year == null or $u.date.month == null or $u.date.day == null or
+                $u.time.hour == null or $u.time.minute == null) then empty
+            else "\($u.date.year)-\($u.date.month)-\($u.date.day) \($u.time.hour):\($u.time.minute):\($u.time.second // 0)" end
+        ' 2>/dev/null) || return 1
+        [ -n "$updated_text" ] || return 1
+        use_utc=$(lite_vnstat_config_value "UseUTC")
+        if [ "$use_utc" = "1" ]; then
+            updated_epoch=$(TZ=UTC date -d "$updated_text" +%s 2>/dev/null) || return 1
+        else
+            updated_epoch=$(date -d "$updated_text" +%s 2>/dev/null) || return 1
+        fi
+    fi
+    now=$(date +%s) || return 1
+    save_interval=$(lite_vnstat_config_value "SaveInterval")
+    update_interval=$(lite_vnstat_config_value "UpdateInterval")
+    [[ "$save_interval" =~ ^[1-9][0-9]*$ && "$update_interval" =~ ^[1-9][0-9]*$ ]] || return 1
+    max_age=$((save_interval * 60 + update_interval + 90))
+    age=$((now - updated_epoch))
+    [ "$age" -ge -300 ] && [ "$age" -le "$max_age" ]
+}
+
 lite_vnstat_available_start() {
     local vnstat_json created_num earliest_num available_num trafficless_entries
 
     [ -n "${MAIN_INTERFACE:-}" ] || return 1
-    vnstat_json=$(vnstat -i "$MAIN_INTERFACE" --json 2>/dev/null) || return 1
+    vnstat_json=$(lite_vnstat_cmd -i "$MAIN_INTERFACE" --json 2>/dev/null) || return 1
+    vnstat_json=$(lite_normalize_vnstat_json_for_interface "$vnstat_json" "$MAIN_INTERFACE") || return 1
+    lite_vnstat_data_is_fresh "$vnstat_json" || return 1
     created_num=$(printf '%s' "$vnstat_json" | jq -r \
         '.interfaces[0].created.date | (.year * 10000 + .month * 100 + .day)' 2>/dev/null) || return 1
     earliest_num=$(printf '%s' "$vnstat_json" | jq -r \
@@ -1155,10 +1301,12 @@ lite_current_usage_gb() {
         return 1
     fi
 
-    vnstat_json=$(vnstat -i "$MAIN_INTERFACE" --json 2>/dev/null) || return 1
+    vnstat_json=$(lite_vnstat_cmd -i "$MAIN_INTERFACE" --json 2>/dev/null) || return 1
     if [ -z "$vnstat_json" ]; then
         return 1
     fi
+    vnstat_json=$(lite_normalize_vnstat_json_for_interface "$vnstat_json" "$MAIN_INTERFACE") || return 1
+    lite_vnstat_data_is_fresh "$vnstat_json" || return 1
 
     start_num=$(lite_date_num "$start_date")
     end_num=$(lite_date_num "$end_date")
@@ -1696,7 +1844,11 @@ uninstall_lite() {
         rm -f "$LEGACY_TC_SHORTCUT_PATH"
         echo "✓ 已删除旧快捷命令 $LEGACY_TC_SHORTCUT_PATH"
     fi
-    cleanup_tc_recovery_files_if_unused
+    if ! cleanup_tc_recovery_files_if_unused; then
+        echo -e "${RED}TrafficCop Lite 主体已删除，但共享 TC 自动恢复文件未能安全清理；卸载未完整完成。${NC}"
+        pause
+        return 1
+    fi
 
     echo -e "${GREEN}卸载完成。${NC}"
     pause

@@ -196,6 +196,7 @@ test_monitor_config_restores_previous_state() {
     load_function "$MONITOR_SCRIPT" restore_monitor_config_snapshot || return 1
     load_function "$MONITOR_SCRIPT" initial_config || return 1
     get_main_interface() { printf '%s\n' 'eth0'; }
+    ensure_vnstat_runtime_config() { return 0; }
     ensure_vnstat_interface() { return 0; }
     ensure_vnstat_daily_retention() { return 0; }
     configure_history_policy() { return 0; }
@@ -226,6 +227,7 @@ test_monitor_config_removes_failed_first_config() {
     load_function "$MONITOR_SCRIPT" restore_monitor_config_snapshot || return 1
     load_function "$MONITOR_SCRIPT" initial_config || return 1
     get_main_interface() { printf '%s\n' 'eth0'; }
+    ensure_vnstat_runtime_config() { return 0; }
     ensure_vnstat_interface() { return 0; }
     ensure_vnstat_daily_retention() { return 0; }
     configure_history_policy() { return 0; }
@@ -257,6 +259,7 @@ test_monitor_config_rolls_back_when_writer_reports_failure() {
     load_function "$MONITOR_SCRIPT" restore_monitor_config_snapshot || return 1
     load_function "$MONITOR_SCRIPT" initial_config || return 1
     get_main_interface() { printf '%s\n' 'eth0'; }
+    ensure_vnstat_runtime_config() { return 0; }
     ensure_vnstat_interface() { return 0; }
     ensure_vnstat_daily_retention() { return 0; }
     configure_history_policy() { return 0; }
@@ -304,53 +307,282 @@ test_monitor_rollback_preserves_backup_on_restore_failure() {
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
-test_vnstat_marker_rolls_back_when_config_commit_fails() {
-    local work config_tmp marker_tmp config_path
-    work=$(mktemp -d "$TEST_ROOT/vnstat-rollback.XXXXXX") || return 1
-    config_path="$work/vnstat.conf"
-    config_tmp="$work/vnstat.conf.tmp"
-    RETENTION_STATE_FILE="$work/coverage"
-    marker_tmp="$work/coverage.tmp"
-    printf '%s\n' 'DailyDays 30' > "$config_path"
-    printf '%s\n' 'DailyDays 400' > "$config_tmp"
-    printf '%s\n' '2026-01-01' > "$RETENTION_STATE_FILE"
-    printf '%s\n' '2026-08-11' > "$marker_tmp"
+test_vnstat_modern_config_is_idempotent_and_preserves_custom_values() {
+    local work source first second
+    work=$(mktemp -d "$TEST_ROOT/vnstat-modern.XXXXXX") || return 1
+    source="$work/vnstat.conf"
+    first="$work/first.conf"
+    second="$work/second.conf"
+    VNSTAT_MAX_BANDWIDTH=50000
+    VNSTAT_SAVE_INTERVAL=1
+    cat > "$source" <<'EOF'
+; SaveInterval 5
+UpdateInterval 300
+; MaxBandwidth 7777
+# MaxBWeth0 1000
+DailyDays 30
+CustomSetting keep-me
+EOF
 
-    load_function "$MONITOR_SCRIPT" commit_vnstat_retention_update || return 1
-    mv() {
-        local destination="${*: -1}"
-        if [ "$destination" = "$config_path" ]; then
-            return 1
-        fi
-        command mv "$@"
-    }
+    load_function "$MONITOR_SCRIPT" build_vnstat_config_candidate || return 1
+    build_vnstat_config_candidate "$source" "$first" eth0 false 60 400 || return 1
+    build_vnstat_config_candidate "$first" "$second" eth0 false 60 400 || return 1
+    cmp -s "$first" "$second" || return 1
+    [ "$(grep -c '^SaveInterval ' "$first")" -eq 1 ] || return 1
+    [ "$(grep -c '^MaxBWeth0 ' "$first")" -eq 1 ] || return 1
+    grep -Fxq 'SaveInterval 1' "$first" || return 1
+    grep -Fxq 'UpdateInterval 60' "$first" || return 1
+    grep -Fxq 'MaxBWeth0 50000' "$first" || return 1
+    grep -Fxq 'DailyDays 400' "$first" || return 1
+    grep -Fxq '; MaxBandwidth 7777' "$first" || return 1
+    grep -Fxq 'CustomSetting keep-me' "$first"
+}
 
-    if commit_vnstat_retention_update "$config_path" "$config_tmp" "$marker_tmp"; then
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_vnstat_legacy_config_disables_detection_at_50000_mbit() {
+    local work source candidate
+    work=$(mktemp -d "$TEST_ROOT/vnstat-legacy.XXXXXX") || return 1
+    source="$work/vnstat.conf"
+    candidate="$work/candidate.conf"
+    VNSTAT_MAX_BANDWIDTH=50000
+    VNSTAT_SAVE_INTERVAL=1
+    cat > "$source" <<'EOF'
+; BandwidthDetection 1
+# MaxBandwidth 1000
+; MaxBWens5 1000
+UpdateInterval 30
+EOF
+
+    load_function "$MONITOR_SCRIPT" build_vnstat_config_candidate || return 1
+    build_vnstat_config_candidate "$source" "$candidate" ens5 true '' '' || return 1
+    grep -Fxq 'BandwidthDetection 0' "$candidate" || return 1
+    grep -Fxq 'MaxBandwidth 50000' "$candidate" || return 1
+    grep -Fxq 'MaxBWens5 50000' "$candidate" || return 1
+    grep -Fxq 'SaveInterval 1' "$candidate" || return 1
+    grep -Fxq 'UpdateInterval 30' "$candidate"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_vnstat_custom_daemon_config_path_is_preserved_idempotently() {
+    local work config_path
+    work=$(mktemp -d "$TEST_ROOT/vnstat-custom-path.XXXXXX") || return 1
+    WORK_DIR="$work/state"
+    mkdir -p "$WORK_DIR"
+    VNSTAT_CONFIG_PATH_FILE="$WORK_DIR/vnstat_config_path"
+    config_path="$work/custom-vnstat.conf"
+    printf '%s\n' 'SaveInterval 1' > "$config_path"
+    printf '%s\n' "$config_path" > "$VNSTAT_CONFIG_PATH_FILE"
+
+    load_function "$MONITOR_SCRIPT" canonical_config_path || return 1
+    load_function "$MONITOR_SCRIPT" resolve_vnstat_config_path || return 1
+    vnstat_daemon_config_path() { printf '%s\n' "$config_path"; }
+    mv() { printf '%s\n' unexpected > "$work/mv-called"; return 1; }
+
+    resolve_vnstat_config_path || return 1
+    [ "$VNSTAT_CONFIG_PATH" = "$config_path" ] || return 1
+    assert_file_content "$config_path" "$VNSTAT_CONFIG_PATH_FILE" || return 1
+    assert_absent "$work/mv-called"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_vnstat_default_config_requires_matching_install_prefixes() {
+    local work config_path
+    work=$(mktemp -d "$TEST_ROOT/vnstat-prefix-mismatch.XXXXXX") || return 1
+    WORK_DIR="$work/state"
+    mkdir -p "$WORK_DIR"
+    VNSTAT_CONFIG_PATH_FILE="$WORK_DIR/vnstat_config_path"
+    unset VNSTAT_CONFIG_PATH
+
+    load_function "$MONITOR_SCRIPT" canonical_config_path || return 1
+    load_function "$MONITOR_SCRIPT" resolve_vnstat_config_path || return 1
+    vnstat_daemon_config_path() { return 1; }
+    vnstat_daemon_install_prefix() { printf '%s\n' /usr; }
+    vnstat_cli_install_prefix() { printf '%s\n' /usr/local; }
+    vnstat() { printf '%s\n' called > "$work/vnstat-called"; return 0; }
+
+    if resolve_vnstat_config_path; then
         return 1
     fi
-    assert_file_content 'DailyDays 30' "$config_path" || return 1
+    assert_absent "$work/vnstat-called" || return 1
+    assert_absent "$VNSTAT_CONFIG_PATH_FILE" || return 1
+
+    config_path="$work/vnstat.conf"
+    printf '%s\n' 'SaveInterval 1' > "$config_path"
+    vnstat_cli_install_prefix() { printf '%s\n' /usr; }
+    vnstat() { printf 'Config file: %s\n' "$config_path"; }
+    resolve_vnstat_config_path || return 1
+    [ "$VNSTAT_CONFIG_PATH" = "$config_path" ] || return 1
+    assert_file_content "$config_path" "$VNSTAT_CONFIG_PATH_FILE"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_vnstat_runtime_starts_daemon_before_resolving_custom_config() {
+    local work expected
+    work=$(mktemp -d "$TEST_ROOT/vnstat-start-before-resolve.XXXXXX") || return 1
+    expected="$work/expected"
+    printf '%s\n' start resolve align 'apply:/custom/vnstat.conf:60' > "$expected"
+
+    load_function "$MONITOR_SCRIPT" ensure_vnstat_runtime_config || return 1
+    ensure_vnstat_daemon_running() { printf '%s\n' start >> "$work/events"; }
+    resolve_vnstat_config_path() {
+        printf '%s\n' resolve >> "$work/events"
+        VNSTAT_CONFIG_PATH=/custom/vnstat.conf
+    }
+    align_timezone_with_vnstat() { printf '%s\n' align >> "$work/events"; }
+    vnstat_version_parts() { printf '%s\n' '2 10'; }
+    vnstat_config_value() { printf '%s\n' 300; }
+    apply_vnstat_config_update() {
+        printf 'apply:%s:%s\n' "$1" "$4" >> "$work/events"
+    }
+
+    ensure_vnstat_runtime_config eth0 || return 1
+    cmp -s "$expected" "$work/events"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_vnstat_unchanged_config_does_not_reload_daemon() {
+    local work config_path
+    work=$(mktemp -d "$TEST_ROOT/vnstat-no-reload.XXXXXX") || return 1
+    WORK_DIR="$work/state"
+    mkdir -p "$WORK_DIR"
+    config_path="$work/vnstat.conf"
+    RETENTION_STATE_FILE="$WORK_DIR/coverage"
+    VNSTAT_MAX_BANDWIDTH=50000
+    VNSTAT_SAVE_INTERVAL=1
+    cat > "$config_path" <<'EOF'
+SaveInterval 1
+UpdateInterval 60
+MaxBWeth0 50000
+EOF
+
+    load_function "$MONITOR_SCRIPT" build_vnstat_config_candidate || return 1
+    load_function "$MONITOR_SCRIPT" canonical_config_path || return 1
+    load_function "$MONITOR_SCRIPT" select_vnstat_backup_path || return 1
+    load_function "$MONITOR_SCRIPT" apply_vnstat_config_update || return 1
+    vnstat_config_candidate_valid() { return 0; }
+    ensure_vnstat_daemon_running() { printf '%s\n' started > "$work/daemon"; }
+    reload_vnstat_daemon() { printf '%s\n' reloaded > "$work/reload"; }
+
+    apply_vnstat_config_update "$config_path" eth0 false '' '' false >/dev/null || return 1
+    assert_file_content 'started' "$work/daemon" || return 1
+    assert_absent "$work/reload" || return 1
+    assert_absent "$WORK_DIR/vnstat.conf.before-trafficcop-lite"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_vnstat_reload_failure_restores_config_and_marker() {
+    local work config_path old_config reload_count=0
+    work=$(mktemp -d "$TEST_ROOT/vnstat-reload-rollback.XXXXXX") || return 1
+    WORK_DIR="$work/state"
+    mkdir -p "$WORK_DIR"
+    config_path="$work/vnstat.conf"
+    RETENTION_STATE_FILE="$WORK_DIR/coverage"
+    VNSTAT_MAX_BANDWIDTH=50000
+    VNSTAT_SAVE_INTERVAL=1
+    cat > "$config_path" <<'EOF'
+SaveInterval 5
+UpdateInterval 300
+MaxBWeth0 1000
+DailyDays 30
+EOF
+    old_config=$(cat "$config_path")
+    printf '%s\n' '2026-01-01' > "$RETENTION_STATE_FILE"
+
+    load_function "$MONITOR_SCRIPT" build_vnstat_config_candidate || return 1
+    load_function "$MONITOR_SCRIPT" rollback_vnstat_config_update || return 1
+    load_function "$MONITOR_SCRIPT" canonical_config_path || return 1
+    load_function "$MONITOR_SCRIPT" select_vnstat_backup_path || return 1
+    load_function "$MONITOR_SCRIPT" apply_vnstat_config_update || return 1
+    vnstat_config_candidate_valid() { return 0; }
+    reload_vnstat_daemon() {
+        reload_count=$((reload_count + 1))
+        [ "$reload_count" -gt 1 ]
+    }
+    chown() { return 0; }
+
+    if apply_vnstat_config_update "$config_path" eth0 false 60 400 true >/dev/null 2>&1; then
+        return 1
+    fi
+    assert_file_content "$old_config" "$config_path" || return 1
     assert_file_content '2026-01-01' "$RETENTION_STATE_FILE" || return 1
-    assert_absent "$config_tmp" || return 1
-    assert_absent "$marker_tmp"
+    assert_file_content "$old_config" "$WORK_DIR/vnstat.conf.before-trafficcop-lite" || return 1
+    [ "$reload_count" -eq 2 ]
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
 test_vnstat_config_and_marker_commit_together() {
-    local work config_tmp marker_tmp config_path
-    work=$(mktemp -d "$TEST_ROOT/vnstat-success.XXXXXX") || return 1
+    local work config_path old_config reload_count=0 today
+    work=$(mktemp -d "$TEST_ROOT/vnstat-config-success.XXXXXX") || return 1
+    WORK_DIR="$work/state"
+    mkdir -p "$WORK_DIR"
     config_path="$work/vnstat.conf"
-    config_tmp="$work/vnstat.conf.tmp"
-    RETENTION_STATE_FILE="$work/coverage"
-    marker_tmp="$work/coverage.tmp"
-    printf '%s\n' 'DailyDays 30' > "$config_path"
-    printf '%s\n' 'DailyDays 400' > "$config_tmp"
+    RETENTION_STATE_FILE="$WORK_DIR/coverage"
+    VNSTAT_MAX_BANDWIDTH=50000
+    VNSTAT_SAVE_INTERVAL=1
+    cat > "$config_path" <<'EOF'
+SaveInterval 5
+UpdateInterval 300
+MaxBWeth0 1000
+DailyDays 30
+EOF
+    old_config=$(cat "$config_path")
     printf '%s\n' '2026-01-01' > "$RETENTION_STATE_FILE"
-    printf '%s\n' '2026-08-11' > "$marker_tmp"
+    today=$(date +%Y-%m-%d) || return 1
 
-    load_function "$MONITOR_SCRIPT" commit_vnstat_retention_update || return 1
-    commit_vnstat_retention_update "$config_path" "$config_tmp" "$marker_tmp" || return 1
-    assert_file_content 'DailyDays 400' "$config_path" || return 1
-    assert_file_content '2026-08-11' "$RETENTION_STATE_FILE"
+    load_function "$MONITOR_SCRIPT" build_vnstat_config_candidate || return 1
+    load_function "$MONITOR_SCRIPT" rollback_vnstat_config_update || return 1
+    load_function "$MONITOR_SCRIPT" canonical_config_path || return 1
+    load_function "$MONITOR_SCRIPT" select_vnstat_backup_path || return 1
+    load_function "$MONITOR_SCRIPT" apply_vnstat_config_update || return 1
+    vnstat_config_candidate_valid() { return 0; }
+    reload_vnstat_daemon() { reload_count=$((reload_count + 1)); }
+    chown() { return 0; }
+
+    apply_vnstat_config_update "$config_path" eth0 false 60 400 true >/dev/null || return 1
+    grep -Fxq 'SaveInterval 1' "$config_path" || return 1
+    grep -Fxq 'UpdateInterval 60' "$config_path" || return 1
+    grep -Fxq 'MaxBWeth0 50000' "$config_path" || return 1
+    grep -Fxq 'DailyDays 400' "$config_path" || return 1
+    assert_file_content "$today" "$RETENTION_STATE_FILE" || return 1
+    assert_file_content "$old_config" "$WORK_DIR/vnstat.conf.before-trafficcop-lite" || return 1
+    [ "$reload_count" -eq 1 ] || return 1
+    ! find "$work" -name '*.trafficcop-lite.*' -print -quit | grep -q .
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_vnstat_backups_are_bound_to_canonical_config_paths() {
+    local work first_config second_config first_original second_original
+    work=$(mktemp -d "$TEST_ROOT/vnstat-backup-paths.XXXXXX") || return 1
+    WORK_DIR="$work/state"
+    mkdir -p "$WORK_DIR"
+    first_config="$work/first-vnstat.conf"
+    second_config="$work/second-vnstat.conf"
+    mkdir -p "$work/sub"
+    RETENTION_STATE_FILE="$WORK_DIR/coverage"
+    VNSTAT_MAX_BANDWIDTH=50000
+    VNSTAT_SAVE_INTERVAL=1
+    printf '%s\n' 'SaveInterval 5' 'UpdateInterval 300' 'MaxBWeth0 1000' > "$first_config"
+    printf '%s\n' 'SaveInterval 10' 'UpdateInterval 120' 'MaxBWeth0 2000' > "$second_config"
+    first_original=$(cat "$first_config")
+    second_original=$(cat "$second_config")
+
+    load_function "$MONITOR_SCRIPT" build_vnstat_config_candidate || return 1
+    load_function "$MONITOR_SCRIPT" canonical_config_path || return 1
+    load_function "$MONITOR_SCRIPT" select_vnstat_backup_path || return 1
+    load_function "$MONITOR_SCRIPT" apply_vnstat_config_update || return 1
+    vnstat_config_candidate_valid() { return 0; }
+    reload_vnstat_daemon() { return 0; }
+    chown() { return 0; }
+
+    apply_vnstat_config_update "$first_config" eth0 false 60 '' false >/dev/null || return 1
+    [ "$(select_vnstat_backup_path "$work/sub/../first-vnstat.conf")" = \
+        "$WORK_DIR/vnstat.conf.before-trafficcop-lite" ] || return 1
+    apply_vnstat_config_update "$second_config" eth0 false 60 '' false >/dev/null || return 1
+
+    assert_file_content "$first_original" "$WORK_DIR/vnstat.conf.before-trafficcop-lite" || return 1
+    assert_file_content "$first_config" "$WORK_DIR/vnstat.conf.before-trafficcop-lite.source-path" || return 1
+    assert_file_content "$second_original" "$WORK_DIR/vnstat.conf.before-trafficcop-lite.1" || return 1
+    assert_file_content "$second_config" "$WORK_DIR/vnstat.conf.before-trafficcop-lite.1.source-path"
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
@@ -536,8 +768,8 @@ test_update_replaces_full_release_and_preserves_state() {
     printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.0' > "$WORK_DIR/$MACHINE_LIMIT_SCRIPT"
     printf '%s\n' 'CONFIG=keep-me' > "$WORK_DIR/traffic_monitor_config.txt"
 
-    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.8"' > "$remote_dir/trafficcop-lite.sh"
-    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.6"' > "$remote_dir/$MONITOR_SCRIPT"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.9"' > "$remote_dir/trafficcop-lite.sh"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.7"' > "$remote_dir/$MONITOR_SCRIPT"
     printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.3"' > "$remote_dir/$TELEGRAM_SCRIPT"
     printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.7' > "$remote_dir/$MACHINE_LIMIT_SCRIPT"
 
@@ -553,8 +785,8 @@ test_update_replaces_full_release_and_preserves_state() {
     install_tc_recovery_service_files() { :; }
 
     update_scripts 'https://example.invalid/release' >/dev/null || return 1
-    grep -Fqx 'SCRIPT_VERSION="1.1.8"' "$WORK_DIR/trafficcop-lite.sh" || return 1
-    grep -Fqx 'SCRIPT_VERSION="1.1.6"' "$WORK_DIR/$MONITOR_SCRIPT" || return 1
+    grep -Fqx 'SCRIPT_VERSION="1.1.9"' "$WORK_DIR/trafficcop-lite.sh" || return 1
+    grep -Fqx 'SCRIPT_VERSION="1.1.7"' "$WORK_DIR/$MONITOR_SCRIPT" || return 1
     grep -Fqx 'SCRIPT_VERSION="1.1.3"' "$WORK_DIR/$TELEGRAM_SCRIPT" || return 1
     grep -Fqx '# TrafficCop Lite Machine Limit v2.7' "$WORK_DIR/$MACHINE_LIMIT_SCRIPT" || return 1
     assert_file_content 'CONFIG=keep-me' "$WORK_DIR/traffic_monitor_config.txt" || return 1
@@ -562,7 +794,7 @@ test_update_replaces_full_release_and_preserves_state() {
     [ -n "$backup_main" ] || return 1
     grep -Fqx 'SCRIPT_VERSION="1.0.2"' "$backup_main" || return 1
     [ "$UPDATE_PREVIOUS_VERSION" = '1.0.2' ] || return 1
-    [ "$UPDATE_NEW_VERSION" = '1.1.8' ] || return 1
+    [ "$UPDATE_NEW_VERSION" = '1.1.9' ] || return 1
     assert_file_content 'called' "$work/shortcut-called"
 }
 
@@ -602,6 +834,74 @@ test_retention_decline_aborts_configuration() {
     vnstat_config_value() { printf '%s\n' '30'; }
 
     if printf '%s\n' 'n' | ensure_vnstat_daily_retention >/dev/null; then
+        return 1
+    fi
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_vnstat_freshness_rejects_dead_and_stale_daemon_data() {
+    local now fresh_json stale_json daemon_running=true
+    command -v jq >/dev/null 2>&1 || return 1
+    now=$(date +%s) || return 1
+    fresh_json=$(printf '{"interfaces":[{"updated":{"timestamp":%s}}]}' "$((now - 30))")
+    stale_json=$(printf '{"interfaces":[{"updated":{"timestamp":%s}}]}' "$((now - 1000))")
+
+    load_function "$MONITOR_SCRIPT" vnstat_data_is_fresh || return 1
+    vnstat_daemon_is_running() { "$daemon_running"; }
+    vnstat_config_value() {
+        case "$1" in
+            SaveInterval) printf '%s\n' '1' ;;
+            UpdateInterval) printf '%s\n' '60' ;;
+        esac
+    }
+
+    vnstat_data_is_fresh "$fresh_json" || return 1
+    if vnstat_data_is_fresh "$stale_json"; then
+        return 1
+    fi
+    daemon_running=false
+    if vnstat_data_is_fresh "$fresh_json"; then
+        return 1
+    fi
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_vnstat_json_is_normalized_for_the_requested_interface() {
+    local valid_json missing_tx_json invalid_date_json leap_day_json normalized
+    command -v jq >/dev/null 2>&1 || return 1
+    valid_json=$(cat <<'JSON'
+{"jsonversion":"2","interfaces":[{"name":"eth1","created":{"date":{"year":2025,"month":1,"day":1}},"updated":{"timestamp":1},"traffic":{"day":[]}},{"name":"eth0","created":{"date":{"year":2025,"month":1,"day":1}},"updated":{"timestamp":1},"traffic":{"day":[{"date":{"year":2026,"month":8,"day":24},"rx":123,"tx":456}]}}]}
+JSON
+)
+    missing_tx_json=$(cat <<'JSON'
+{"jsonversion":"2","interfaces":[{"name":"eth0","created":{"date":{"year":2025,"month":1,"day":1}},"updated":{"timestamp":1},"traffic":{"day":[{"date":{"year":2026,"month":8,"day":24},"rx":123}]}}]}
+JSON
+)
+    invalid_date_json=$(printf '%s' "$valid_json" | jq -c '
+        (.interfaces[] | select(.name == "eth0").traffic.day[0].date) =
+        {year: 2026, month: 2, day: 31}
+    ') || return 1
+    leap_day_json=$(printf '%s' "$valid_json" | jq -c '
+        (.interfaces[] | select(.name == "eth0").traffic.day[0].date) =
+        {year: 2024, month: 2, day: 29}
+    ') || return 1
+
+    load_function "$MONITOR_SCRIPT" normalize_vnstat_json_for_interface || return 1
+    normalized=$(normalize_vnstat_json_for_interface "$valid_json" eth0) || return 1
+    [ "$(printf '%s' "$normalized" | jq -r '.interfaces | length')" = 1 ] || return 1
+    [ "$(printf '%s' "$normalized" | jq -r '.interfaces[0].name')" = eth0 ] || return 1
+    [ "$(printf '%s' "$normalized" | jq -r '.interfaces[0].traffic.day[0].tx')" = 456 ] || return 1
+    normalize_vnstat_json_for_interface "$leap_day_json" eth0 >/dev/null || return 1
+    if normalize_vnstat_json_for_interface "$missing_tx_json" eth0 >/dev/null; then
+        return 1
+    fi
+    if normalize_vnstat_json_for_interface "$invalid_date_json" eth0 >/dev/null; then
+        return 1
+    fi
+    if normalize_vnstat_json_for_interface "$valid_json" ens5 >/dev/null; then
+        return 1
+    fi
+    if normalize_vnstat_json_for_interface "${valid_json/\"jsonversion\":\"2\"/\"jsonversion\":\"3\"}" eth0 >/dev/null; then
         return 1
     fi
 }
@@ -672,6 +972,146 @@ test_tc_change_requires_prepared_state() {
     fi
     assert_file_content 'called' "$work/state-prewrite" || return 1
     assert_absent "$work/tc-called" || return 1
+    [ "$lock_held" = "false" ]
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_tc_query_helpers_preserve_command_errors() {
+    TC_BIN='mock_tc'
+    load_function "$MONITOR_SCRIPT" tc_root_qdisc || return 1
+    load_function "$MONITOR_SCRIPT" tc_class_line || return 1
+    load_function "$MONITOR_SCRIPT" tc_class_output || return 1
+    load_function "$MONITOR_SCRIPT" tc_filter_output || return 1
+    mock_tc() { return 42; }
+
+    tc_root_qdisc eth0 >/dev/null 2>&1
+    [ "$?" -eq 2 ] || return 1
+    tc_class_line eth0 1:1 >/dev/null 2>&1
+    [ "$?" -eq 2 ] || return 1
+    tc_class_output eth0 >/dev/null 2>&1
+    [ "$?" -eq 2 ] || return 1
+    tc_filter_output eth0 >/dev/null 2>&1
+    [ "$?" -eq 2 ] || return 1
+
+    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" tc_root_qdisc || return 1
+    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" tc_class_output || return 1
+    tc_root_qdisc eth0 >/dev/null 2>&1
+    [ "$?" -eq 2 ] || return 1
+    tc_class_output eth0 >/dev/null 2>&1
+    [ "$?" -eq 2 ]
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_tc_apply_query_failure_is_zero_mutation() {
+    local work lock_held=false
+    work=$(mktemp -d "$TEST_ROOT/tc-apply-query-error.XXXXXX") || return 1
+    TC_STATE_FILE="$work/tc-state"
+    LOG_FILE="$work/log"
+    MAIN_INTERFACE='eth0'
+    TC_BIN='mock_tc'
+
+    load_function "$MONITOR_SCRIPT" apply_tc_limit || return 1
+    acquire_tc_hierarchy_lock() { lock_held=true; }
+    release_tc_hierarchy_lock() { lock_held=false; }
+    tc_state_interface() { return 1; }
+    tc_root_qdisc() { return 2; }
+    write_tc_state() { printf '%s\n' unexpected > "$work/state-written"; }
+    mock_tc() { printf '%s\n' "$*" > "$work/tc-called"; }
+
+    if apply_tc_limit 90 >/dev/null; then
+        return 1
+    fi
+    assert_absent "$work/tc-called" || return 1
+    assert_absent "$work/state-written" || return 1
+    assert_absent "$TC_STATE_FILE" || return 1
+    [ "$lock_held" = "false" ]
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_tc_clear_query_failure_preserves_rules_and_state() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/tc-clear-query-error.XXXXXX") || return 1
+    TC_STATE_FILE="$work/tc-state"
+    LOG_FILE="$work/log"
+    TC_STATE_SCHEMA='traffic-tools-unified-htb-v1'
+    TC_STATE_PROVIDER='trafficcop-lite'
+    TC_BIN='mock_tc'
+    printf '%s\n' state > "$TC_STATE_FILE"
+
+    load_function "$MONITOR_SCRIPT" clear_owned_tc_rules_locked || return 1
+    tc_state_interface() { printf '%s\n' eth0; }
+    tc_state_value() {
+        case "$1" in
+            LIMIT_SPEED) printf '%s\n' 90 ;;
+            SCHEMA) printf '%s\n' "$TC_STATE_SCHEMA" ;;
+            PROVIDER) printf '%s\n' "$TC_STATE_PROVIDER" ;;
+        esac
+    }
+    tc_root_qdisc() { printf '%s\n' 'qdisc htb 1: root default 30'; }
+    is_default_qdisc_line() { return 1; }
+    tc_root_is_unified_compatible() { return 0; }
+    tc_verify_unified_hierarchy() { return 0; }
+    tc_has_other_consumers() { return 2; }
+    mock_tc() { printf '%s\n' "$*" > "$work/tc-called"; }
+
+    if clear_owned_tc_rules_locked test >/dev/null; then
+        return 1
+    fi
+    assert_file_content state "$TC_STATE_FILE" || return 1
+    assert_absent "$work/tc-called"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_tc_recovery_query_failure_is_zero_mutation() {
+    local work lock_held=false
+    work=$(mktemp -d "$TEST_ROOT/tc-recover-query-error.XXXXXX") || return 1
+    TC_STATE_FILE="$work/tc-state"
+    TC_STATE_SCHEMA='traffic-tools-unified-htb-v1'
+    TC_STATE_PROVIDER='trafficcop-lite'
+    TC_BIN='mock_tc'
+    MAIN_INTERFACE='eth0'
+    LIMIT_MODE='tc'
+    DISABLED='false'
+    printf '%s\n' state > "$TC_STATE_FILE"
+
+    load_function "$MONITOR_SCRIPT" recover_owned_tc_hierarchy || return 1
+    tc_state_interface() { printf '%s\n' eth0; }
+    tc_state_value() {
+        case "$1" in
+            SCHEMA) printf '%s\n' "$TC_STATE_SCHEMA" ;;
+            PROVIDER) printf '%s\n' "$TC_STATE_PROVIDER" ;;
+            LIMIT_SPEED) printf '%s\n' 90 ;;
+        esac
+    }
+    acquire_tc_hierarchy_lock() { lock_held=true; }
+    release_tc_hierarchy_lock() { lock_held=false; }
+    tc_root_qdisc() { return 2; }
+    mock_tc() { printf '%s\n' "$*" > "$work/tc-called"; }
+
+    if recover_owned_tc_hierarchy --manual >/dev/null 2>&1; then
+        return 1
+    fi
+    assert_file_content state "$TC_STATE_FILE" || return 1
+    assert_absent "$work/tc-called" || return 1
+    [ "$lock_held" = "false" ]
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_tc_self_check_reports_query_error() {
+    local work status=0 lock_held=false
+    work=$(mktemp -d "$TEST_ROOT/tc-self-query-error.XXXXXX") || return 1
+    TC_BIN='mock_tc'
+    TC_STATE_FILE="$work/tc-state"
+
+    load_function "$MONITOR_SCRIPT" tc_self_check || return 1
+    resolve_tc_self_check_interface() { printf '%s\n' eth0; }
+    acquire_tc_hierarchy_lock() { lock_held=true; }
+    release_tc_hierarchy_lock() { lock_held=false; }
+    tc_root_qdisc() { return 2; }
+
+    tc_self_check eth0 > "$work/output" || status=$?
+    [ "$status" -eq 1 ] || return 1
+    assert_file_content 'TC_SELF_CHECK=ERROR INTERFACE=eth0 REASON=tc-query-failed' "$work/output" || return 1
     [ "$lock_held" = "false" ]
 }
 
@@ -853,7 +1293,7 @@ test_unified_hierarchy_verification_requires_full_contract() {
     tc_verify_unified_hierarchy eth0 90kbit
 }
 
-# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+# shellcheck disable=SC2016,SC2034,SC2209,SC2317,SC2329
 test_monitor_crontab_update_holds_project_lock() {
     local work
     work=$(mktemp -d "$TEST_ROOT/root-cron-lock.XXXXXX") || return 1
@@ -1048,6 +1488,62 @@ test_component_download_rejects_versionless_body() {
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_component_download_requires_a_verified_installed_target() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/component-target-verify.XXXXXX") || return 1
+    WORK_DIR="$work/installed"
+    RAW_BASE='https://example.invalid/release'
+    RED=''
+    GREEN=''
+    YELLOW=''
+    NC=''
+    mkdir -p "$WORK_DIR"
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" script_version_from_file || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" version_is_newer || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" validate_update_candidate || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" download_component || return 1
+    download_url_to_file() {
+        printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.0.0"' > "$2"
+    }
+    # 模拟复制工具错误地报告成功但没有生成目标，安装函数仍须自行校验并失败。
+    mv() { return 0; }
+
+    if download_component trafficcop-lite-monitor.sh >/dev/null; then
+        return 1
+    fi
+    assert_absent "$WORK_DIR/trafficcop-lite-monitor.sh"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_local_component_copy_failure_is_reported() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/component-local-copy.XXXXXX") || return 1
+    SCRIPT_DIR="$work/source"
+    WORK_DIR="$work/installed"
+    RED=''
+    GREEN=''
+    YELLOW=''
+    NC=''
+    mkdir -p "$SCRIPT_DIR" "$WORK_DIR"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.0.0"' > "$SCRIPT_DIR/trafficcop-lite-monitor.sh"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="0.9.0"' '# old-installed-copy' > \
+        "$WORK_DIR/trafficcop-lite-monitor.sh"
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" script_version_from_file || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" version_is_newer || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" ensure_component || return 1
+    ensure_work_dir() { return 0; }
+    cp() { return 1; }
+
+    if ensure_component trafficcop-lite-monitor.sh >/dev/null; then
+        return 1
+    fi
+    grep -Fxq '# old-installed-copy' "$WORK_DIR/trafficcop-lite-monitor.sh" || return 1
+    [ "$(script_version_from_file "$WORK_DIR/trafficcop-lite-monitor.sh")" = 0.9.0 ]
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
 test_period_date_boundaries() {
     local CURRENT_DATE='2026-01-01'
 
@@ -1096,6 +1592,7 @@ test_traffic_accounting_modes() {
     WORK_DIR="$TEST_ROOT/nonexistent"
     RETENTION_STATE_FILE="$WORK_DIR/coverage"
 
+    load_function "$MONITOR_SCRIPT" normalize_vnstat_json_for_interface || return 1
     load_function "$MONITOR_SCRIPT" get_traffic_usage || return 1
     get_period_start_date() { printf '%s\n' '2026-07-01'; }
     get_period_end_date() { printf '%s\n' '2026-07-31'; }
@@ -1108,9 +1605,11 @@ test_traffic_accounting_modes() {
     }
     vnstat() {
         cat <<'JSON'
-{"interfaces":[{"created":{"date":{"year":2025,"month":1,"day":1}},"traffic":{"day":[{"date":{"year":2026,"month":6,"day":30},"rx":10000000000,"tx":10000000000},{"date":{"year":2026,"month":7,"day":1},"rx":1000000000,"tx":2000000000},{"date":{"year":2026,"month":7,"day":2},"rx":3000000000,"tx":1000000000}]}}]}
+{"jsonversion":"2","interfaces":[{"name":"eth0","created":{"date":{"year":2025,"month":1,"day":1}},"updated":{"timestamp":1},"traffic":{"day":[{"date":{"year":2026,"month":6,"day":30},"rx":10000000000,"tx":10000000000},{"date":{"year":2026,"month":7,"day":1},"rx":1000000000,"tx":2000000000},{"date":{"year":2026,"month":7,"day":2},"rx":3000000000,"tx":1000000000}]}}]}
 JSON
     }
+    vnstat_cmd() { vnstat "$@"; }
+    vnstat_data_is_fresh() { return 0; }
     check_mode() {
         TRAFFIC_MODE="$1"
         [ "$(get_traffic_usage 2>/dev/null)" = "$2" ]
@@ -1358,6 +1857,7 @@ test_restore_failure_restores_previous_config() {
     assert_absent "$CONFIG_FILE"
 }
 
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
 test_tc_auto_recovery_without_state_is_noop() {
     local work
     work=$(mktemp -d "$TEST_ROOT/tc-auto-no-state.XXXXXX") || return 1
@@ -1375,6 +1875,48 @@ test_tc_auto_recovery_without_state_is_noop() {
     grep -Fq '没有需要自动恢复' "$work/output"
 }
 
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_tc_auto_recovery_refuses_a_foreign_root_with_owned_state() {
+    local work lock_held=false
+    work=$(mktemp -d "$TEST_ROOT/tc-auto-foreign-root.XXXXXX") || return 1
+    TC_BIN='mock_tc'
+    TC_STATE_FILE="$work/tc-state"
+    TC_STATE_SCHEMA='traffic-tools-unified-htb-v1'
+    TC_STATE_PROVIDER='trafficcop-lite'
+    MAIN_INTERFACE='eth0'
+    LIMIT_MODE='tc'
+    DISABLED='false'
+    printf '%s\n' state > "$TC_STATE_FILE"
+
+    load_function "$MONITOR_SCRIPT" recover_owned_tc_hierarchy || return 1
+    tc_state_interface() { printf '%s\n' eth0; }
+    tc_state_value() {
+        case "$1" in
+            SCHEMA) printf '%s\n' "$TC_STATE_SCHEMA" ;;
+            PROVIDER) printf '%s\n' "$TC_STATE_PROVIDER" ;;
+            LIMIT_SPEED) printf '%s\n' 90 ;;
+        esac
+    }
+    acquire_tc_hierarchy_lock() { lock_held=true; }
+    release_tc_hierarchy_lock() { lock_held=false; }
+    tc_root_qdisc() { printf '%s\n' 'qdisc tbf 8001: root refcnt 2 rate 1Gbit'; }
+    tc_root_is_unified_compatible() { return 1; }
+    is_default_qdisc_line() { return 1; }
+    dog_configured_class_ids() { return 0; }
+    write_tc_state() { printf '%s\n' called > "$work/state-write-called"; }
+    mock_tc() { printf '%s\n' "$*" > "$work/tc-called"; }
+
+    if recover_owned_tc_hierarchy --auto > "$work/output" 2>&1; then
+        return 1
+    fi
+    grep -Fq '拒绝接管' "$work/output" || return 1
+    assert_file_content state "$TC_STATE_FILE" || return 1
+    assert_absent "$work/state-write-called" || return 1
+    assert_absent "$work/tc-called" || return 1
+    [ "$lock_held" = false ]
+}
+
+# shellcheck disable=SC2016,SC2034,SC2209,SC2317,SC2329
 test_shared_recovery_service_is_opt_in() {
     local work
     work=$(mktemp -d "$TEST_ROOT/tc-recovery-service.XXXXXX") || return 1
@@ -1386,6 +1928,8 @@ test_shared_recovery_service_is_opt_in() {
 
     printf '%s\n' '#!/bin/bash' 'printf "%s\n" "$*" >> "$SYSTEMCTL_LOG"' > "$TC_RECOVERY_SYSTEMCTL"
     chmod 755 "$TC_RECOVERY_SYSTEMCTL"
+    load_function "$ROOT_DIR/trafficcop-lite.sh" tc_recovery_unit_is_owned || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" tc_recovery_runner_is_owned || return 1
     load_function "$ROOT_DIR/trafficcop-lite.sh" install_tc_recovery_service_files || return 1
     load_function "$ROOT_DIR/trafficcop-lite.sh" enable_tc_auto_recovery || return 1
     tc_recovery_systemd_available() { return 0; }
@@ -1402,6 +1946,7 @@ test_shared_recovery_service_is_opt_in() {
     grep -Fxq 'enable traffic-tools-tc-recovery.service' "$SYSTEMCTL_LOG"
 }
 
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
 test_tc_recovery_waits_for_monitor_lock() {
     local work
     work=$(mktemp -d "$TEST_ROOT/tc-recovery-monitor-lock.XXXXXX") || return 1
@@ -1427,6 +1972,7 @@ test_tc_recovery_waits_for_monitor_lock() {
     [ "$(head -n 1 "$work/flock.calls")" = '-w 15 9' ]
 }
 
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
 test_tc_recovery_menu_requires_confirm_only_for_conflict() {
     local healthy_output
     local conflict_output
@@ -1483,6 +2029,156 @@ test_tc_recovery_menu_requires_confirm_only_for_conflict() {
     ! grep -Fq 'AUTO_RECOVERY_ENABLED' <<< "$automatic_output"
 }
 
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_tc_boot_rebuild_requires_a_known_state_schema() {
+    TC_STATE_SCHEMA='traffic-tools-unified-htb-v1'
+    TC_STATE_PROVIDER='trafficcop-lite'
+    local mock_schema='unknown-v2'
+    local mock_provider='trafficcop-lite'
+
+    load_function "$MONITOR_SCRIPT" tc_state_allows_boot_rebuild || return 1
+    tc_state_interface() { printf '%s\n' eth0; }
+    current_boot_id() { printf '%s\n' current-boot; }
+    tc_state_value() {
+        case "$1" in
+            SCHEMA) printf '%s\n' "$mock_schema" ;;
+            PROVIDER) printf '%s\n' "$mock_provider" ;;
+            LIMIT_SPEED) printf '%s\n' 90 ;;
+            BOOT_ID) printf '%s\n' previous-boot ;;
+        esac
+    }
+
+    ! tc_state_allows_boot_rebuild eth0 || return 1
+    mock_schema="$TC_STATE_SCHEMA"
+    mock_provider=''
+    ! tc_state_allows_boot_rebuild eth0 || return 1
+    mock_schema=''
+    mock_provider=''
+    tc_state_allows_boot_rebuild eth0 || return 1
+    mock_schema="$TC_STATE_SCHEMA"
+    mock_provider="$TC_STATE_PROVIDER"
+    tc_state_allows_boot_rebuild eth0
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_tc_clear_preserves_state_without_an_interface() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/tc-state-no-interface.XXXXXX") || return 1
+    TC_STATE_FILE="$work/tc-state"
+    LOG_FILE="$work/log"
+    TC_BIN='mock_tc'
+    printf '%s\n' 'LIMIT_SPEED=90' > "$TC_STATE_FILE"
+
+    load_function "$MONITOR_SCRIPT" clear_owned_tc_rules_locked || return 1
+    tc_state_interface() { return 0; }
+    mock_tc() { printf '%s\n' "$*" > "$work/tc-called"; }
+
+    if clear_owned_tc_rules_locked test >/dev/null; then
+        return 1
+    fi
+    assert_file_content 'LIMIT_SPEED=90' "$TC_STATE_FILE" || return 1
+    assert_absent "$work/tc-called"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_tc_manual_recovery_rejects_an_unreadable_dog_config() {
+    local work lock_held=false
+    work=$(mktemp -d "$TEST_ROOT/tc-recover-invalid-dog.XXXXXX") || return 1
+    TC_STATE_FILE="$work/tc-state"
+    DOG_CONFIG_FILE="$work/dog-config.json"
+    DOG_TC_OWNER_FILE="$work/dog-owner"
+    TC_STATE_SCHEMA='traffic-tools-unified-htb-v1'
+    TC_STATE_PROVIDER='trafficcop-lite'
+    TC_BIN='mock_tc'
+    MAIN_INTERFACE='eth0'
+    LIMIT_MODE='tc'
+    DISABLED='false'
+    printf '%s\n' state > "$TC_STATE_FILE"
+    printf '%s\n' '{"ports":' > "$DOG_CONFIG_FILE"
+
+    load_function "$MONITOR_SCRIPT" dog_configured_class_ids || return 1
+    load_function "$MONITOR_SCRIPT" recover_owned_tc_hierarchy || return 1
+    tc_state_interface() { printf '%s\n' eth0; }
+    tc_state_value() {
+        case "$1" in
+            SCHEMA) printf '%s\n' "$TC_STATE_SCHEMA" ;;
+            PROVIDER) printf '%s\n' "$TC_STATE_PROVIDER" ;;
+            LIMIT_SPEED) printf '%s\n' 90 ;;
+        esac
+    }
+    acquire_tc_hierarchy_lock() { lock_held=true; }
+    release_tc_hierarchy_lock() { lock_held=false; }
+    tc_root_qdisc() { printf '%s\n' 'qdisc tbf 8001: root rate 1Gbit'; }
+    tc_root_is_unified_compatible() { return 1; }
+    is_default_qdisc_line() { return 1; }
+    write_tc_state() { printf '%s\n' called > "$work/state-write-called"; }
+    mock_tc() { printf '%s\n' "$*" > "$work/tc-called"; }
+
+    if recover_owned_tc_hierarchy --manual > "$work/output" 2>&1; then
+        return 1
+    fi
+    grep -Fq 'Dog 配置存在但无法安全解析' "$work/output" || return 1
+    assert_file_content state "$TC_STATE_FILE" || return 1
+    assert_absent "$work/state-write-called" || return 1
+    assert_absent "$work/tc-called" || return 1
+    [ "$lock_held" = false ]
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_tc_recovery_unit_ownership_is_fail_closed() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/tc-recovery-unit.XXXXXX") || return 1
+    TC_RECOVERY_UNIT_FILE="$work/traffic-tools-tc-recovery.service"
+    TC_RECOVERY_RUNNER="$work/traffic-tools-tc-recovery.sh"
+    TC_RECOVERY_SERVICE='traffic-tools-tc-recovery.service'
+    TC_RECOVERY_SYSTEMCTL='mock_systemctl'
+    local disable_rc=1
+    local systemctl_trace="$work/systemctl.trace"
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" tc_recovery_unit_is_owned || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" tc_recovery_runner_is_owned || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" install_tc_recovery_service_files || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" tc_auto_recovery_state || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" disable_tc_auto_recovery || return 1
+    tc_recovery_systemd_available() { return 0; }
+    mock_systemctl() {
+        printf '%s\n' "$*" >> "$systemctl_trace"
+        case "${1:-}" in
+            is-enabled|daemon-reload) return 0 ;;
+            disable) return "$disable_rc" ;;
+            *) return 0 ;;
+        esac
+    }
+
+    printf '%s\n' '# foreign unit' > "$TC_RECOVERY_UNIT_FILE"
+    if install_tc_recovery_service_files >/dev/null 2>&1; then
+        return 1
+    fi
+    assert_absent "$TC_RECOVERY_RUNNER" || return 1
+    [ "$(tc_auto_recovery_state)" = '冲突（同名 unit 不属于 Dog/NTC）' ] || return 1
+    : > "$systemctl_trace"
+    if disable_tc_auto_recovery >/dev/null 2>&1; then
+        return 1
+    fi
+    [ ! -s "$systemctl_trace" ] || return 1
+
+    printf '%s\n' '# traffic-tools-tc-recovery-v1' > "$TC_RECOVERY_UNIT_FILE"
+    if disable_tc_auto_recovery >/dev/null 2>&1; then
+        return 1
+    fi
+    grep -Fqx "disable $TC_RECOVERY_SERVICE" "$systemctl_trace" || return 1
+    disable_rc=0
+    disable_tc_auto_recovery || return 1
+
+    rm -f "$TC_RECOVERY_UNIT_FILE"
+    install_tc_recovery_service_files || return 1
+    grep -Fq 'bash "$dog_script" --recover-tc "$mode" || result=1' "$TC_RECOVERY_RUNNER" || return 1
+    grep -Fq 'bash "$ntc_monitor" --tc-recover-owned "$mode" || result=1' "$TC_RECOVERY_RUNNER" || return 1
+    grep -Fq 'exit "$result"' "$TC_RECOVERY_RUNNER" || return 1
+    extract_function "$ROOT_DIR/trafficcop-lite.sh" uninstall_lite |
+        grep -Fq 'if ! cleanup_tc_recovery_files_if_unused'
+}
+
 run_test() {
     local name="$1"
     local test_function="$2"
@@ -1504,8 +2200,15 @@ run_test 'monitor config restores previous state' test_monitor_config_restores_p
 run_test 'monitor first config is removed after post-save failure' test_monitor_config_removes_failed_first_config
 run_test 'monitor config rolls back when writer reports failure' test_monitor_config_rolls_back_when_writer_reports_failure
 run_test 'monitor rollback preserves backup after restore failure' test_monitor_rollback_preserves_backup_on_restore_failure
-run_test 'vnStat marker rolls back after config commit failure' test_vnstat_marker_rolls_back_when_config_commit_fails
-run_test 'vnStat config and marker commit together' test_vnstat_config_and_marker_commit_together
+run_test 'vnStat modern config is idempotent and preserves custom values' test_vnstat_modern_config_is_idempotent_and_preserves_custom_values
+run_test 'vnStat 2.0-2.8 compatibility disables detection at 50000 Mbit' test_vnstat_legacy_config_disables_detection_at_50000_mbit
+run_test 'vnStat custom daemon config path is preserved idempotently' test_vnstat_custom_daemon_config_path_is_preserved_idempotently
+run_test 'vnStat default config requires matching daemon and CLI prefixes' test_vnstat_default_config_requires_matching_install_prefixes
+run_test 'vnStat starts daemon before resolving a custom service config' test_vnstat_runtime_starts_daemon_before_resolving_custom_config
+run_test 'vnStat unchanged config does not reload the daemon' test_vnstat_unchanged_config_does_not_reload_daemon
+run_test 'vnStat reload failure restores config and coverage marker' test_vnstat_reload_failure_restores_config_and_marker
+run_test 'vnStat config and coverage marker commit together' test_vnstat_config_and_marker_commit_together
+run_test 'vnStat backups remain bound to canonical config paths' test_vnstat_backups_are_bound_to_canonical_config_paths
 run_test 'Telegram menu does not hold cron lock' test_telegram_menu_does_not_hold_cron_lock
 run_test 'Telegram cron still takes lock' test_telegram_cron_still_takes_lock
 run_test 'Telegram action releases lock after failure' test_telegram_action_releases_lock_after_failure
@@ -1516,16 +2219,28 @@ run_test 'complete bundle install remains local' test_complete_bundle_install_st
 run_test 'update replaces full release and preserves state' test_update_replaces_full_release_and_preserves_state
 run_test 'update rollback requires backup evidence' test_update_rollback_requires_backup_evidence
 run_test 'declining vnStat retention aborts configuration' test_retention_decline_aborts_configuration
+run_test 'vnStat freshness rejects dead and stale daemon data' test_vnstat_freshness_rejects_dead_and_stale_daemon_data
+run_test 'vnStat JSON is normalized for the requested interface' test_vnstat_json_is_normalized_for_the_requested_interface
 run_test 'vnStat history read errors abort configuration' test_vnstat_history_read_error_aborts_configuration
 run_test 'post-save read errors preserve runtime state' test_post_save_read_error_preserves_runtime_state
 run_test 'TC changes require a prepared ownership state' test_tc_change_requires_prepared_state
+run_test 'TC query helpers preserve command errors' test_tc_query_helpers_preserve_command_errors
+run_test 'TC apply query failure performs zero mutation' test_tc_apply_query_failure_is_zero_mutation
+run_test 'TC clear query failure preserves rules and state' test_tc_clear_query_failure_preserves_rules_and_state
+run_test 'TC recovery query failure performs zero mutation' test_tc_recovery_query_failure_is_zero_mutation
+run_test 'TC self-check reports query errors' test_tc_self_check_reports_query_error
 run_test 'TC builds the unified HTB directly without invoking Dog' test_tc_builds_unified_htb_directly
 run_test 'TC self-check flags legacy state after Dog migrates the hierarchy' test_self_check_flags_legacy_state_after_dog_migration
 run_test 'TC refuses an unrecognized root qdisc without mutation' test_tc_refuses_foreign_root_without_mutation
 run_test 'TC auto recovery is a no-op without an existing owned state' test_tc_auto_recovery_without_state_is_noop
+run_test 'TC auto recovery refuses a foreign root with owned state' test_tc_auto_recovery_refuses_a_foreign_root_with_owned_state
 run_test 'shared TC recovery service remains disabled until explicitly enabled' test_shared_recovery_service_is_opt_in
 run_test 'TC recovery waits briefly for the monitor lock' test_tc_recovery_waits_for_monitor_lock
 run_test 'TC recovery menu confirms takeover only after detecting a conflict' test_tc_recovery_menu_requires_confirm_only_for_conflict
+run_test 'TC boot rebuild accepts only known state schemas' test_tc_boot_rebuild_requires_a_known_state_schema
+run_test 'TC cleanup preserves an invalid state without an interface' test_tc_clear_preserves_state_without_an_interface
+run_test 'TC manual recovery rejects an unreadable Dog config without mutation' test_tc_manual_recovery_rejects_an_unreadable_dog_config
+run_test 'TC recovery unit ownership and disable failures are fail-closed' test_tc_recovery_unit_ownership_is_fail_closed
 run_test 'legacy TBF adoption requires a matching numeric speed' test_legacy_tbf_requires_matching_numeric_speed
 run_test 'invalid Dog config cannot authorize HTB adoption' test_invalid_dog_config_cannot_authorize_adoption
 run_test 'unified HTB verification requires the full root and class contract' test_unified_hierarchy_verification_requires_full_contract
@@ -1536,6 +2251,8 @@ run_test 'Telegram legacy config is parsed without execution' test_telegram_lega
 run_test 'Telegram plain config round-trips special values' test_telegram_plain_config_round_trip
 run_test 'Telegram token is absent from curl arguments' test_telegram_token_is_not_in_curl_arguments
 run_test 'component download rejects versionless responses' test_component_download_rejects_versionless_body
+run_test 'component download verifies the installed target' test_component_download_requires_a_verified_installed_target
+run_test 'local component copy failures are reported' test_local_component_copy_failure_is_reported
 run_test 'period date boundaries remain correct' test_period_date_boundaries
 run_test 'traffic accounting modes remain correct' test_traffic_accounting_modes
 run_test 'invalid limit speed is rejected while missing values stay compatible' test_invalid_limit_speed_is_rejected

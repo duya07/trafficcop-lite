@@ -11,6 +11,7 @@ TC_STATE_FILE="$WORK_DIR/tc_limit_state"
 ENFORCEMENT_STATE_FILE="$WORK_DIR/enforcement_state"
 SHUTDOWN_STATE_FILE="$WORK_DIR/shutdown_limit_state"
 MONITOR_LOCK_FILE="$WORK_DIR/traffic_monitor.lock"
+VNSTAT_CONFIG_PATH_FILE="$WORK_DIR/vnstat_config_path"
 ROOT_CRONTAB_LOCK_FILE="${TRAFFICCOP_ROOT_CRONTAB_LOCK_FILE:-$WORK_DIR/root-crontab.lock}"
 TC_STATE_SCHEMA="traffic-tools-unified-htb-v1"
 TC_STATE_PROVIDER="trafficcop-lite"
@@ -83,9 +84,18 @@ tc_state_value() {
 
 tc_root_qdisc() {
     local interface="$1"
-    if [ -n "$TC_BIN" ] && [ -n "$interface" ]; then
-        "$TC_BIN" qdisc show dev "$interface" root 2>/dev/null | head -n 1
-    fi
+    local qdisc_state qdisc_line
+    [ -n "$TC_BIN" ] && [ -n "$interface" ] || return 2
+    qdisc_state=$("$TC_BIN" qdisc show dev "$interface" root 2>/dev/null) || return 2
+    qdisc_line=$(awk 'NR == 1 { print; exit }' <<< "$qdisc_state")
+    [ -n "$qdisc_line" ] || return 1
+    printf '%s\n' "$qdisc_line"
+}
+
+tc_class_output() {
+    local interface="$1"
+    [ -n "$TC_BIN" ] && [ -n "$interface" ] || return 2
+    "$TC_BIN" class show dev "$interface" 2>/dev/null || return 2
 }
 
 enforcement_state_value() {
@@ -641,41 +651,53 @@ show_status() {
     fi
     
     # 检查TC规则
-    local interface state_interface qdisc_line state_qdisc_line state_speed state_schema state_provider class_output
+    local interface state_interface qdisc_line state_qdisc_line state_speed state_schema state_provider class_output query_status
     interface=$(get_main_interface)
     state_interface="$(tc_state_value "INTERFACE")"
     if [ -z "$TC_BIN" ]; then
         echo -e "TC限速: ${YELLOW}无法检测（未找到 tc）${NC}"
     elif [ -n "$state_interface" ]; then
         qdisc_line="$(tc_root_qdisc "$state_interface")"
-        state_schema="$(tc_state_value SCHEMA)"
-        state_provider="$(tc_state_value PROVIDER)"
-        state_speed="$(tc_state_value LIMIT_SPEED)"
-        if [ "$state_schema" = "$TC_STATE_SCHEMA" ] && [ "$state_provider" = "$TC_STATE_PROVIDER" ]; then
-            class_output="$("$TC_BIN" class show dev "$state_interface" 2>/dev/null || true)"
-            if echo "$qdisc_line" | grep -Eq '^qdisc htb 1:([[:space:]]|$)' &&
-               printf '%s\n' "$class_output" | grep -Eq '^class htb 1:1([[:space:]]|$)' &&
-               printf '%s\n' "$class_output" | grep -Eq '^class htb 1:30([[:space:]]|$)'; then
-                echo -e "TC限速: ${YELLOW}统一 HTB 已激活（整机 ${state_speed} kbit/s）${NC}"
-            else
-                echo -e "TC限速: ${YELLOW}统一 HTB 状态与当前层级不一致，请运行 ntc --tc-self-check${NC}"
-            fi
-        elif echo "$qdisc_line" | grep -q " tbf "; then
-            state_qdisc_line="$(tc_state_value "QDISC_LINE")"
-            if { [ -n "$state_qdisc_line" ] && [ "$qdisc_line" = "$state_qdisc_line" ]; } \
-                || { [ -z "$state_qdisc_line" ] && [[ "$state_speed" =~ ^[0-9]+$ ]] && echo "$qdisc_line" | grep -Eq "rate[[:space:]]+${state_speed}[Kk]bit"; }; then
-                echo -e "TC限速: ${YELLOW}已激活（本脚本）${NC}"
-            else
-                echo -e "TC限速: ${YELLOW}状态记录与当前 tbf 不一致（按外部规则保留）${NC}"
-            fi
+        query_status=$?
+        if [ "$query_status" -eq 2 ]; then
+            echo -e "TC限速: ${YELLOW}无法检测（tc 查询失败）${NC}"
         else
-            echo -e "TC限速: ${YELLOW}状态标记存在，但当前未检测到 tbf${NC}"
+            [ "$query_status" -eq 0 ] || qdisc_line=""
+            state_schema="$(tc_state_value SCHEMA)"
+            state_provider="$(tc_state_value PROVIDER)"
+            state_speed="$(tc_state_value LIMIT_SPEED)"
+            if [ "$state_schema" = "$TC_STATE_SCHEMA" ] && [ "$state_provider" = "$TC_STATE_PROVIDER" ]; then
+                class_output="$(tc_class_output "$state_interface")"
+                query_status=$?
+                if [ "$query_status" -eq 2 ]; then
+                    echo -e "TC限速: ${YELLOW}无法检测（tc 查询失败）${NC}"
+                elif echo "$qdisc_line" | grep -Eq '^qdisc htb 1:([[:space:]]|$)' &&
+                     printf '%s\n' "$class_output" | grep -Eq '^class htb 1:1([[:space:]]|$)' &&
+                     printf '%s\n' "$class_output" | grep -Eq '^class htb 1:30([[:space:]]|$)'; then
+                    echo -e "TC限速: ${YELLOW}统一 HTB 已激活（整机 ${state_speed} kbit/s）${NC}"
+                else
+                    echo -e "TC限速: ${YELLOW}统一 HTB 状态与当前层级不一致，请运行 ntc --tc-self-check${NC}"
+                fi
+            elif echo "$qdisc_line" | grep -q " tbf "; then
+                state_qdisc_line="$(tc_state_value "QDISC_LINE")"
+                if { [ -n "$state_qdisc_line" ] && [ "$qdisc_line" = "$state_qdisc_line" ]; } \
+                    || { [ -z "$state_qdisc_line" ] && [[ "$state_speed" =~ ^[0-9]+$ ]] && echo "$qdisc_line" | grep -Eq "rate[[:space:]]+${state_speed}[Kk]bit"; }; then
+                    echo -e "TC限速: ${YELLOW}已激活（本脚本）${NC}"
+                else
+                    echo -e "TC限速: ${YELLOW}状态记录与当前 tbf 不一致（按外部规则保留）${NC}"
+                fi
+            else
+                echo -e "TC限速: ${YELLOW}状态标记存在，但当前未检测到 tbf${NC}"
+            fi
         fi
     elif [ -f "$TC_STATE_FILE" ]; then
         echo -e "TC限速: ${YELLOW}状态标记无效（未记录接口）${NC}"
     elif [ -n "$interface" ]; then
         qdisc_line="$(tc_root_qdisc "$interface")"
-        if echo "$qdisc_line" | grep -q " tbf "; then
+        query_status=$?
+        if [ "$query_status" -eq 2 ]; then
+            echo -e "TC限速: ${YELLOW}无法检测（tc 查询失败）${NC}"
+        elif echo "$qdisc_line" | grep -q " tbf "; then
             echo -e "TC限速: ${YELLOW}检测到外部 tbf（非本脚本）${NC}"
         elif echo "$qdisc_line" | grep -Eq '^qdisc htb 1:([[:space:]]|$)'; then
             echo -e "TC限速: ${GREEN}检测到统一 HTB，TrafficCop 当前未施加整机上限${NC}"
@@ -695,6 +717,104 @@ show_status() {
 }
 
 # 详细状态检查
+machine_vnstat_cmd() {
+    local config_path=""
+    config_path=$(cat "$VNSTAT_CONFIG_PATH_FILE" 2>/dev/null || true)
+    if [ -n "$config_path" ] && [ "${config_path#/}" != "$config_path" ] && [ -f "$config_path" ]; then
+        vnstat --config "$config_path" "$@"
+    else
+        vnstat "$@"
+    fi
+}
+
+machine_vnstat_config_value() {
+    local target="$1"
+    machine_vnstat_cmd --showconfig 2>/dev/null | awk -v target="$target" '
+        {
+            key=$1
+            sub(/^[;#]/, "", key)
+            if (key == target) {
+                print $NF
+                exit
+            }
+        }
+    '
+}
+
+machine_vnstat_daemon_is_running() {
+    local comm_file
+    for comm_file in /proc/[0-9]*/comm; do
+        [ -r "$comm_file" ] || continue
+        [ "$(cat "$comm_file" 2>/dev/null)" = "vnstatd" ] && return 0
+    done
+    return 1
+}
+
+machine_normalize_vnstat_json_for_interface() {
+    local vnstat_json="$1"
+    local expected_interface="$2"
+
+    [[ "$expected_interface" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || return 1
+    printf '%s' "$vnstat_json" | jq -ce --arg expected "$expected_interface" '
+        def uint: type == "number" and . >= 0 and floor == .;
+        def leap_year($year):
+            ($year % 400 == 0) or (($year % 4 == 0) and ($year % 100 != 0));
+        def month_days($year; $month):
+            if $month == 2 then (if leap_year($year) then 29 else 28 end)
+            elif $month == 4 or $month == 6 or $month == 9 or $month == 11 then 30
+            else 31 end;
+        def valid_date:
+            type == "object" and
+            (.year | uint) and .year >= 1970 and .year <= 9999 and
+            (.month | uint) and .month >= 1 and .month <= 12 and
+            (.day | uint) and .day >= 1 and .day <= month_days(.year; .month);
+        select(.jsonversion == "2" or .jsonversion == 2) |
+        select((.interfaces | type) == "array") |
+        [.interfaces[] | select(.name == $expected)] as $matches |
+        select(($matches | length) == 1) |
+        $matches[0] as $interface |
+        select(($interface | type) == "object") |
+        select($interface.created.date | valid_date) |
+        select(($interface.updated | type) == "object") |
+        select(($interface.traffic | type) == "object") |
+        select(($interface.traffic.day | type) == "array") |
+        select(all($interface.traffic.day[];
+            (.date | valid_date) and (.rx | uint) and (.tx | uint))) |
+        {jsonversion: "2", interfaces: [$interface]}
+    ' 2>/dev/null
+}
+
+machine_vnstat_data_is_fresh() {
+    local vnstat_json="$1"
+    local updated_epoch updated_text now age save_interval update_interval max_age
+
+    command -v jq >/dev/null 2>&1 || return 1
+    machine_vnstat_daemon_is_running || return 1
+    updated_epoch=$(printf '%s' "$vnstat_json" |
+        jq -r '.interfaces[0].updated.timestamp // empty' 2>/dev/null) || return 1
+    if ! [[ "$updated_epoch" =~ ^[0-9]+$ ]]; then
+        updated_text=$(printf '%s' "$vnstat_json" | jq -r '
+            .interfaces[0].updated as $u |
+            if ($u.date.year == null or $u.date.month == null or $u.date.day == null or
+                $u.time.hour == null or $u.time.minute == null) then empty
+            else "\($u.date.year)-\($u.date.month)-\($u.date.day) \($u.time.hour):\($u.time.minute):\($u.time.second // 0)" end
+        ' 2>/dev/null) || return 1
+        [ -n "$updated_text" ] || return 1
+        if [ "$(machine_vnstat_config_value "UseUTC")" = "1" ]; then
+            updated_epoch=$(TZ=UTC date -d "$updated_text" +%s 2>/dev/null) || return 1
+        else
+            updated_epoch=$(date -d "$updated_text" +%s 2>/dev/null) || return 1
+        fi
+    fi
+    now=$(date +%s) || return 1
+    save_interval=$(machine_vnstat_config_value "SaveInterval")
+    update_interval=$(machine_vnstat_config_value "UpdateInterval")
+    [[ "$save_interval" =~ ^[1-9][0-9]*$ && "$update_interval" =~ ^[1-9][0-9]*$ ]] || return 1
+    max_age=$((save_interval * 60 + update_interval + 90))
+    age=$((now - updated_epoch))
+    [ "$age" -ge -300 ] && [ "$age" -le "$max_age" ]
+}
+
 show_detailed_status() {
     echo -e "${CYAN}==================== 详细状态 ====================${NC}"
     echo ""
@@ -729,10 +849,17 @@ show_detailed_status() {
     # 检查当前流量使用
     echo -e "${CYAN}当前流量统计:${NC}"
     if command -v vnstat >/dev/null 2>&1; then
-        local interface
+        local interface vnstat_json
         interface=$(get_main_interface)
         if [ -n "$interface" ]; then
-            vnstat -i "$interface" --oneline 2>/dev/null | head -1 || echo "无法获取流量统计"
+            vnstat_json=$(machine_vnstat_cmd -i "$interface" --json 2>/dev/null || true)
+            if [ -n "$vnstat_json" ] &&
+               vnstat_json=$(machine_normalize_vnstat_json_for_interface "$vnstat_json" "$interface") &&
+               machine_vnstat_data_is_fresh "$vnstat_json"; then
+                machine_vnstat_cmd -i "$interface" --oneline 2>/dev/null | head -1 || echo "无法获取流量统计"
+            else
+                echo "vnStat 守护进程未运行或数据库数据已过期"
+            fi
         else
             echo "无法检测网络接口"
         fi

@@ -40,6 +40,8 @@
 24. TC 模式直接管理 `traffic-tools-unified-htb-v1`：`1:1` 实施整机上限，`1:30` 承接默认流量，并保留 Dog 的端口子类。TrafficCop Lite 可单独安装；日常应用在可验证的 Dog 层级中原地协调，共享恢复入口在两者并存时按顺序调用两边的恢复接口，安装顺序不限。
 25. 主页只读显示 TC 状态；用户明确确认后，可删除冲突 root 并按 Dog/NTC 现有状态重建。第三方 TC 配置不会被识别、迁移或保留。
 26. Dog 与 NTC 共用唯一的 `traffic-tools-tc-recovery.service`。服务默认关闭；启用后在网络就绪时执行一次，不使用固定延迟，也不做运行期高频抢占。
+27. 自动校准 vnStat 的高速接口上限和写盘间隔，避免云网卡实际速率超过默认回退上限时整段采样被丢弃；仅在配置实际变化时向 `vnstatd` 发送 HUP，失败会恢复旧配置。
+28. 流量读取前同时检查 `vnstatd` 和数据库更新时间；TC 的 root/class/filter 查询保留“存在、缺失、查询失败”三种状态，查询失败时不会按“规则不存在”继续修改。
 
 ## 下载方式说明
 
@@ -180,7 +182,11 @@ sudo env RAW_BASE="https://v6.gh-proxy.org/https://raw.githubusercontent.com/duy
 
 例如输入 `6`，年度统计周期会按每年 6 月的指定起始日开始计算。
 
-配置时还可选择流量单位：`GB` 使用十进制（1000³ 字节，适合服务商配额），`GiB` 使用二进制（1024³ 字节，兼容旧版）。容错范围必须大于等于 `0` 且小于流量限制，异常旧配置会停止本轮判断，不会按 `0` 阈值触发限速或关机。季度和年度统计依赖 vnStat 的每日历史；脚本可调整 `DailyDays` 并将原配置备份到 `/etc/trafficcop-lite/vnstat.conf.before-trafficcop-lite`。`DailyDays=-1` 会按无限保留处理，`TrafficlessEntries=0` 产生的无流量日期缺口不会被误判为历史丢失。
+配置时还可选择流量单位：`GB` 使用十进制（1000³ 字节，适合服务商配额），`GiB` 使用二进制（1024³ 字节，兼容旧版）。容错范围必须大于等于 `0` 且小于流量限制，异常旧配置会停止本轮判断，不会按 `0` 阈值触发限速或关机。季度和年度统计依赖 vnStat 的每日历史；脚本可调整 `DailyDays`，并按实际配置文件的规范路径分别保留原配置备份（首个通常为 `/etc/trafficcop-lite/vnstat.conf.before-trafficcop-lite`，切换路径后使用编号备份及对应 `.source-path` 标记）。`DailyDays=-1` 会按无限保留处理，`TrafficlessEntries=0` 产生的无流量日期缺口不会被误判为历史丢失。
+
+TrafficCop Lite 会保留 vnStat 配置中的其他自定义项，并幂等设置 `SaveInterval 1`。当 `UpdateInterval` 大于 60 秒时才将其收紧到 60 秒，以满足 vnStat 的保存间隔约束。vnStat 2.9 及以上使用当前网卡的 `MaxBW<接口名> 50000`；2.0–2.8 因自动带宽检测会覆盖接口值，兼容模式还会设置 `BandwidthDetection 0` 和 `MaxBandwidth 50000`。这里使用 vnStat 支持的 50000 Mbit 上限，不使用 `0`（完全关闭异常速率保护）。
+
+`SaveInterval 1` 会让数据库通常每分钟落盘一次，相比常见的 5 分钟默认值会增加少量磁盘写入，但缩短崩溃或断电时未保存流量的窗口。统计仍不是秒级实时值；正常可有约 1–3 分钟延迟。若 `vnstatd` 未运行、数据库因磁盘满等原因长期未更新，或 JSON API 版本、接口名、日期、每日 `rx/tx` 字段无效，本轮判断会失败关闭：不下发新限制，也不清除已有规则。vnStat 已经因“实际速率高于 MaxBandwidth”而忽略的历史采样无法从数据库补回，只能从修复生效后重新准确累计。
 
 机器重装后，vnStat 无法恢复重装前的流量。若配置的周期起点早于现有历史，脚本会明确显示可用历史起点，并要求选择：
 
@@ -243,6 +249,7 @@ sudo bash /etc/trafficcop-lite/trafficcop-lite.sh --uninstall
 - 默认备份配置和日志到 `/etc/trafficcop-lite-backup-时间戳/`。
 - 不卸载系统依赖包。
 - 不删除上游默认目录 `/root/TrafficCop`。
+- 不自动恢复 vnStat 全局配置，避免覆盖安装后用户自行调整的内容；选择备份时，原始 vnStat 配置副本会随工作目录一起保存。
 
 ## 8) 目录说明
 
@@ -266,9 +273,11 @@ sudo bash /etc/trafficcop-lite/trafficcop-lite.sh --uninstall
 ├── last_reset_period
 ├── current_traffic_state
 ├── vnstat_daily_coverage_start
+├── vnstat_config_path
 ├── last_traffic_notification
 ├── last_daily_report
-└── vnstat.conf.before-trafficcop-lite
+├── vnstat.conf.before-trafficcop-lite[.N]
+└── vnstat.conf.before-trafficcop-lite[.N].source-path
 ```
 
 快捷命令:
@@ -289,14 +298,14 @@ sudo /usr/sbin/tc qdisc show
 - TC 模式会用 `/etc/trafficcop-lite/tc_limit_state` 记录自身管理的整机上限。NTC 直接创建或更新统一 HTB；Dog 存在时保留其端口类和过滤器，不存在时也可独立工作。
 - NTC 与 Dog 各自使用自己的 root crontab 锁；只有修改同一内核 TC 层级时共用 `/run/lock/traffic-tools-tc.lock`。
 - 外部程序重建 root qdisc 后，主页会报告外部/未知 TC 冲突，普通监控 cron 仍会拒绝覆盖。主菜单 `9` 可在明确确认后删除冲突并只重建 Dog/NTC；不会保留任何第三方规则。
-- 可选的 `traffic-tools-tc-recovery.service` 只在开机网络就绪后执行一次。运行期间若 root qdisc 再次被其他程序覆盖，需要用户再次手动恢复；建议关闭其他 TC 管理服务。
+- 可选的 `traffic-tools-tc-recovery.service` 只在开机网络就绪后执行一次；它只接受默认/缺失 qdisc 或已识别的 Dog/NTC 统一层级，遇到外部或未知 root qdisc 会拒绝自动接管，须从主菜单 `9` 明确确认。运行期间若 root qdisc 再次被其他程序覆盖，也需要用户再次手动恢复；建议关闭其他 TC 管理服务。
 - `enforcement_state` 只记录临时宽限或暂停状态；`shutdown_limit_state` 只记录本脚本计划的流量关机及其 boot ID。
 - 若状态记录与当前 qdisc 不一致，脚本会按外部规则处理并停止自动覆盖。
 - 停止服务/卸载时，未标记的 TC 规则和计划关机会要求确认后才处理。
 - Telegram cron 日志默认保留最近 2000 行；如需详细调试，可临时设置 `TG_DEBUG=true`。
 - 流量监控日志默认保留最近 5000 行，可通过 `LOG_MAX_LINES` 调整。
 - Telegram 报告时区可独立配置；旧配置默认使用 `Asia/Shanghai`。时区名称必须对应系统 `/usr/share/zoneinfo` 中的有效文件，因此精简系统需要安装 `tzdata`。到达设定时间后当天只发送一次，任务短暂中断时会在恢复后补发。
-- 需要 vnStat 2.x 或更高版本。脚本兼容 `vnstat --showconfig` 中带分号或井号的默认配置项，只修改 vnStat 的 `DailyDays` 保留期并保留原配置备份；卸载时不会自动恢复全局 vnStat 配置，以免覆盖用户后续修改。
+- 需要 vnStat 2.x 或更高版本。脚本兼容 `vnstat --showconfig` 中带分号或井号的默认配置项，会管理 `SaveInterval`、必要时的 `UpdateInterval`、当前接口 `MaxBW`，并按周期需求管理 `DailyDays`；vnStat 2.0–2.8 还使用上述兼容设置。守护进程未显式指定 `--config` 时，只有运行中的 `vnstatd`、系统 `vnstatd` 命令和 `vnstat` 客户端能证明来自同一安装前缀，脚本才采用客户端报告的默认配置。每个实际配置路径首次变更前都会单独保留原配置备份，卸载时不会自动恢复全局 vnStat 配置。
 - Debian/Ubuntu、RHEL 系、Alpine 和 Arch 系会按已识别的包管理器尝试安装依赖；无法自动启动 cron 或 vnStat 服务时会给出明确提示，请按系统服务管理方式确认其已运行。
 - 网络受限时，优先使用带 `v6.gh-proxy.org` 的命令。
 

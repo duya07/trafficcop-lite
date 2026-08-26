@@ -117,12 +117,12 @@ export PERIOD_START_DAY=1
 export MAIN_INTERFACE=eth0
 
 # Dog 先安装：NTC 直接接管 1:1，保留 Dog 的端口类与过滤器。
-dog_action apply 3265 10mbit
+dog_action apply 3265 10mbit || exit 1
 dog_class_id=$(jq -r '.ports["3265"].bandwidth_limit.class_id' "$DOG_TEST_CONFIG_FILE")
 [ -n "$dog_class_id" ] && [ "$dog_class_id" != "null" ]
 tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
 
-apply_tc_limit 5000 >/dev/null
+apply_tc_limit 5000 >/dev/null || exit 1
 tc_root_is_htb_handle_one eth0
 tc_root_has_default_30 eth0
 tc_class_rate_matches eth0 1:1 5mbit 5mbit
@@ -130,15 +130,15 @@ tc_class_rate_matches eth0 1:30 1kbit 5mbit
 tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
 filter_state=$(tc filter show dev eth0 parent 1:0)
 grep -Eq "(flowid|classid)[[:space:]]+$dog_class_id([[:space:]]|$)" <<< "$filter_state"
-tc_self_check eth0 >/dev/null
+tc_self_check eth0 >/dev/null || exit 1
 
-clear_owned_tc_rules "integration clear" >/dev/null
+clear_owned_tc_rules "integration clear" >/dev/null || exit 1
 [ ! -e "$TC_STATE_FILE" ]
 tc_class_rate_matches eth0 1:1 100gbit 100gbit
 tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
 
 # 清空 Dog 后让 NTC 先安装，再由 Dog 在 NTC 的全局父类下添加端口类。
-dog_action remove 3265
+dog_action remove 3265 || exit 1
 ! tc_root_is_htb_handle_one eth0
 jq '
     .ports = {
@@ -153,59 +153,64 @@ jq '
 mv "$DOG_TEST_CONFIG_FILE.tmp" "$DOG_TEST_CONFIG_FILE"
 chmod 600 "$DOG_TEST_CONFIG_FILE"
 
-apply_tc_limit 3000 >/dev/null
+apply_tc_limit 3000 >/dev/null || exit 1
 tc_class_rate_matches eth0 1:1 3mbit 3mbit
-dog_action apply 3266 10mbit
+dog_action apply 3266 10mbit || exit 1
 dog_class_id=$(jq -r '.ports["3266"].bandwidth_limit.class_id' "$DOG_TEST_CONFIG_FILE")
 tc_class_rate_matches eth0 1:1 3mbit 3mbit
 tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
 grep -Fxq 'SCHEMA=traffic-tools-unified-htb-v1' "$TC_STATE_FILE"
 grep -Fxq 'PROVIDER=trafficcop-lite' "$TC_STATE_FILE"
-tc_self_check eth0 >/dev/null
+tc_self_check eth0 >/dev/null || exit 1
 
-clear_owned_tc_rules "integration clear" >/dev/null
+clear_owned_tc_rules "integration clear" >/dev/null || exit 1
 [ ! -e "$TC_STATE_FILE" ]
 tc_class_rate_matches eth0 1:1 100gbit 100gbit
 tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
-dog_action remove 3266
+dog_action remove 3266 || exit 1
 ! tc_root_is_htb_handle_one eth0
 
-# 普通限速继续拒绝外部层级；显式共享恢复则删除冲突并重建 Dog/NTC。
+# 普通限速和自动恢复均拒绝外部层级；只有显式手动恢复才删除冲突并重建。
 tc qdisc replace dev eth0 root handle 1: htb default 10
 tc class replace dev eth0 parent 1: classid 1:10 htb rate 20mbit ceil 20mbit
 foreign_before="$(tc qdisc show dev eth0; tc class show dev eth0)"
 ! apply_tc_limit 2000 >/dev/null
 [ "$foreign_before" = "$(tc qdisc show dev eth0; tc class show dev eth0)" ]
 ! tc_self_check eth0 >/dev/null
-dog_action recover --auto
+! dog_action recover --auto
+[ "$foreign_before" = "$(tc qdisc show dev eth0; tc class show dev eth0)" ]
+dog_action recover --manual || exit 1
 tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
 
 # Dog 已先恢复、NTC 尚无活动状态时，NTC 手动恢复应在原树中协调而不是误报 Dog 冲突。
 LIMIT_MODE=tc
 ntc_recheck_called=false
 check_and_limit_traffic() { ntc_recheck_called=true; }
-recover_owned_tc_hierarchy --manual >/dev/null
+recover_owned_tc_hierarchy --manual >/dev/null || exit 1
 [ "$ntc_recheck_called" = "true" ]
 tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
 
-apply_tc_limit 2000 >/dev/null
+apply_tc_limit 2000 >/dev/null || exit 1
 tc_class_rate_matches eth0 1:1 2mbit 2mbit
 tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
 
-# 外部程序再次覆盖后，由 Dog 读取 NTC 权威状态并一次性恢复父类和端口子类。
+# 外部程序再次覆盖后，自动恢复保持零修改，手动恢复读取 NTC 权威状态重建整棵树。
 tc qdisc del dev eth0 root handle 1:
 tc qdisc add dev eth0 root handle 1: htb default 10
 tc class add dev eth0 parent 1: classid 1:10 htb rate 20mbit ceil 20mbit
 ! tc_self_check eth0 >/dev/null
-dog_action recover --auto
+ntc_dog_foreign_before="$(tc qdisc show dev eth0; tc class show dev eth0)"
+! dog_action recover --auto
+[ "$ntc_dog_foreign_before" = "$(tc qdisc show dev eth0; tc class show dev eth0)" ]
+dog_action recover --manual || exit 1
 tc_class_rate_matches eth0 1:1 2mbit 2mbit
 tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
-tc_self_check eth0 >/dev/null
-recover_owned_tc_hierarchy --auto >/dev/null
-tc_self_check eth0 >/dev/null
+tc_self_check eth0 >/dev/null || exit 1
+recover_owned_tc_hierarchy --auto >/dev/null || exit 1
+tc_self_check eth0 >/dev/null || exit 1
 
-clear_owned_tc_rules "integration clear" >/dev/null
-dog_action remove 3266
+clear_owned_tc_rules "integration clear" >/dev/null || exit 1
+dog_action remove 3266 || exit 1
 ! tc_root_is_htb_handle_one eth0
 
 # Dog 迁移 NTC 旧 TBF 后，NTC 自检必须先报告漂移，再由 NTC 重建权威状态。
@@ -218,35 +223,38 @@ legacy_qdisc=$(tc qdisc show dev eth0 root | head -n 1)
     printf 'PROVIDER=trafficcop-lite\n'
 } > "$TC_STATE_FILE"
 chmod 600 "$TC_STATE_FILE"
-dog_action apply 3266 10mbit
+dog_action apply 3266 10mbit || exit 1
 legacy_self_check_status=0
 tc_self_check eth0 > "$TEST_DIR/legacy-self-check.out" || legacy_self_check_status=$?
 [ "$legacy_self_check_status" -eq 1 ]
 grep -Fxq \
     'TC_SELF_CHECK=DRIFT INTERFACE=eth0 REASON=legacy-trafficcop-state-with-unified-htb ACTION=reapply-trafficcop-limit' \
     "$TEST_DIR/legacy-self-check.out"
-apply_tc_limit 6000 >/dev/null
+apply_tc_limit 6000 >/dev/null || exit 1
 tc_class_rate_matches eth0 1:1 6mbit 6mbit
 grep -Fxq 'SCHEMA=traffic-tools-unified-htb-v1' "$TC_STATE_FILE"
-clear_owned_tc_rules "integration clear" >/dev/null
+clear_owned_tc_rules "integration clear" >/dev/null || exit 1
 [ ! -e "$TC_STATE_FILE" ]
 tc_root_is_htb_handle_one eth0
-dog_action remove 3266
+dog_action remove 3266 || exit 1
 ! tc_root_is_htb_handle_one eth0
 
-# 纯 NTC 的持久状态被外部 root 覆盖时，显式自动恢复入口可独立重建。
+# 纯 NTC 状态遇到外部 root 也必须先拒绝自动接管，再由显式手动入口重建。
 jq '.ports = {}' "$DOG_TEST_CONFIG_FILE" > "$DOG_TEST_CONFIG_FILE.tmp"
 mv "$DOG_TEST_CONFIG_FILE.tmp" "$DOG_TEST_CONFIG_FILE"
 chmod 600 "$DOG_TEST_CONFIG_FILE"
-apply_tc_limit 4500 >/dev/null
+apply_tc_limit 4500 >/dev/null || exit 1
 tc qdisc del dev eth0 root handle 1:
 tc qdisc add dev eth0 root handle 1: htb default 10
 tc class add dev eth0 parent 1: classid 1:10 htb rate 20mbit ceil 20mbit
 ! tc_self_check eth0 >/dev/null
-recover_owned_tc_hierarchy --auto >/dev/null
+ntc_foreign_before="$(tc qdisc show dev eth0; tc class show dev eth0)"
+! recover_owned_tc_hierarchy --auto >/dev/null
+[ "$ntc_foreign_before" = "$(tc qdisc show dev eth0; tc class show dev eth0)" ]
+recover_owned_tc_hierarchy --manual >/dev/null || exit 1
 tc_class_rate_matches eth0 1:1 4500kbit 4500kbit
-tc_self_check eth0 >/dev/null
-clear_owned_tc_rules "integration clear" >/dev/null
+tc_self_check eth0 >/dev/null || exit 1
+clear_owned_tc_rules "integration clear" >/dev/null || exit 1
 ! tc_root_is_htb_handle_one eth0
 
 echo "Dog/TrafficCop unified HTB integration tests passed"

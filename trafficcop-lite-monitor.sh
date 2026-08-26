@@ -16,6 +16,7 @@ LOCK_FILE="$WORK_DIR/traffic_monitor.lock"
 TC_STATE_FILE="$WORK_DIR/tc_limit_state"
 PERIOD_STATE_FILE="$WORK_DIR/last_reset_period"
 RETENTION_STATE_FILE="$WORK_DIR/vnstat_daily_coverage_start"
+VNSTAT_CONFIG_PATH_FILE="$WORK_DIR/vnstat_config_path"
 USAGE_STATE_FILE="$WORK_DIR/current_traffic_state"
 ENFORCEMENT_STATE_FILE="$WORK_DIR/enforcement_state"
 SHUTDOWN_STATE_FILE="$WORK_DIR/shutdown_limit_state"
@@ -25,10 +26,12 @@ TC_STATE_SCHEMA="traffic-tools-unified-htb-v1"
 TC_STATE_PROVIDER="trafficcop-lite"
 TC_PARENT_RATE="100gbit"
 TC_DEFAULT_CLASS_RATE="1kbit"
+VNSTAT_MAX_BANDWIDTH=50000
+VNSTAT_SAVE_INTERVAL=1
 DOG_CONFIG_FILE="/etc/port-traffic-dog/config.json"
 DOG_TC_OWNER_FILE="/etc/port-traffic-dog/tc-root-qdisc.owner"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.1.6"
+SCRIPT_VERSION="1.1.7"
 mkdir -p "$WORK_DIR"
 chmod 700 "$WORK_DIR" 2>/dev/null || true
 
@@ -78,9 +81,171 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+vnstat_version_parts() {
+    local version_output
+    version_output=$(vnstat --version 2>&1 | head -n 1) || return 1
+    printf '%s\n' "$version_output" | sed -n \
+        's/^[^0-9]*\([0-9][0-9]*\)\.\([0-9][0-9]*\).*/\1 \2/p'
+}
+
+vnstat_daemon_config_path() {
+    local comm_file pid cmdline_path="" detected_path="" argument expect_path=false
+    local daemon_count=0
+
+    for comm_file in /proc/[0-9]*/comm; do
+        [ -r "$comm_file" ] || continue
+        [ "$(cat "$comm_file" 2>/dev/null)" = "vnstatd" ] || continue
+        daemon_count=$((daemon_count + 1))
+        cmdline_path=""
+        expect_path=false
+        pid=${comm_file#/proc/}
+        pid=${pid%/comm}
+        [ -r "/proc/$pid/cmdline" ] || continue
+        while IFS= read -r argument; do
+            if $expect_path; then
+                cmdline_path="$argument"
+                expect_path=false
+                continue
+            fi
+            case "$argument" in
+                --config) expect_path=true ;;
+                --config=*) cmdline_path=${argument#--config=} ;;
+            esac
+        done < <(tr '\0' '\n' < "/proc/$pid/cmdline")
+        [ -n "$cmdline_path" ] || continue
+        if [ -n "$detected_path" ] && [ "$detected_path" != "$cmdline_path" ]; then
+            return 2
+        fi
+        detected_path="$cmdline_path"
+    done
+    [ "$daemon_count" -le 1 ] || return 2
+    [ -n "$detected_path" ] || return 1
+    printf '%s\n' "$detected_path"
+}
+
+executable_install_prefix() {
+    local executable="$1" resolved bin_dir bin_name prefix
+
+    [ -n "$executable" ] && [ "${executable#/}" != "$executable" ] || return 1
+    resolved=$(readlink -f "$executable" 2>/dev/null) || return 1
+    [ -f "$resolved" ] && [ -x "$resolved" ] || return 1
+    bin_dir=${resolved%/*}
+    bin_name=${bin_dir##*/}
+    case "$bin_name" in
+        bin|sbin) ;;
+        *) return 1 ;;
+    esac
+    prefix=${bin_dir%/*}
+    [ -n "$prefix" ] || prefix=/
+    printf '%s\n' "$prefix"
+}
+
+vnstat_daemon_install_prefix() {
+    local comm_file pid daemon_count=0 daemon_executable=""
+
+    for comm_file in /proc/[0-9]*/comm; do
+        [ -r "$comm_file" ] || continue
+        [ "$(cat "$comm_file" 2>/dev/null)" = "vnstatd" ] || continue
+        daemon_count=$((daemon_count + 1))
+        pid=${comm_file#/proc/}
+        pid=${pid%/comm}
+        daemon_executable=$(readlink -f "/proc/$pid/exe" 2>/dev/null) || return 1
+    done
+    [ "$daemon_count" -eq 1 ] || return 1
+    executable_install_prefix "$daemon_executable"
+}
+
+vnstat_cli_install_prefix() {
+    local vnstat_path vnstatd_path vnstat_prefix vnstatd_prefix
+
+    vnstat_path=$(command -v vnstat 2>/dev/null) || return 1
+    vnstatd_path=$(command -v vnstatd 2>/dev/null) || return 1
+    vnstat_prefix=$(executable_install_prefix "$vnstat_path") || return 1
+    vnstatd_prefix=$(executable_install_prefix "$vnstatd_path") || return 1
+    [ "$vnstat_prefix" = "$vnstatd_prefix" ] || return 1
+    printf '%s\n' "$vnstat_prefix"
+}
+
+canonical_config_path() {
+    local path="$1" resolved
+    [ -n "$path" ] && [ "${path#/}" != "$path" ] || return 1
+    resolved=$(readlink -f "$path" 2>/dev/null) || return 1
+    path="$resolved"
+    [ -f "$path" ] || return 1
+    printf '%s\n' "$path"
+}
+
+resolve_vnstat_config_path() {
+    local daemon_path="" daemon_status daemon_prefix cli_prefix
+    local debug_output cli_path="" candidate resolved
+
+    daemon_path=$(vnstat_daemon_config_path 2>/dev/null)
+    daemon_status=$?
+    if [ "$daemon_status" -eq 0 ]; then
+        resolved=$(canonical_config_path "$daemon_path") || return 1
+        VNSTAT_CONFIG_PATH="$resolved"
+    elif [ "$daemon_status" -eq 2 ]; then
+        return 1
+    else
+        # vnstatd 没有显式 --config 时，只有运行进程、vnstatd 命令和 vnstat
+        # 客户端都能证明来自同一安装前缀，才可采用客户端报告的默认配置。
+        daemon_prefix=$(vnstat_daemon_install_prefix) || return 1
+        cli_prefix=$(vnstat_cli_install_prefix) || return 1
+        [ "$daemon_prefix" = "$cli_prefix" ] || return 1
+        debug_output=$(LC_ALL=C vnstat --debug --showconfig 2>&1) || return 1
+        cli_path=$(printf '%s\n' "$debug_output" |
+            sed -n 's/^Config file:[[:space:]]*//p' | tail -n 1)
+        if [ -n "$cli_path" ]; then
+            resolved=$(canonical_config_path "$cli_path") || return 1
+            VNSTAT_CONFIG_PATH="$resolved"
+        else
+            for candidate in /etc/vnstat.conf /etc/vnstat/vnstat.conf /usr/local/etc/vnstat.conf; do
+                if resolved=$(canonical_config_path "$candidate" 2>/dev/null); then
+                    VNSTAT_CONFIG_PATH="$resolved"
+                    break
+                fi
+            done
+        fi
+    fi
+    [ -n "${VNSTAT_CONFIG_PATH:-}" ] || return 1
+    if [ -f "$VNSTAT_CONFIG_PATH_FILE" ] &&
+       [ "$(cat "$VNSTAT_CONFIG_PATH_FILE" 2>/dev/null)" = "$VNSTAT_CONFIG_PATH" ]; then
+        return 0
+    fi
+    printf '%s\n' "$VNSTAT_CONFIG_PATH" > "${VNSTAT_CONFIG_PATH_FILE}.tmp.$$" || return 1
+    chmod 600 "${VNSTAT_CONFIG_PATH_FILE}.tmp.$$" 2>/dev/null || true
+    mv -f "${VNSTAT_CONFIG_PATH_FILE}.tmp.$$" "$VNSTAT_CONFIG_PATH_FILE" || {
+        rm -f "${VNSTAT_CONFIG_PATH_FILE}.tmp.$$"
+        return 1
+    }
+}
+
+vnstat_cmd() {
+    if [ -n "${VNSTAT_CONFIG_PATH:-}" ]; then
+        vnstat --config "$VNSTAT_CONFIG_PATH" "$@"
+    else
+        vnstat "$@"
+    fi
+}
+
+vnstat_config_value_from_file() {
+    local config_path="$1"
+    local target="$2"
+    vnstat --config "$config_path" --showconfig 2>/dev/null | awk -v target="$target" '
+        {
+            key=$1
+            sub(/^[;#]/, "", key)
+            if (key == target) {
+                print $NF
+                exit
+            }
+        }
+    '
+}
+
 vnstat_config_value() {
     local target="$1"
-    vnstat --showconfig 2>/dev/null | awk -v target="$target" '
+    vnstat_cmd --showconfig 2>/dev/null | awk -v target="$target" '
         {
             key=$1
             sub(/^[;#]/, "", key)
@@ -147,64 +312,400 @@ align_timezone_with_vnstat() {
     fi
 }
 
-ensure_vnstat_interface() {
-    local interface="$1"
-    if vnstat -i "$interface" --json >/dev/null 2>&1; then
-        return 0
-    fi
-    echo "$(date '+%Y-%m-%d %H:%M:%S') vnStat 尚未监控接口 $interface，正在添加。" | tee -a "$LOG_FILE"
-    if ! vnstat --add -i "$interface" >/dev/null 2>&1; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 无法将接口 $interface 添加到 vnStat 数据库。" | tee -a "$LOG_FILE"
-        return 1
-    fi
-    ensure_service_running "vnStat" vnstat vnstatd
+vnstat_daemon_pids() {
+    local comm_file pid
+    for comm_file in /proc/[0-9]*/comm; do
+        [ -r "$comm_file" ] || continue
+        [ "$(cat "$comm_file" 2>/dev/null)" = "vnstatd" ] || continue
+        pid=${comm_file#/proc/}
+        pid=${pid%/comm}
+        [[ "$pid" =~ ^[0-9]+$ ]] && printf '%s\n' "$pid"
+    done
 }
 
-commit_vnstat_retention_update() {
-    local config_path="$1"
-    local config_tmp="$2"
-    local marker_tmp="$3"
-    local marker_backup="${RETENTION_STATE_FILE}.before-update.$$"
-    local had_marker=false
-    local rollback_failed=false
+vnstat_daemon_is_running() {
+    [ -n "$(vnstat_daemon_pids)" ]
+}
 
-    if [ -f "$RETENTION_STATE_FILE" ]; then
-        if ! cp -p "$RETENTION_STATE_FILE" "$marker_backup"; then
-            rm -f "$config_tmp" "$marker_tmp"
-            return 1
-        fi
-        had_marker=true
-    fi
+start_vnstat_daemon_strict() {
+    local service_name
 
-    if ! mv -f "$marker_tmp" "$RETENTION_STATE_FILE"; then
-        rm -f "$config_tmp" "$marker_tmp" "$marker_backup"
-        return 1
-    fi
-
-    if mv -f "$config_tmp" "$config_path"; then
-        rm -f "$marker_backup"
-        return 0
-    fi
-
-    if $had_marker; then
-        mv -f "$marker_backup" "$RETENTION_STATE_FILE" || rollback_failed=true
-    else
-        rm -f "$RETENTION_STATE_FILE" || rollback_failed=true
-    fi
-    rm -f "$config_tmp" "$marker_tmp"
-
-    if $rollback_failed; then
-        if $had_marker; then
-            echo "vnStat 配置写入失败，且保留期状态回滚失败；旧标记备份保留在 $marker_backup。"
-        else
-            echo "vnStat 配置写入失败，且无法删除新建的保留期标记；请检查 $RETENTION_STATE_FILE。"
-        fi
+    if command_exists systemctl && [ -d /run/systemd/system ]; then
+        for service_name in vnstat vnstatd; do
+            if systemctl list-unit-files "${service_name}.service" --no-legend 2>/dev/null |
+                grep -q "^${service_name}\.service"; then
+                run_privileged systemctl enable --now "${service_name}.service" >/dev/null 2>&1 || return 1
+                systemctl is-active --quiet "${service_name}.service" 2>/dev/null || return 1
+                vnstat_daemon_is_running
+                return $?
+            fi
+        done
+    elif command_exists rc-service; then
+        for service_name in vnstat vnstatd; do
+            [ -x "/etc/init.d/$service_name" ] || continue
+            if command_exists rc-update; then
+                run_privileged rc-update add "$service_name" default >/dev/null 2>&1 || return 1
+            fi
+            run_privileged rc-service "$service_name" start >/dev/null 2>&1 ||
+                rc-service "$service_name" status >/dev/null 2>&1 || return 1
+            vnstat_daemon_is_running
+            return $?
+        done
+    elif command_exists service; then
+        for service_name in vnstat vnstatd; do
+            [ -x "/etc/init.d/$service_name" ] || continue
+            run_privileged service "$service_name" start >/dev/null 2>&1 ||
+                service "$service_name" status >/dev/null 2>&1 || return 1
+            vnstat_daemon_is_running
+            return $?
+        done
     fi
     return 1
 }
 
+ensure_vnstat_daemon_running() {
+    vnstat_daemon_is_running && return 0
+    start_vnstat_daemon_strict
+}
+
+reload_vnstat_daemon() {
+    local pids pid
+    pids=$(vnstat_daemon_pids)
+    if [ -n "$pids" ]; then
+        while IFS= read -r pid; do
+            [ -n "$pid" ] || continue
+            kill -HUP "$pid" 2>/dev/null || return 1
+        done <<< "$pids"
+        vnstat_daemon_is_running
+        return $?
+    fi
+    start_vnstat_daemon_strict
+}
+
+ensure_vnstat_interface() {
+    local interface="$1"
+    if vnstat_cmd -i "$interface" --json >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "$(date '+%Y-%m-%d %H:%M:%S') vnStat 尚未监控接口 $interface，正在添加。" | tee -a "$LOG_FILE"
+    if ! vnstat_cmd --add -i "$interface" >/dev/null 2>&1; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 无法将接口 $interface 添加到 vnStat 数据库。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+    if ! ensure_vnstat_daemon_running || ! reload_vnstat_daemon; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 无法启动或重载 vnStat 服务。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+}
+
+build_vnstat_config_candidate() {
+    local source_path="$1"
+    local candidate_path="$2"
+    local interface="$3"
+    local legacy_mode="$4"
+    local update_interval_value="${5:-}"
+    local daily_days_value="${6:-}"
+    local max_key="MaxBW${interface}"
+
+    awk -v max_key="$max_key" -v max_bw="$VNSTAT_MAX_BANDWIDTH" \
+        -v save_interval="$VNSTAT_SAVE_INTERVAL" -v legacy="$legacy_mode" \
+        -v update_value="$update_interval_value" -v daily_value="$daily_days_value" '
+        function config_key(line,    text, parts, first, is_comment) {
+            text=line
+            sub(/^[[:space:]]*/, "", text)
+            first=substr(text, 1, 1)
+            is_comment=(first == ";" || first == "#")
+            if (is_comment) {
+                text=substr(text, 2)
+                sub(/^[[:space:]]*/, "", text)
+            }
+            split(text, parts, /[[:space:]]+/)
+            parsed_value=parts[2]
+            parsed_comment=is_comment
+            return parts[1]
+        }
+        function replaceable(key, target) {
+            return key == target && (!parsed_comment || parsed_value ~ /^-?[0-9]+$/)
+        }
+        {
+            key=config_key($0)
+            if (replaceable(key, "SaveInterval")) {
+                if (!seen_save) print "SaveInterval " save_interval
+                seen_save=1
+                next
+            }
+            if (legacy == "true" && replaceable(key, "BandwidthDetection")) {
+                if (!seen_detection) print "BandwidthDetection 0"
+                seen_detection=1
+                next
+            }
+            if (legacy == "true" && replaceable(key, "MaxBandwidth")) {
+                if (!seen_global_max) print "MaxBandwidth " max_bw
+                seen_global_max=1
+                next
+            }
+            if (replaceable(key, max_key)) {
+                if (!seen_max) print max_key " " max_bw
+                seen_max=1
+                next
+            }
+            if (update_value != "" && replaceable(key, "UpdateInterval")) {
+                if (!seen_update) print "UpdateInterval " update_value
+                seen_update=1
+                next
+            }
+            if (daily_value != "" && replaceable(key, "DailyDays")) {
+                if (!seen_daily) print "DailyDays " daily_value
+                seen_daily=1
+                next
+            }
+            print
+        }
+        END {
+            if (!seen_save) print "SaveInterval " save_interval
+            if (legacy == "true") {
+                if (!seen_detection) print "BandwidthDetection 0"
+                if (!seen_global_max) print "MaxBandwidth " max_bw
+            }
+            if (!seen_max) print max_key " " max_bw
+            if (update_value != "" && !seen_update) print "UpdateInterval " update_value
+            if (daily_value != "" && !seen_daily) print "DailyDays " daily_value
+        }
+    ' "$source_path" > "$candidate_path"
+}
+
+vnstat_config_candidate_valid() {
+    local candidate_path="$1"
+    local interface="$2"
+    local legacy_mode="$3"
+    local update_interval_value="${4:-}"
+    local daily_days_value="${5:-}"
+    local value max_key="MaxBW${interface}"
+
+    vnstat --config "$candidate_path" --showconfig >/dev/null 2>&1 || return 1
+    value=$(vnstat_config_value_from_file "$candidate_path" "SaveInterval")
+    [ "$value" = "$VNSTAT_SAVE_INTERVAL" ] || return 1
+    if [ "$legacy_mode" = "true" ]; then
+        [ "$(vnstat_config_value_from_file "$candidate_path" "BandwidthDetection")" = "0" ] || return 1
+        [ "$(vnstat_config_value_from_file "$candidate_path" "MaxBandwidth")" = "$VNSTAT_MAX_BANDWIDTH" ] || return 1
+    fi
+    [ "$(vnstat_config_value_from_file "$candidate_path" "$max_key")" = "$VNSTAT_MAX_BANDWIDTH" ] || return 1
+    value=$(vnstat_config_value_from_file "$candidate_path" "UpdateInterval")
+    [[ "$value" =~ ^[0-9]+$ ]] && [ "$value" -le 60 ] || return 1
+    if [ -n "$update_interval_value" ]; then
+        [ "$value" = "$update_interval_value" ] || return 1
+    fi
+    if [ -n "$daily_days_value" ]; then
+        [ "$(vnstat_config_value_from_file "$candidate_path" "DailyDays")" = "$daily_days_value" ] || return 1
+    fi
+}
+
+rollback_vnstat_config_update() {
+    local config_path="$1"
+    local rollback_path="$2"
+    local marker_backup="$3"
+    local had_marker="$4"
+    local rollback_failed=false
+
+    if [ -f "$rollback_path" ]; then
+        mv -f "$rollback_path" "$config_path" || rollback_failed=true
+    else
+        rollback_failed=true
+    fi
+    if [ -n "$marker_backup" ]; then
+        if [ "$had_marker" = "true" ]; then
+            mv -f "$marker_backup" "$RETENTION_STATE_FILE" || rollback_failed=true
+        else
+            rm -f "$RETENTION_STATE_FILE" || rollback_failed=true
+        fi
+    fi
+    reload_vnstat_daemon || rollback_failed=true
+    ! $rollback_failed
+}
+
+select_vnstat_backup_path() {
+    local config_path canonical_path base_path candidate source_path index=0
+
+    config_path="$1"
+    canonical_path=$(canonical_config_path "$config_path") || return 1
+    base_path="$WORK_DIR/vnstat.conf.before-trafficcop-lite"
+
+    while [ "$index" -le 100 ]; do
+        if [ "$index" -eq 0 ]; then
+            candidate="$base_path"
+        else
+            candidate="${base_path}.${index}"
+        fi
+        source_path="${candidate}.source-path"
+
+        [ ! -L "$candidate" ] && [ ! -L "$source_path" ] || return 1
+        if [ -e "$candidate" ]; then
+            [ -f "$candidate" ] || return 1
+            if [ -f "$source_path" ] &&
+               [ "$(cat "$source_path" 2>/dev/null)" = "$canonical_path" ]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+            index=$((index + 1))
+            continue
+        fi
+        [ ! -e "$source_path" ] || return 1
+        printf '%s\n' "$candidate"
+        return 0
+    done
+    return 1
+}
+
+apply_vnstat_config_update() {
+    local config_path
+    local interface="$2"
+    local legacy_mode="$3"
+    local update_interval_value="${4:-}"
+    local daily_days_value="${5:-}"
+    local update_marker="${6:-false}"
+    local candidate_path rollback_path marker_tmp="" marker_backup="" had_marker=false
+    local backup_path backup_source_path backup_tmp="" backup_source_tmp=""
+    local mode owner group
+
+    config_path=$(canonical_config_path "$1") || return 1
+
+    candidate_path="${config_path}.trafficcop-lite.$$"
+    rollback_path="${config_path}.trafficcop-lite.rollback.$$"
+    cp -p "$config_path" "$rollback_path" || return 1
+    build_vnstat_config_candidate "$rollback_path" "$candidate_path" "$interface" \
+        "$legacy_mode" "$update_interval_value" "$daily_days_value" || {
+        rm -f "$candidate_path" "$rollback_path"
+        return 1
+    }
+    if ! vnstat_config_candidate_valid "$candidate_path" "$interface" "$legacy_mode" \
+        "$update_interval_value" "$daily_days_value"; then
+        rm -f "$candidate_path" "$rollback_path"
+        return 1
+    fi
+    if cmp -s "$candidate_path" "$rollback_path"; then
+        rm -f "$candidate_path" "$rollback_path"
+        ensure_vnstat_daemon_running
+        return $?
+    fi
+
+    backup_path=$(select_vnstat_backup_path "$config_path") || {
+        rm -f "$candidate_path" "$rollback_path"
+        return 1
+    }
+    backup_source_path="${backup_path}.source-path"
+    if [ ! -f "$backup_path" ]; then
+        backup_tmp="${backup_path}.tmp.$$"
+        backup_source_tmp="${backup_source_path}.tmp.$$"
+        cp -p "$rollback_path" "$backup_tmp" || {
+            rm -f "$candidate_path" "$rollback_path" "$backup_tmp" "$backup_source_tmp"
+            return 1
+        }
+        chmod 600 "$backup_tmp" || {
+            rm -f "$candidate_path" "$rollback_path" "$backup_tmp" "$backup_source_tmp"
+            return 1
+        }
+        printf '%s\n' "$config_path" > "$backup_source_tmp" || {
+            rm -f "$candidate_path" "$rollback_path" "$backup_tmp" "$backup_source_tmp"
+            return 1
+        }
+        chmod 600 "$backup_source_tmp" || {
+            rm -f "$candidate_path" "$rollback_path" "$backup_tmp" "$backup_source_tmp"
+            return 1
+        }
+        mv -f "$backup_tmp" "$backup_path" || {
+            rm -f "$candidate_path" "$rollback_path" "$backup_tmp" "$backup_source_tmp"
+            return 1
+        }
+        if ! mv -f "$backup_source_tmp" "$backup_source_path"; then
+            rm -f "$backup_path" "$candidate_path" "$rollback_path" \
+                "$backup_tmp" "$backup_source_tmp"
+            return 1
+        fi
+    fi
+    mode=$(stat -c '%a' "$rollback_path") || { rm -f "$candidate_path" "$rollback_path"; return 1; }
+    owner=$(stat -c '%u' "$rollback_path") || { rm -f "$candidate_path" "$rollback_path"; return 1; }
+    group=$(stat -c '%g' "$rollback_path") || { rm -f "$candidate_path" "$rollback_path"; return 1; }
+    chmod "$mode" "$candidate_path" || { rm -f "$candidate_path" "$rollback_path"; return 1; }
+    chown "$owner:$group" "$candidate_path" || { rm -f "$candidate_path" "$rollback_path"; return 1; }
+
+    if [ "$update_marker" = "true" ]; then
+        marker_tmp="${RETENTION_STATE_FILE}.tmp.$$"
+        marker_backup="${RETENTION_STATE_FILE}.before-update.$$"
+        date +%Y-%m-%d > "$marker_tmp" || {
+            rm -f "$candidate_path" "$rollback_path" "$marker_tmp"
+            return 1
+        }
+        chmod 600 "$marker_tmp" || { rm -f "$candidate_path" "$rollback_path" "$marker_tmp"; return 1; }
+        if [ -f "$RETENTION_STATE_FILE" ]; then
+            cp -p "$RETENTION_STATE_FILE" "$marker_backup" || {
+                rm -f "$candidate_path" "$rollback_path" "$marker_tmp"
+                return 1
+            }
+            had_marker=true
+        fi
+    fi
+
+    if ! cmp -s "$config_path" "$rollback_path" || ! mv -f "$candidate_path" "$config_path"; then
+        rm -f "$candidate_path" "$rollback_path" "$marker_tmp" "$marker_backup"
+        return 1
+    fi
+    if ! reload_vnstat_daemon ||
+       ! vnstat_config_candidate_valid "$config_path" "$interface" "$legacy_mode" \
+            "$update_interval_value" "$daily_days_value"; then
+        rm -f "$marker_tmp"
+        if ! rollback_vnstat_config_update "$config_path" "$rollback_path" "$marker_backup" "$had_marker"; then
+            echo "vnStat 新配置未生效，且自动回滚未完全成功；请立即检查 $config_path。" >&2
+        fi
+        return 1
+    fi
+    if [ "$update_marker" = "true" ] && ! mv -f "$marker_tmp" "$RETENTION_STATE_FILE"; then
+        if ! rollback_vnstat_config_update "$config_path" "$rollback_path" "$marker_backup" "$had_marker"; then
+            echo "vnStat 保留期标记写入失败，且自动回滚未完全成功；请立即检查。" >&2
+        fi
+        rm -f "$marker_tmp"
+        return 1
+    fi
+
+    rm -f "$rollback_path" "$marker_backup"
+    if [ "$legacy_mode" = "true" ]; then
+        echo "vnStat 2.0-2.8 兼容模式：已关闭自动带宽检测，并将全局 MaxBandwidth 设为 ${VNSTAT_MAX_BANDWIDTH} Mbit。"
+    fi
+    echo "vnStat 已设置 SaveInterval=${VNSTAT_SAVE_INTERVAL}，接口/兼容带宽上限=${VNSTAT_MAX_BANDWIDTH} Mbit。"
+}
+
+ensure_vnstat_runtime_config() {
+    local interface="$1"
+    local daily_days_value="${2:-}"
+    local update_marker="${3:-false}"
+    local version_parts major minor legacy_mode=false current_update update_interval_value=""
+
+    [[ "$interface" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || return 1
+    # 先启动服务，再从实际 vnstatd 进程参数解析配置路径；这样即使服务通过
+    # --config 使用自定义文件且调用前处于停止状态，也不会误改 CLI 默认配置。
+    ensure_vnstat_daemon_running || return 1
+    resolve_vnstat_config_path || {
+        echo "无法确认 vnStat 守护进程实际使用的配置文件，拒绝修改猜测路径。" >&2
+        return 1
+    }
+    align_timezone_with_vnstat
+    version_parts=$(vnstat_version_parts) || return 1
+    read -r major minor <<< "$version_parts"
+    [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+    [ "$major" -ge 2 ] || return 1
+    if [ "$major" -eq 2 ] && [ "$minor" -lt 9 ]; then
+        legacy_mode=true
+    fi
+    current_update=$(vnstat_config_value "UpdateInterval")
+    [[ "$current_update" =~ ^[0-9]+$ ]] || return 1
+    if [ "$current_update" -gt 60 ]; then
+        update_interval_value=60
+    fi
+    apply_vnstat_config_update "$VNSTAT_CONFIG_PATH" "$interface" "$legacy_mode" \
+        "$update_interval_value" "$daily_days_value" "$update_marker"
+}
+
 ensure_vnstat_daily_retention() {
-    local required_days current_days config_path answer tmp_file mode owner group marker_tmp
+    local required_days current_days answer
     case "$TRAFFIC_PERIOD" in
         monthly) required_days=40 ;;
         quarterly) required_days=100 ;;
@@ -224,43 +725,8 @@ ensure_vnstat_daily_retention() {
             ;;
     esac
 
-    for config_path in /etc/vnstat.conf /etc/vnstat/vnstat.conf; do
-        [ -f "$config_path" ] && break
-    done
-    if [ ! -f "$config_path" ]; then
-        echo "未找到 vnStat 配置文件，请手动将 DailyDays 调整为至少 $required_days。"
-        return 1
-    fi
-    if [ ! -f "$WORK_DIR/vnstat.conf.before-trafficcop-lite" ]; then
-        cp -p "$config_path" "$WORK_DIR/vnstat.conf.before-trafficcop-lite" || return 1
-        chmod 600 "$WORK_DIR/vnstat.conf.before-trafficcop-lite" 2>/dev/null || true
-    fi
-    tmp_file="${config_path}.trafficcop-lite.$$"
-    awk -v days="$required_days" '
-        BEGIN { updated=0 }
-        /^[[:space:]]*[;#]?[[:space:]]*DailyDays[[:space:]]+/ { print "DailyDays " days; updated=1; next }
-        { print }
-        END { if (!updated) print "DailyDays " days }
-    ' "$config_path" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
-    mode=$(stat -c '%a' "$config_path" 2>/dev/null || echo 644)
-    owner=$(stat -c '%u' "$config_path" 2>/dev/null || echo 0)
-    group=$(stat -c '%g' "$config_path" 2>/dev/null || echo 0)
-    chmod "$mode" "$tmp_file" 2>/dev/null || chmod 644 "$tmp_file" 2>/dev/null || true
-    chown "$owner:$group" "$tmp_file" 2>/dev/null || true
-
-    marker_tmp="${RETENTION_STATE_FILE}.tmp.$$"
-    date +%Y-%m-%d > "$marker_tmp" || { rm -f "$tmp_file"; return 1; }
-    chmod 600 "$marker_tmp" 2>/dev/null || true
-    commit_vnstat_retention_update "$config_path" "$tmp_file" "$marker_tmp" || return 1
-    if command_exists systemctl; then
-        systemctl restart vnstat.service >/dev/null 2>&1 || systemctl restart vnstatd.service >/dev/null 2>&1 || true
-    elif command_exists rc-service; then
-        rc-service vnstat restart >/dev/null 2>&1 || rc-service vnstatd restart >/dev/null 2>&1 || true
-    elif command_exists service; then
-        service vnstat restart >/dev/null 2>&1 || service vnstatd restart >/dev/null 2>&1 || true
-    fi
-    ensure_service_running "vnStat" vnstat vnstatd
-    echo "vnStat DailyDays 已调整为 $required_days；原配置备份在 $WORK_DIR/vnstat.conf.before-trafficcop-lite。"
+    ensure_vnstat_runtime_config "$MAIN_INTERFACE" "$required_days" true || return 1
+    echo "vnStat DailyDays 已调整为 $required_days；原配置已按配置文件路径备份在 $WORK_DIR 下。"
 }
 
 run_privileged() {
@@ -430,7 +896,12 @@ check_and_install_packages() {
     fi
 
     ensure_service_running "cron" cron crond dcron cronie
-    ensure_service_running "vnStat" vnstat vnstatd
+    if ! ensure_vnstat_daemon_running; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 错误：无法确认 vnStat 守护进程正在运行。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+
+    TC_BIN="$(find_tc_bin)"
 
     # 验证系统 tc 命令是否可用；独立版的 tc 快捷命令不会用于限速。
     if [ -z "$TC_BIN" ]; then
@@ -462,8 +933,14 @@ check_and_install_packages() {
     # 获取 vnstat 统计开始时间
     if [ -n "$main_interface" ]; then
         local vnstat_json vnstat_start_time
-        vnstat_json=$(vnstat -i "$main_interface" --json d)
-        vnstat_start_time=$(echo "$vnstat_json" | jq -r '.interfaces[0].created.date | "\(.year)-\(.month | tostring | if length == 1 then "0" + . else . end)-\(.day | tostring | if length == 1 then "0" + . else . end)"')
+        vnstat_json=$(vnstat_cmd -i "$main_interface" --json d 2>/dev/null || true)
+        if [ -n "$vnstat_json" ] &&
+           vnstat_json=$(normalize_vnstat_json_for_interface "$vnstat_json" "$main_interface") &&
+           vnstat_data_is_fresh "$vnstat_json"; then
+            vnstat_start_time=$(echo "$vnstat_json" | jq -r '.interfaces[0].created.date | "\(.year)-\(.month | tostring | if length == 1 then "0" + . else . end)-\(.day | tostring | if length == 1 then "0" + . else . end)"')
+        else
+            vnstat_start_time=""
+        fi
         
         if [ -n "$vnstat_start_time" ] && [ "$vnstat_start_time" != "null-null-null" ]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') vnstat 统计开始日期: $vnstat_start_time，在此之前的流量不会被纳入统计！" | tee -a "$LOG_FILE"
@@ -763,7 +1240,9 @@ date_num_to_iso() {
 get_vnstat_available_start() {
     local vnstat_json created_num earliest_num available_num trafficless_entries
 
-    vnstat_json=$(vnstat -i "$MAIN_INTERFACE" --json 2>/dev/null) || return 1
+    vnstat_json=$(vnstat_cmd -i "$MAIN_INTERFACE" --json 2>/dev/null) || return 1
+    vnstat_json=$(normalize_vnstat_json_for_interface "$vnstat_json" "$MAIN_INTERFACE") || return 1
+    vnstat_data_is_fresh "$vnstat_json" || return 1
     created_num=$(printf '%s' "$vnstat_json" | jq -r \
         '.interfaces[0].created.date | (.year * 10000 + .month * 100 + .day)' 2>/dev/null) || return 1
     earliest_num=$(printf '%s' "$vnstat_json" | jq -r \
@@ -957,6 +1436,7 @@ initial_config() {
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') 正在检测主要网络接口..."| tee -a "$LOG_FILE"
     MAIN_INTERFACE=$(get_main_interface)
+    ensure_vnstat_runtime_config "$MAIN_INTERFACE" || return 1
     ensure_vnstat_interface "$MAIN_INTERFACE" || return 1
 
     while true; do
@@ -1243,6 +1723,73 @@ get_period_end_date() {
     previous_day "$next_anchor"
 }
 
+normalize_vnstat_json_for_interface() {
+    local vnstat_json="$1"
+    local expected_interface="$2"
+
+    [[ "$expected_interface" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || return 1
+    printf '%s' "$vnstat_json" | jq -ce --arg expected "$expected_interface" '
+        def uint:
+            type == "number" and . >= 0 and floor == .;
+        def leap_year($year):
+            ($year % 400 == 0) or (($year % 4 == 0) and ($year % 100 != 0));
+        def month_days($year; $month):
+            if $month == 2 then (if leap_year($year) then 29 else 28 end)
+            elif $month == 4 or $month == 6 or $month == 9 or $month == 11 then 30
+            else 31 end;
+        def valid_date:
+            type == "object" and
+            (.year | uint) and .year >= 1970 and .year <= 9999 and
+            (.month | uint) and .month >= 1 and .month <= 12 and
+            (.day | uint) and .day >= 1 and .day <= month_days(.year; .month);
+
+        select(.jsonversion == "2" or .jsonversion == 2) |
+        select((.interfaces | type) == "array") |
+        [.interfaces[] | select(.name == $expected)] as $matches |
+        select(($matches | length) == 1) |
+        $matches[0] as $interface |
+        select(($interface | type) == "object") |
+        select($interface.created.date | valid_date) |
+        select(($interface.updated | type) == "object") |
+        select(($interface.traffic | type) == "object") |
+        select(($interface.traffic.day | type) == "array") |
+        select(all($interface.traffic.day[];
+            (.date | valid_date) and (.rx | uint) and (.tx | uint))) |
+        {jsonversion: "2", interfaces: [$interface]}
+    ' 2>/dev/null
+}
+
+vnstat_data_is_fresh() {
+    local vnstat_json="$1"
+    local updated_epoch updated_text now age save_interval update_interval max_age use_utc
+
+    vnstat_daemon_is_running || return 1
+    updated_epoch=$(printf '%s' "$vnstat_json" |
+        jq -r '.interfaces[0].updated.timestamp // empty' 2>/dev/null) || return 1
+    if ! [[ "$updated_epoch" =~ ^[0-9]+$ ]]; then
+        updated_text=$(printf '%s' "$vnstat_json" | jq -r '
+            .interfaces[0].updated as $u |
+            if ($u.date.year == null or $u.date.month == null or $u.date.day == null or
+                $u.time.hour == null or $u.time.minute == null) then empty
+            else "\($u.date.year)-\($u.date.month)-\($u.date.day) \($u.time.hour):\($u.time.minute):\($u.time.second // 0)" end
+        ' 2>/dev/null) || return 1
+        [ -n "$updated_text" ] || return 1
+        use_utc=$(vnstat_config_value "UseUTC")
+        if [ "$use_utc" = "1" ]; then
+            updated_epoch=$(TZ=UTC date -d "$updated_text" +%s 2>/dev/null) || return 1
+        else
+            updated_epoch=$(date -d "$updated_text" +%s 2>/dev/null) || return 1
+        fi
+    fi
+    now=$(date +%s) || return 1
+    save_interval=$(vnstat_config_value "SaveInterval")
+    update_interval=$(vnstat_config_value "UpdateInterval")
+    [[ "$save_interval" =~ ^[1-9][0-9]*$ && "$update_interval" =~ ^[1-9][0-9]*$ ]] || return 1
+    max_age=$((save_interval * 60 + update_interval + 90))
+    age=$((now - updated_epoch))
+    [ "$age" -ge -300 ] && [ "$age" -le "$max_age" ]
+}
+
 # 获取流量使用情况
 get_traffic_usage() {
     local start_date end_date
@@ -1256,13 +1803,21 @@ get_traffic_usage() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') 周期开始日期: $start_date, 周期结束日期: $end_date" >&2
     
     # 使用 vnstat JSON API 获取每日流量数据
-    if ! vnstat_json=$(vnstat -i "$MAIN_INTERFACE" --json 2>/dev/null); then
+    if ! vnstat_json=$(vnstat_cmd -i "$MAIN_INTERFACE" --json 2>/dev/null); then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: vnstat 执行失败，跳过本轮限速检查" >&2
         return 1
     fi
     
     if [ -z "$vnstat_json" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: 无法获取 vnstat JSON 数据" >&2
+        return 1
+    fi
+    if ! vnstat_json=$(normalize_vnstat_json_for_interface "$vnstat_json" "$MAIN_INTERFACE"); then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: vnStat JSON 版本、接口或每日 rx/tx 字段无效，跳过本轮限速检查" >&2
+        return 1
+    fi
+    if ! vnstat_data_is_fresh "$vnstat_json"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: vnStat 守护进程未运行或数据库更新时间过旧，跳过本轮限速检查" >&2
         return 1
     fi
     
@@ -1353,9 +1908,11 @@ get_traffic_usage() {
 }
 
 tc_root_qdisc() {
-    local qdisc_state
-    qdisc_state=$("$TC_BIN" qdisc show dev "$1" root 2>/dev/null) || return 1
-    awk 'NR == 1 { print }' <<< "$qdisc_state"
+    local qdisc_state qdisc_line
+    qdisc_state=$("$TC_BIN" qdisc show dev "$1" root 2>/dev/null) || return 2
+    qdisc_line=$(awk 'NR == 1 { print; exit }' <<< "$qdisc_state")
+    [ -n "$qdisc_line" ] || return 1
+    printf '%s\n' "$qdisc_line"
 }
 
 is_default_qdisc_line() {
@@ -1416,18 +1973,38 @@ normalize_tc_rate_to_bps() {
 tc_class_line() {
     local interface="$1"
     local class_id="$2"
-    local class_state
-    class_state=$("$TC_BIN" class show dev "$interface" 2>/dev/null) || return 1
-    awk -v class_id="$class_id" '$1 == "class" && $3 == class_id { print; exit }' \
-        <<< "$class_state"
+    local class_state class_line
+    class_state=$("$TC_BIN" class show dev "$interface" 2>/dev/null) || return 2
+    class_line=$(awk -v class_id="$class_id" \
+        '$1 == "class" && $3 == class_id { print; exit }' <<< "$class_state")
+    [ -n "$class_line" ] || return 1
+    printf '%s\n' "$class_line"
+}
+
+tc_class_output() {
+    local interface="$1"
+    "$TC_BIN" class show dev "$interface" 2>/dev/null || return 2
+}
+
+tc_filter_output() {
+    local interface="$1"
+    "$TC_BIN" filter show dev "$interface" parent 1:0 2>/dev/null || return 2
 }
 
 tc_class_value() {
     local interface="$1"
     local class_id="$2"
     local key="$3"
-    tc_class_line "$interface" "$class_id" |
-        awk -v key="$key" '{ for (i = 1; i < NF; i++) if ($i == key) { print $(i + 1); exit } }'
+    local class_line status value
+
+    class_line=$(tc_class_line "$interface" "$class_id")
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    value=$(awk -v key="$key" \
+        '{ for (i = 1; i < NF; i++) if ($i == key) { print $(i + 1); exit } }' \
+        <<< "$class_line")
+    [ -n "$value" ] || return 1
+    printf '%s\n' "$value"
 }
 
 tc_class_rate_matches() {
@@ -1435,14 +2012,18 @@ tc_class_rate_matches() {
     local class_id="$2"
     local expected_rate="$3"
     local expected_ceil="${4:-}"
-    local actual_rate actual_ceil expected_bps actual_bps
+    local actual_rate actual_ceil expected_bps actual_bps status
 
     actual_rate=$(tc_class_value "$interface" "$class_id" rate)
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
     expected_bps=$(normalize_tc_rate_to_bps "$expected_rate") || return 1
     actual_bps=$(normalize_tc_rate_to_bps "$actual_rate") || return 1
     [ "$actual_bps" = "$expected_bps" ] || return 1
     if [ -n "$expected_ceil" ]; then
         actual_ceil=$(tc_class_value "$interface" "$class_id" ceil)
+        status=$?
+        [ "$status" -eq 0 ] || return "$status"
         expected_bps=$(normalize_tc_rate_to_bps "$expected_ceil") || return 1
         actual_bps=$(normalize_tc_rate_to_bps "$actual_ceil") || return 1
         [ "$actual_bps" = "$expected_bps" ] || return 1
@@ -1451,17 +2032,29 @@ tc_class_rate_matches() {
 
 tc_root_is_htb_handle_one() {
     local interface="$1"
-    tc_root_qdisc "$interface" | grep -Eq '^qdisc htb 1:([[:space:]]|$)'
+    local qdisc_line status
+    qdisc_line=$(tc_root_qdisc "$interface")
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    printf '%s\n' "$qdisc_line" | grep -Eq '^qdisc htb 1:([[:space:]]|$)'
 }
 
 tc_root_has_default_30() {
     local interface="$1"
-    tc_root_qdisc "$interface" | grep -Eq ' default (0x)?30([[:space:]]|$)'
+    local qdisc_line status
+    qdisc_line=$(tc_root_qdisc "$interface")
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    printf '%s\n' "$qdisc_line" | grep -Eq ' default (0x)?30([[:space:]]|$)'
 }
 
 tc_root_has_parent_class() {
     local interface="$1"
-    tc_class_line "$interface" "1:1" | grep -Eq '^class htb 1:1 root([[:space:]]|$)'
+    local class_line status
+    class_line=$(tc_class_line "$interface" "1:1")
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    printf '%s\n' "$class_line" | grep -Eq '^class htb 1:1 root([[:space:]]|$)'
 }
 
 dog_owner_marker_matches() {
@@ -1510,13 +2103,19 @@ dog_configured_class_ids() {
 
 dog_live_objects_match_config() {
     local interface="$1"
-    local configured_ids actual_ids filter_ids class_id
+    local configured_ids class_output filter_output actual_ids filter_ids class_id status
 
     configured_ids=$(dog_configured_class_ids) || return 1
-    actual_ids=$("$TC_BIN" class show dev "$interface" 2>/dev/null |
+    class_output=$(tc_class_output "$interface")
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    filter_output=$(tc_filter_output "$interface")
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    actual_ids=$(printf '%s\n' "$class_output" |
         awk '$1 == "class" && $2 == "htb" && $3 != "1:1" && $3 != "1:30" { print $3 }' |
         sort -u)
-    filter_ids=$("$TC_BIN" filter show dev "$interface" parent 1:0 2>/dev/null |
+    filter_ids=$(printf '%s\n' "$filter_output" |
         grep -Eo '(flowid|classid)[[:space:]]+1:[0-9a-fA-F]+' |
         awk '{ print $2 }' | sort -u)
 
@@ -1537,19 +2136,36 @@ dog_live_objects_match_config() {
 
 tc_root_is_recognized_dog_htb() {
     local interface="$1"
-    dog_owner_marker_matches "$interface" &&
-        tc_root_is_htb_handle_one "$interface" &&
-        tc_root_has_default_30 "$interface" &&
-        tc_root_has_parent_class "$interface" &&
-        dog_live_objects_match_config "$interface"
+    local status
+
+    dog_owner_marker_matches "$interface" || return 1
+    tc_root_is_htb_handle_one "$interface"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    tc_root_has_default_30 "$interface"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    tc_root_has_parent_class "$interface"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    dog_live_objects_match_config "$interface"
 }
 
 tc_root_is_unified_compatible() {
     local interface="$1"
-    tc_root_is_htb_handle_one "$interface" || return 1
-    tc_root_has_default_30 "$interface" || return 1
-    tc_root_has_parent_class "$interface" || return 1
-    tc_state_is_unified_for_interface "$interface" || tc_root_is_recognized_dog_htb "$interface"
+    local status
+
+    tc_root_is_htb_handle_one "$interface"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    tc_root_has_default_30 "$interface"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    tc_root_has_parent_class "$interface"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    tc_state_is_unified_for_interface "$interface" && return 0
+    tc_root_is_recognized_dog_htb "$interface"
 }
 
 dog_config_reserves_default_class() {
@@ -1564,25 +2180,31 @@ dog_config_reserves_default_class() {
 
 tc_default_class_is_safe() {
     local interface="$1"
-    local default_line
+    local default_line status
 
     dog_config_reserves_default_class && return 1
     default_line=$(tc_class_line "$interface" "1:30")
-    [ -z "$default_line" ] && return 0
+    status=$?
+    [ "$status" -eq 2 ] && return 2
+    [ "$status" -eq 1 ] && return 0
     printf '%s\n' "$default_line" | grep -Eq '^class htb 1:30 parent 1:1([[:space:]]|$)' &&
         tc_class_rate_matches "$interface" "1:30" "$TC_DEFAULT_CLASS_RATE"
 }
 
 tc_has_other_consumers() {
     local interface="$1"
-    local class_output filter_output
+    local class_output filter_output status
 
-    class_output=$("$TC_BIN" class show dev "$interface" 2>/dev/null || true)
+    class_output=$(tc_class_output "$interface")
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
     if printf '%s\n' "$class_output" |
         awk '$1 == "class" && $3 != "1:1" && $3 != "1:30" { found=1 } END { exit found ? 0 : 1 }'; then
         return 0
     fi
-    filter_output=$("$TC_BIN" filter show dev "$interface" parent 1:0 2>/dev/null || true)
+    filter_output=$(tc_filter_output "$interface")
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
     [ -n "$filter_output" ]
 }
 
@@ -1639,22 +2261,37 @@ write_tc_state() {
 tc_verify_unified_hierarchy() {
     local interface="$1"
     local parent_rate="$2"
+    local class_line status
 
-    tc_root_is_htb_handle_one "$interface" || return 1
-    tc_root_has_default_30 "$interface" || return 1
-    tc_root_has_parent_class "$interface" || return 1
-    tc_class_line "$interface" "1:30" |
+    tc_root_is_htb_handle_one "$interface"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    tc_root_has_default_30 "$interface"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    tc_root_has_parent_class "$interface"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    class_line=$(tc_class_line "$interface" "1:30")
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    printf '%s\n' "$class_line" |
         grep -Eq '^class htb 1:30 parent 1:1([[:space:]]|$)' || return 1
-    tc_class_rate_matches "$interface" "1:1" "$parent_rate" "$parent_rate" || return 1
+    tc_class_rate_matches "$interface" "1:1" "$parent_rate" "$parent_rate"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
     tc_class_rate_matches "$interface" "1:30" "$TC_DEFAULT_CLASS_RATE" "$parent_rate"
 }
 
 tc_replace_base_classes() {
     local interface="$1"
     local parent_rate="$2"
+    local status
 
     normalize_tc_rate_to_bps "$parent_rate" >/dev/null 2>&1 || return 1
-    tc_default_class_is_safe "$interface" || return 1
+    tc_default_class_is_safe "$interface"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
     "$TC_BIN" class replace dev "$interface" parent 1: classid 1:1 htb \
         rate "$parent_rate" ceil "$parent_rate" 2>/dev/null || return 1
     "$TC_BIN" class replace dev "$interface" parent 1:1 classid 1:30 htb \
@@ -1663,11 +2300,17 @@ tc_replace_base_classes() {
 
 tc_state_allows_boot_rebuild() {
     local interface="$1"
-    local state_boot_id boot_id state_provider state_speed
+    local state_boot_id boot_id state_schema state_provider state_speed
 
     [ "$(tc_state_interface)" = "$interface" ] || return 1
+    state_schema=$(tc_state_value SCHEMA)
     state_provider=$(tc_state_value PROVIDER)
-    [ -z "$state_provider" ] || [ "$state_provider" = "$TC_STATE_PROVIDER" ] || return 1
+    if [ -z "$state_schema" ]; then
+        [ -z "$state_provider" ] || return 1
+    else
+        [ "$state_schema" = "$TC_STATE_SCHEMA" ] &&
+            [ "$state_provider" = "$TC_STATE_PROVIDER" ] || return 1
+    fi
     state_speed=$(tc_state_value LIMIT_SPEED)
     [[ "$state_speed" =~ ^[1-9][0-9]*$ ]] || return 1
     state_boot_id=$(tc_state_value BOOT_ID)
@@ -1682,6 +2325,7 @@ apply_tc_limit() {
     local old_parent_rate="" old_parent_ceil=""
     local old_default_line="" old_default_rate="" old_default_ceil=""
     local legacy_speed="" rollback_ok=false
+    local query_status verify_status
 
     if [ -z "$TC_BIN" ] || ! [[ "$speed" =~ ^[1-9][0-9]*$ ]]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 未找到系统 tc 命令，无法执行限速" | tee -a "$LOG_FILE"
@@ -1704,23 +2348,58 @@ apply_tc_limit() {
     fi
 
     existing_qdisc=$(tc_root_qdisc "$MAIN_INTERFACE")
-    if tc_root_is_unified_compatible "$MAIN_INTERFACE"; then
+    query_status=$?
+    if [ "$query_status" -eq 2 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 无法读取 $MAIN_INTERFACE 的 root qdisc，未作任何 TC 修改。" | tee -a "$LOG_FILE"
+        release_tc_hierarchy_lock
+        return 1
+    elif [ "$query_status" -eq 1 ]; then
+        existing_qdisc=""
+    fi
+
+    tc_root_is_unified_compatible "$MAIN_INTERFACE"
+    query_status=$?
+    if [ "$query_status" -eq 2 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') TC 层级查询失败，未作任何 TC 修改。" | tee -a "$LOG_FILE"
+        release_tc_hierarchy_lock
+        return 1
+    elif [ "$query_status" -eq 0 ]; then
         mode="existing"
         if tc_state_is_unified_for_interface "$MAIN_INTERFACE" &&
-           [ "$(tc_state_value LIMIT_SPEED)" = "$speed" ] &&
-           tc_verify_unified_hierarchy "$MAIN_INTERFACE" "${speed}kbit"; then
-            release_tc_hierarchy_lock
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 统一 HTB 整机限速规则保持生效" | tee -a "$LOG_FILE"
-            return 0
+           [ "$(tc_state_value LIMIT_SPEED)" = "$speed" ]; then
+            tc_verify_unified_hierarchy "$MAIN_INTERFACE" "${speed}kbit"
+            verify_status=$?
+            if [ "$verify_status" -eq 0 ]; then
+                release_tc_hierarchy_lock
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 统一 HTB 整机限速规则保持生效" | tee -a "$LOG_FILE"
+                return 0
+            elif [ "$verify_status" -eq 2 ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') TC 层级查询失败，未作任何 TC 修改。" | tee -a "$LOG_FILE"
+                release_tc_hierarchy_lock
+                return 1
+            fi
         fi
         old_parent_rate=$(tc_class_value "$MAIN_INTERFACE" "1:1" rate)
+        query_status=$?
+        [ "$query_status" -eq 0 ] || mode=""
         old_parent_ceil=$(tc_class_value "$MAIN_INTERFACE" "1:1" ceil)
+        query_status=$?
+        [ "$query_status" -eq 0 ] || mode=""
         normalize_tc_rate_to_bps "$old_parent_rate" >/dev/null 2>&1 || mode=""
         normalize_tc_rate_to_bps "$old_parent_ceil" >/dev/null 2>&1 || mode=""
         old_default_line=$(tc_class_line "$MAIN_INTERFACE" "1:30")
-        if [ -n "$old_default_line" ]; then
+        query_status=$?
+        if [ "$query_status" -eq 2 ]; then
+            mode=""
+        elif [ "$query_status" -eq 1 ]; then
+            old_default_line=""
+        else
             old_default_rate=$(tc_class_value "$MAIN_INTERFACE" "1:30" rate)
+            query_status=$?
+            [ "$query_status" -eq 0 ] || mode=""
             old_default_ceil=$(tc_class_value "$MAIN_INTERFACE" "1:30" ceil)
+            query_status=$?
+            [ "$query_status" -eq 0 ] || mode=""
             normalize_tc_rate_to_bps "$old_default_rate" >/dev/null 2>&1 || mode=""
             normalize_tc_rate_to_bps "$old_default_ceil" >/dev/null 2>&1 || mode=""
         fi
@@ -1784,9 +2463,12 @@ apply_tc_limit() {
             fi
             ;;
         new)
-            if "$TC_BIN" qdisc del dev "$MAIN_INTERFACE" root handle 1: 2>/dev/null ||
-               ! tc_root_is_htb_handle_one "$MAIN_INTERFACE"; then
+            if "$TC_BIN" qdisc del dev "$MAIN_INTERFACE" root handle 1: 2>/dev/null; then
                 rollback_ok=true
+            else
+                tc_root_is_htb_handle_one "$MAIN_INTERFACE"
+                query_status=$?
+                [ "$query_status" -eq 1 ] && rollback_ok=true
             fi
             ;;
     esac
@@ -1805,6 +2487,7 @@ clear_owned_tc_rules_locked() {
     local reason="$1"
     local state_interface qdisc_line state_speed state_schema state_provider
     local rollback_ok=false
+    local query_status verify_status
 
     if [ ! -f "$TC_STATE_FILE" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：未发现本脚本 TC 状态标记，保留现有 qdisc。" | tee -a "$LOG_FILE"
@@ -1813,9 +2496,8 @@ clear_owned_tc_rules_locked() {
 
     state_interface=$(tc_state_interface)
     if [ -z "$state_interface" ]; then
-        rm -f "$TC_STATE_FILE"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：TC 状态文件无效，已移除状态文件。" | tee -a "$LOG_FILE"
-        return 0
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：TC 状态文件缺少接口，无法证明现有 qdisc 归属；已保留状态和规则。" | tee -a "$LOG_FILE"
+        return 1
     fi
 
     if [ -z "$TC_BIN" ]; then
@@ -1824,6 +2506,13 @@ clear_owned_tc_rules_locked() {
     fi
 
     qdisc_line=$(tc_root_qdisc "$state_interface")
+    query_status=$?
+    if [ "$query_status" -eq 2 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：无法读取 root qdisc，保留规则和状态。" | tee -a "$LOG_FILE"
+        return 1
+    elif [ "$query_status" -eq 1 ]; then
+        qdisc_line=""
+    fi
     state_speed=$(tc_state_value LIMIT_SPEED)
     state_schema=$(tc_state_value SCHEMA)
     state_provider=$(tc_state_value PROVIDER)
@@ -1862,13 +2551,32 @@ clear_owned_tc_rules_locked() {
         echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB 已不存在，仅清理本脚本状态。" | tee -a "$LOG_FILE"
         return 0
     fi
-    if ! tc_root_is_unified_compatible "$state_interface" ||
-       ! tc_verify_unified_hierarchy "$state_interface" "${state_speed}kbit"; then
+    tc_root_is_unified_compatible "$state_interface"
+    query_status=$?
+    if [ "$query_status" -eq 2 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：TC 层级查询失败，保留规则和状态。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+    if [ "$query_status" -ne 0 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB 与本脚本状态不一致，保留规则和状态。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+    tc_verify_unified_hierarchy "$state_interface" "${state_speed}kbit"
+    verify_status=$?
+    if [ "$verify_status" -eq 2 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：TC 层级查询失败，保留规则和状态。" | tee -a "$LOG_FILE"
+        return 1
+    elif [ "$verify_status" -ne 0 ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB 与本脚本状态不一致，保留规则和状态。" | tee -a "$LOG_FILE"
         return 1
     fi
 
-    if tc_has_other_consumers "$state_interface"; then
+    tc_has_other_consumers "$state_interface"
+    query_status=$?
+    if [ "$query_status" -eq 2 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：无法确认其他 TC 使用者，保留规则和状态。" | tee -a "$LOG_FILE"
+        return 1
+    elif [ "$query_status" -eq 0 ]; then
         if ! tc_replace_base_classes "$state_interface" "$TC_PARENT_RATE" ||
            ! tc_verify_unified_hierarchy "$state_interface" "$TC_PARENT_RATE"; then
             tc_replace_base_classes "$state_interface" "${state_speed}kbit" >/dev/null 2>&1 || true
@@ -1881,10 +2589,16 @@ clear_owned_tc_rules_locked() {
         fi
         tc_replace_base_classes "$state_interface" "${state_speed}kbit" >/dev/null 2>&1 && rollback_ok=true
     else
-        if ! "$TC_BIN" qdisc del dev "$state_interface" root handle 1: 2>/dev/null &&
-           tc_root_is_htb_handle_one "$state_interface"; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB root 清理失败，保留状态。" | tee -a "$LOG_FILE"
-            return 1
+        if ! "$TC_BIN" qdisc del dev "$state_interface" root handle 1: 2>/dev/null; then
+            tc_root_is_htb_handle_one "$state_interface"
+            query_status=$?
+            if [ "$query_status" -eq 2 ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：root 清理后状态查询失败，保留状态。" | tee -a "$LOG_FILE"
+                return 1
+            elif [ "$query_status" -eq 0 ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB root 清理失败，保留状态。" | tee -a "$LOG_FILE"
+                return 1
+            fi
         fi
         if rm -f "$TC_STATE_FILE"; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：已清理仅由 TrafficCop 使用的统一 HTB root。" | tee -a "$LOG_FILE"
@@ -2036,6 +2750,7 @@ enforcement_guard_active() {
 
 owned_tc_limit_active() {
     local state_interface qdisc_line state_speed state_provider state_schema
+    local query_status
 
     [ -f "$TC_STATE_FILE" ] || return 1
     state_interface=$(tc_state_interface)
@@ -2045,9 +2760,13 @@ owned_tc_limit_active() {
     state_speed=$(tc_state_value LIMIT_SPEED)
     [[ "$state_speed" =~ ^[1-9][0-9]*$ ]] || return 1
     qdisc_line=$(tc_root_qdisc "$state_interface")
+    query_status=$?
+    [ "$query_status" -eq 0 ] || return "$query_status"
     if [ "$state_schema" = "$TC_STATE_SCHEMA" ] && [ "$state_provider" = "$TC_STATE_PROVIDER" ]; then
-        tc_root_is_unified_compatible "$state_interface" &&
-            tc_verify_unified_hierarchy "$state_interface" "${state_speed}kbit"
+        tc_root_is_unified_compatible "$state_interface"
+        query_status=$?
+        [ "$query_status" -eq 0 ] || return "$query_status"
+        tc_verify_unified_hierarchy "$state_interface" "${state_speed}kbit"
         return $?
     fi
     tc_legacy_tbf_is_owned "$state_interface" "$qdisc_line"
@@ -2285,26 +3004,60 @@ recover_owned_tc_hierarchy() {
         return 1
     fi
 
-    local qdisc_line
+    local qdisc_line query_status unified_status verify_status
     qdisc_line=$(tc_root_qdisc "$MAIN_INTERFACE")
-    if [ "$state_expected" = "true" ] &&
-       tc_root_is_unified_compatible "$MAIN_INTERFACE" &&
-       tc_verify_unified_hierarchy "$MAIN_INTERFACE" "${state_speed}kbit"; then
+    query_status=$?
+    if [ "$query_status" -eq 2 ]; then
         release_tc_hierarchy_lock
-        echo "Dog/NTC TC 规则完整，无需重建。"
-        return 0
+        echo "无法读取当前 root qdisc，未作任何 TC 修改。" >&2
+        return 1
+    elif [ "$query_status" -eq 1 ]; then
+        qdisc_line=""
+    fi
+    tc_root_is_unified_compatible "$MAIN_INTERFACE"
+    unified_status=$?
+    if [ "$unified_status" -eq 2 ]; then
+        release_tc_hierarchy_lock
+        echo "TC 层级查询失败，未作任何 TC 修改。" >&2
+        return 1
+    fi
+    if [ "$state_expected" = "true" ] && [ "$unified_status" -eq 0 ]; then
+        tc_verify_unified_hierarchy "$MAIN_INTERFACE" "${state_speed}kbit"
+        verify_status=$?
+        if [ "$verify_status" -eq 2 ]; then
+            release_tc_hierarchy_lock
+            echo "TC 层级查询失败，未作任何 TC 修改。" >&2
+            return 1
+        elif [ "$verify_status" -eq 0 ]; then
+            release_tc_hierarchy_lock
+            echo "Dog/NTC TC 规则完整，无需重建。"
+            return 0
+        fi
     fi
 
     # Dog 已恢复统一层级但 NTC 状态尚未建立时，不删树，交给现有全局限速逻辑原地协调。
-    if [ "$state_expected" = "false" ] && tc_root_is_unified_compatible "$MAIN_INTERFACE"; then
+    if [ "$state_expected" = "false" ] && [ "$unified_status" -eq 0 ]; then
         release_tc_hierarchy_lock
         check_and_limit_traffic
         return $?
     fi
 
+    if [ "$mode" = "--auto" ] && [ "$unified_status" -ne 0 ] &&
+       ! is_default_qdisc_line "$qdisc_line"; then
+        release_tc_hierarchy_lock
+        echo "自动恢复检测到外部或未知 root qdisc，拒绝接管；请使用 --manual 明确确认。" >&2
+        return 1
+    fi
+
     # 其余情况下只要仍配置了 Dog 端口类，就必须由共享入口先恢复整棵树。
     local dog_classes=""
-    dog_classes=$(dog_configured_class_ids 2>/dev/null || true)
+    if [ -e "$DOG_CONFIG_FILE" ] || [ -L "$DOG_CONFIG_FILE" ]; then
+        if ! dog_classes=$(dog_configured_class_ids 2>/dev/null); then
+            release_tc_hierarchy_lock
+            echo "Dog 配置存在但无法安全解析，拒绝删除 qdisc。" >&2
+            return 1
+        fi
+    fi
     if [ -n "$dog_classes" ]; then
         release_tc_hierarchy_lock
         echo "检测到 Dog 端口限速配置，请使用共享 traffic-tools-tc-recovery 服务恢复。" >&2
@@ -2350,6 +3103,7 @@ recover_owned_tc_hierarchy() {
 
 tc_self_check() {
     local interface qdisc_line state_speed state_schema result=1
+    local query_status verify_status default_status default_line
 
     if [ -z "$TC_BIN" ]; then
         echo "TC_SELF_CHECK=ERROR REASON=tc-not-found"
@@ -2366,6 +3120,14 @@ tc_self_check() {
     fi
 
     qdisc_line=$(tc_root_qdisc "$interface")
+    query_status=$?
+    if [ "$query_status" -eq 2 ]; then
+        echo "TC_SELF_CHECK=ERROR INTERFACE=$interface REASON=tc-query-failed"
+        release_tc_hierarchy_lock
+        return 1
+    elif [ "$query_status" -eq 1 ]; then
+        qdisc_line=""
+    fi
     if is_default_qdisc_line "$qdisc_line"; then
         if [ -f "$TC_STATE_FILE" ]; then
             echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=state-without-unified-htb"
@@ -2380,35 +3142,57 @@ tc_self_check() {
         else
             echo "TC_SELF_CHECK=CONFLICT INTERFACE=$interface REASON=foreign-tbf"
         fi
-    elif tc_root_is_unified_compatible "$interface"; then
-        if ! tc_default_class_is_safe "$interface"; then
-            echo "TC_SELF_CHECK=CONFLICT INTERFACE=$interface REASON=reserved-class-1:30"
-        elif tc_state_is_unified_for_interface "$interface"; then
-            state_speed=$(tc_state_value LIMIT_SPEED)
-            if [[ "$state_speed" =~ ^[1-9][0-9]*$ ]] &&
-               tc_verify_unified_hierarchy "$interface" "${state_speed}kbit"; then
-                echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=$TC_STATE_SCHEMA OWNER=trafficcop-lite"
-                result=0
-            else
-                echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=trafficcop-parent-mismatch"
-            fi
-        elif [ -f "$TC_STATE_FILE" ] && [ "$(tc_state_interface)" = "$interface" ]; then
-            state_schema=$(tc_state_value SCHEMA)
-            if [ -z "$state_schema" ]; then
-                echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=legacy-trafficcop-state-with-unified-htb ACTION=reapply-trafficcop-limit"
-            else
-                echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=trafficcop-state-not-unified"
-            fi
-        elif tc_class_line "$interface" "1:30" >/dev/null &&
-             [ -n "$(tc_class_line "$interface" "1:30")" ]; then
-            echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=$TC_STATE_SCHEMA OWNER=port-traffic-dog"
-            result=0
-        else
-            echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=legacy-dog-htb ACTION=add-default-class-on-next-apply"
-            result=0
-        fi
     else
-        echo "TC_SELF_CHECK=CONFLICT INTERFACE=$interface REASON=foreign-root-qdisc"
+        tc_root_is_unified_compatible "$interface"
+        query_status=$?
+        if [ "$query_status" -eq 2 ]; then
+            echo "TC_SELF_CHECK=ERROR INTERFACE=$interface REASON=tc-query-failed"
+        elif [ "$query_status" -ne 0 ]; then
+            echo "TC_SELF_CHECK=CONFLICT INTERFACE=$interface REASON=foreign-root-qdisc"
+        else
+            tc_default_class_is_safe "$interface"
+            default_status=$?
+            if [ "$default_status" -eq 2 ]; then
+                echo "TC_SELF_CHECK=ERROR INTERFACE=$interface REASON=tc-query-failed"
+            elif [ "$default_status" -ne 0 ]; then
+                echo "TC_SELF_CHECK=CONFLICT INTERFACE=$interface REASON=reserved-class-1:30"
+            elif tc_state_is_unified_for_interface "$interface"; then
+                state_speed=$(tc_state_value LIMIT_SPEED)
+                if [[ "$state_speed" =~ ^[1-9][0-9]*$ ]]; then
+                    tc_verify_unified_hierarchy "$interface" "${state_speed}kbit"
+                    verify_status=$?
+                else
+                    verify_status=1
+                fi
+                if [ "$verify_status" -eq 2 ]; then
+                    echo "TC_SELF_CHECK=ERROR INTERFACE=$interface REASON=tc-query-failed"
+                elif [ "$verify_status" -eq 0 ]; then
+                    echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=$TC_STATE_SCHEMA OWNER=trafficcop-lite"
+                    result=0
+                else
+                    echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=trafficcop-parent-mismatch"
+                fi
+            elif [ -f "$TC_STATE_FILE" ] && [ "$(tc_state_interface)" = "$interface" ]; then
+                state_schema=$(tc_state_value SCHEMA)
+                if [ -z "$state_schema" ]; then
+                    echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=legacy-trafficcop-state-with-unified-htb ACTION=reapply-trafficcop-limit"
+                else
+                    echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=trafficcop-state-not-unified"
+                fi
+            else
+                default_line=$(tc_class_line "$interface" "1:30")
+                query_status=$?
+                if [ "$query_status" -eq 2 ]; then
+                    echo "TC_SELF_CHECK=ERROR INTERFACE=$interface REASON=tc-query-failed"
+                elif [ "$query_status" -eq 0 ] && [ -n "$default_line" ]; then
+                    echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=$TC_STATE_SCHEMA OWNER=port-traffic-dog"
+                    result=0
+                else
+                    echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=legacy-dog-htb ACTION=add-default-class-on-next-apply"
+                    result=0
+                fi
+            fi
+        fi
     fi
 
     release_tc_hierarchy_lock
@@ -2476,8 +3260,6 @@ main() {
         exit 1
     fi
     trap 'trim_log_file "$LOG_FILE" "$LOG_MAX_LINES"; flock -u 9 2>/dev/null || true' EXIT
-    command_exists vnstat && align_timezone_with_vnstat
-
     if [ "${1:-}" = "--tc-recover-owned" ]; then
         if ! read_config; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 配置文件读取失败，未修改 TC。" | tee -a "$LOG_FILE"
@@ -2494,6 +3276,10 @@ main() {
             if [ "${DISABLED:-false}" = "true" ]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') 监控已标记为禁用，跳过自动检查" | tee -a "$LOG_FILE"
                 return
+            fi
+            if ! ensure_vnstat_runtime_config "$MAIN_INTERFACE"; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') vnStat 运行配置或服务校验失败，跳过本轮检查。" | tee -a "$LOG_FILE"
+                return 1
             fi
             check_reset_limit || return 1
             check_and_limit_traffic
@@ -2512,6 +3298,7 @@ main() {
     fi
     if check_existing_setup; then
         read_config || return 1
+        ensure_vnstat_runtime_config "$MAIN_INTERFACE" || return 1
         show_current_config
 
         echo "$(date '+%Y-%m-%d %H:%M:%S') 是否需要修改配置？(y/n): 5秒内按任意键修改配置，否则保持现有配置" | tee -a "$LOG_FILE"

@@ -26,12 +26,23 @@ TC_STATE_SCHEMA="traffic-tools-unified-htb-v1"
 TC_STATE_PROVIDER="trafficcop-lite"
 TC_PARENT_RATE="100gbit"
 TC_DEFAULT_CLASS_RATE="1kbit"
-VNSTAT_MAX_BANDWIDTH=50000
+TC_MARK_MASK=0xfffff000
+VNSTAT_MAX_BANDWIDTH="${VNSTAT_MAX_BANDWIDTH:-0}"
 VNSTAT_SAVE_INTERVAL=1
+VNSTAT_CONFIG_TRANSACTION_ACTIVE=false
+VNSTAT_TRANSACTION_DIR=""
+VNSTAT_TRANSACTION_CONFIG_PATH=""
+VNSTAT_TRANSACTION_INTERFACE=""
+VNSTAT_TRANSACTION_INTERFACE_ADDED=false
+VNSTAT_TRANSACTION_DAEMON_WAS_RUNNING=false
+VNSTAT_TRANSACTION_SERVICE_MANAGER=""
+VNSTAT_TRANSACTION_SERVICE_NAME=""
+VNSTAT_TRANSACTION_HAD_RETENTION=false
+VNSTAT_TRANSACTION_HAD_CONFIG_PATH_FILE=false
 DOG_CONFIG_FILE="/etc/port-traffic-dog/config.json"
 DOG_TC_OWNER_FILE="/etc/port-traffic-dog/tc-root-qdisc.owner"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.1.7"
+SCRIPT_VERSION="1.1.8"
 mkdir -p "$WORK_DIR"
 chmod 700 "$WORK_DIR" 2>/dev/null || true
 
@@ -50,7 +61,24 @@ trim_log_file() {
     rm -f "$tmp_file" 2>/dev/null || true
 }
 
-trim_log_file "$LOG_FILE" "$LOG_MAX_LINES"
+invocation_writes_generic_log() {
+    case "${1:-}" in
+        --self-check|--tc-self-check) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+write_invocation_log_header() {
+    invocation_writes_generic_log "${1:-}" || return 0
+    trim_log_file "$LOG_FILE" "$LOG_MAX_LINES"
+    echo "-----------------------------------------------------" | tee -a "$LOG_FILE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') 当前版本：$SCRIPT_VERSION" | tee -a "$LOG_FILE"
+}
+
+write_invocation_log_footer() {
+    invocation_writes_generic_log "${1:-}" || return 0
+    echo "-----------------------------------------------------" | tee -a "$LOG_FILE"
+}
 
 find_tc_bin() {
     local candidate
@@ -65,8 +93,7 @@ find_tc_bin() {
 
 TC_BIN="$(find_tc_bin)"
 
-echo "-----------------------------------------------------"| tee -a "$LOG_FILE"
-echo "$(date '+%Y-%m-%d %H:%M:%S') 当前版本：$SCRIPT_VERSION"| tee -a "$LOG_FILE"
+write_invocation_log_header "${1:-}"
 
 
 
@@ -363,8 +390,88 @@ start_vnstat_daemon_strict() {
     return 1
 }
 
+start_vnstat_daemon_temporarily() {
+    local service_name
+
+    VNSTAT_TRANSACTION_SERVICE_MANAGER=""
+    VNSTAT_TRANSACTION_SERVICE_NAME=""
+    if command_exists systemctl && [ -d /run/systemd/system ]; then
+        for service_name in vnstat vnstatd; do
+            if systemctl list-unit-files "${service_name}.service" --no-legend 2>/dev/null |
+                grep -q "^${service_name}\.service"; then
+                VNSTAT_TRANSACTION_SERVICE_MANAGER=systemd
+                VNSTAT_TRANSACTION_SERVICE_NAME="$service_name"
+                run_privileged systemctl start "${service_name}.service" >/dev/null 2>&1 || return 1
+                systemctl is-active --quiet "${service_name}.service" 2>/dev/null || return 1
+                vnstat_daemon_is_running || return 1
+                return 0
+            fi
+        done
+    elif command_exists rc-service; then
+        for service_name in vnstat vnstatd; do
+            [ -x "/etc/init.d/$service_name" ] || continue
+            VNSTAT_TRANSACTION_SERVICE_MANAGER=openrc
+            VNSTAT_TRANSACTION_SERVICE_NAME="$service_name"
+            run_privileged rc-service "$service_name" start >/dev/null 2>&1 ||
+                rc-service "$service_name" status >/dev/null 2>&1 || return 1
+            vnstat_daemon_is_running || return 1
+            return 0
+        done
+    elif command_exists service; then
+        for service_name in vnstat vnstatd; do
+            [ -x "/etc/init.d/$service_name" ] || continue
+            VNSTAT_TRANSACTION_SERVICE_MANAGER=sysv
+            VNSTAT_TRANSACTION_SERVICE_NAME="$service_name"
+            run_privileged service "$service_name" start >/dev/null 2>&1 ||
+                service "$service_name" status >/dev/null 2>&1 || return 1
+            vnstat_daemon_is_running || return 1
+            return 0
+        done
+    fi
+    return 1
+}
+
+stop_transaction_vnstat_daemon() {
+    local stop_status=0
+
+    case "$VNSTAT_TRANSACTION_SERVICE_MANAGER" in
+        systemd)
+            run_privileged systemctl stop "${VNSTAT_TRANSACTION_SERVICE_NAME}.service" >/dev/null 2>&1 || stop_status=$?
+            ;;
+        openrc)
+            run_privileged rc-service "$VNSTAT_TRANSACTION_SERVICE_NAME" stop >/dev/null 2>&1 || stop_status=$?
+            ;;
+        sysv)
+            run_privileged service "$VNSTAT_TRANSACTION_SERVICE_NAME" stop >/dev/null 2>&1 || stop_status=$?
+            ;;
+        "") return 0 ;;
+        *) return 1 ;;
+    esac
+    vnstat_daemon_is_running && return 1
+    [ "$stop_status" -eq 0 ] || return 1
+}
+
+enable_transaction_vnstat_daemon() {
+    case "$VNSTAT_TRANSACTION_SERVICE_MANAGER" in
+        systemd)
+            run_privileged systemctl enable "${VNSTAT_TRANSACTION_SERVICE_NAME}.service" >/dev/null 2>&1
+            ;;
+        openrc)
+            command_exists rc-update || return 1
+            run_privileged rc-update add "$VNSTAT_TRANSACTION_SERVICE_NAME" default >/dev/null 2>&1
+            ;;
+        sysv) return 0 ;;
+        "") return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 ensure_vnstat_daemon_running() {
     vnstat_daemon_is_running && return 0
+    if [ "${VNSTAT_CONFIG_TRANSACTION_ACTIVE:-false}" = "true" ]; then
+        start_vnstat_daemon_temporarily
+        return $?
+    fi
     start_vnstat_daemon_strict
 }
 
@@ -392,10 +499,44 @@ ensure_vnstat_interface() {
         echo "$(date '+%Y-%m-%d %H:%M:%S') 无法将接口 $interface 添加到 vnStat 数据库。" | tee -a "$LOG_FILE"
         return 1
     fi
+    if [ "${VNSTAT_CONFIG_TRANSACTION_ACTIVE:-false}" = "true" ] &&
+       [ "$interface" = "${VNSTAT_TRANSACTION_INTERFACE:-}" ]; then
+        VNSTAT_TRANSACTION_INTERFACE_ADDED=true
+    fi
     if ! ensure_vnstat_daemon_running || ! reload_vnstat_daemon; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 无法启动或重载 vnStat 服务。" | tee -a "$LOG_FILE"
         return 1
     fi
+}
+
+vnstat_max_bandwidth_valid() {
+    local value="${1:-}"
+
+    [[ "$value" =~ ^[0-9]+$ ]] || return 1
+    [ "${#value}" -le 5 ] || return 1
+    value=$((10#$value))
+    [ "$value" -le 50000 ]
+}
+
+prompt_vnstat_max_bandwidth() {
+    local current="${VNSTAT_MAX_BANDWIDTH:-0}"
+    local answer
+
+    if ! vnstat_max_bandwidth_valid "$current"; then
+        current=0
+    else
+        current=$((10#$current))
+    fi
+
+    while true; do
+        read -r -p "请输入 vnStat 异常速率检查上限 (Mbit/s；0=关闭检查，默认0；直接回车保留当前值 $current): " answer || return 1
+        answer=${answer:-$current}
+        if vnstat_max_bandwidth_valid "$answer"; then
+            VNSTAT_MAX_BANDWIDTH=$((10#$answer))
+            return 0
+        fi
+        echo "输入无效，请输入 0-50000 的整数；0 表示关闭检查。"
+    done
 }
 
 build_vnstat_config_candidate() {
@@ -668,9 +809,13 @@ apply_vnstat_config_update() {
 
     rm -f "$rollback_path" "$marker_backup"
     if [ "$legacy_mode" = "true" ]; then
-        echo "vnStat 2.0-2.8 兼容模式：已关闭自动带宽检测，并将全局 MaxBandwidth 设为 ${VNSTAT_MAX_BANDWIDTH} Mbit。"
+        echo "vnStat 2.0-2.8 兼容模式：已关闭自动带宽检测，并同步设置全局 MaxBandwidth。"
     fi
-    echo "vnStat 已设置 SaveInterval=${VNSTAT_SAVE_INTERVAL}，接口/兼容带宽上限=${VNSTAT_MAX_BANDWIDTH} Mbit。"
+    if [ "$VNSTAT_MAX_BANDWIDTH" -eq 0 ]; then
+        echo "vnStat 已设置 SaveInterval=${VNSTAT_SAVE_INTERVAL}，异常速率检查已关闭（MaxBW=0）。"
+    else
+        echo "vnStat 已设置 SaveInterval=${VNSTAT_SAVE_INTERVAL}，异常速率检查上限=${VNSTAT_MAX_BANDWIDTH} Mbit/s。"
+    fi
 }
 
 ensure_vnstat_runtime_config() {
@@ -680,6 +825,11 @@ ensure_vnstat_runtime_config() {
     local version_parts major minor legacy_mode=false current_update update_interval_value=""
 
     [[ "$interface" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || return 1
+    vnstat_max_bandwidth_valid "$VNSTAT_MAX_BANDWIDTH" || {
+        echo "vnStat 异常速率检查上限无效，必须是 0-50000 的整数。" >&2
+        return 1
+    }
+    VNSTAT_MAX_BANDWIDTH=$((10#$VNSTAT_MAX_BANDWIDTH))
     # 先启动服务，再从实际 vnstatd 进程参数解析配置路径；这样即使服务通过
     # --config 使用自定义文件且调用前处于停止状态，也不会误改 CLI 默认配置。
     ensure_vnstat_daemon_running || return 1
@@ -729,6 +879,131 @@ ensure_vnstat_daily_retention() {
     echo "vnStat DailyDays 已调整为 $required_days；原配置已按配置文件路径备份在 $WORK_DIR 下。"
 }
 
+restore_file_snapshot() {
+    local backup_path="$1"
+    local had_file="$2"
+    local target_path="$3"
+    local restore_tmp="${target_path}.restore.$$"
+
+    if [ "$had_file" = "true" ]; then
+        [ -f "$backup_path" ] || return 1
+        cp -p "$backup_path" "$restore_tmp" || { rm -f "$restore_tmp"; return 1; }
+        mv -f "$restore_tmp" "$target_path" || { rm -f "$restore_tmp"; return 1; }
+    else
+        rm -f "$target_path" || return 1
+    fi
+}
+
+cleanup_initial_vnstat_transaction_files() {
+    [ -n "${VNSTAT_TRANSACTION_DIR:-}" ] || return 0
+    rm -f "$VNSTAT_TRANSACTION_DIR/vnstat.conf" \
+        "$VNSTAT_TRANSACTION_DIR/retention-state" \
+        "$VNSTAT_TRANSACTION_DIR/config-path-file" 2>/dev/null || true
+    rmdir "$VNSTAT_TRANSACTION_DIR" 2>/dev/null || true
+    VNSTAT_TRANSACTION_DIR=""
+}
+
+rollback_initial_vnstat_transaction() {
+    local rollback_failed=false
+
+    [ "${VNSTAT_CONFIG_TRANSACTION_ACTIVE:-false}" = "true" ] || return 0
+    if [ "${VNSTAT_TRANSACTION_INTERFACE_ADDED:-false}" = "true" ]; then
+        if ! vnstat_cmd --remove -i "$VNSTAT_TRANSACTION_INTERFACE" >/dev/null 2>&1; then
+            rollback_failed=true
+        fi
+    fi
+    if [ -n "${VNSTAT_TRANSACTION_CONFIG_PATH:-}" ] &&
+       ! restore_file_snapshot "$VNSTAT_TRANSACTION_DIR/vnstat.conf" true "$VNSTAT_TRANSACTION_CONFIG_PATH"; then
+        rollback_failed=true
+    fi
+    if ! restore_file_snapshot "$VNSTAT_TRANSACTION_DIR/retention-state" \
+        "$VNSTAT_TRANSACTION_HAD_RETENTION" "$RETENTION_STATE_FILE"; then
+        rollback_failed=true
+    fi
+
+    if [ "${VNSTAT_TRANSACTION_DAEMON_WAS_RUNNING:-false}" = "true" ]; then
+        reload_vnstat_daemon || rollback_failed=true
+    else
+        stop_transaction_vnstat_daemon || rollback_failed=true
+    fi
+    if ! restore_file_snapshot "$VNSTAT_TRANSACTION_DIR/config-path-file" \
+        "$VNSTAT_TRANSACTION_HAD_CONFIG_PATH_FILE" "$VNSTAT_CONFIG_PATH_FILE"; then
+        rollback_failed=true
+    fi
+
+    if [ "$VNSTAT_TRANSACTION_HAD_CONFIG_PATH_FILE" = "true" ]; then
+        VNSTAT_CONFIG_PATH=$(cat "$VNSTAT_CONFIG_PATH_FILE" 2>/dev/null || true)
+    else
+        unset VNSTAT_CONFIG_PATH
+    fi
+    VNSTAT_CONFIG_TRANSACTION_ACTIVE=false
+    VNSTAT_TRANSACTION_INTERFACE_ADDED=false
+    if $rollback_failed; then
+        echo "vnStat 配置事务未能完整回滚；证据保留在 $VNSTAT_TRANSACTION_DIR。" >&2
+        return 1
+    fi
+    cleanup_initial_vnstat_transaction_files
+}
+
+begin_initial_vnstat_transaction() {
+    local interface="$1"
+
+    [ "${VNSTAT_CONFIG_TRANSACTION_ACTIVE:-false}" != "true" ] || return 1
+    VNSTAT_TRANSACTION_DIR=$(mktemp -d "$WORK_DIR/.initial-config-transaction.XXXXXX") || return 1
+    chmod 700 "$VNSTAT_TRANSACTION_DIR" 2>/dev/null || true
+    VNSTAT_TRANSACTION_INTERFACE="$interface"
+    VNSTAT_TRANSACTION_CONFIG_PATH=""
+    VNSTAT_TRANSACTION_INTERFACE_ADDED=false
+    VNSTAT_TRANSACTION_DAEMON_WAS_RUNNING=false
+    VNSTAT_TRANSACTION_SERVICE_MANAGER=""
+    VNSTAT_TRANSACTION_SERVICE_NAME=""
+    VNSTAT_TRANSACTION_HAD_RETENTION=false
+    VNSTAT_TRANSACTION_HAD_CONFIG_PATH_FILE=false
+
+    if vnstat_daemon_is_running; then
+        VNSTAT_TRANSACTION_DAEMON_WAS_RUNNING=true
+    fi
+    if [ -f "$RETENTION_STATE_FILE" ]; then
+        cp -p "$RETENTION_STATE_FILE" "$VNSTAT_TRANSACTION_DIR/retention-state" || {
+            cleanup_initial_vnstat_transaction_files
+            return 1
+        }
+        VNSTAT_TRANSACTION_HAD_RETENTION=true
+    fi
+    if [ -f "$VNSTAT_CONFIG_PATH_FILE" ]; then
+        cp -p "$VNSTAT_CONFIG_PATH_FILE" "$VNSTAT_TRANSACTION_DIR/config-path-file" || {
+            cleanup_initial_vnstat_transaction_files
+            return 1
+        }
+        VNSTAT_TRANSACTION_HAD_CONFIG_PATH_FILE=true
+    fi
+
+    VNSTAT_CONFIG_TRANSACTION_ACTIVE=true
+    if ! ensure_vnstat_daemon_running || ! resolve_vnstat_config_path; then
+        rollback_initial_vnstat_transaction ||
+            echo "vnStat 初始化失败，且临时服务或路径状态未能完整回滚。" >&2
+        return 1
+    fi
+    VNSTAT_TRANSACTION_CONFIG_PATH="$VNSTAT_CONFIG_PATH"
+    if ! cp -p "$VNSTAT_TRANSACTION_CONFIG_PATH" "$VNSTAT_TRANSACTION_DIR/vnstat.conf"; then
+        rollback_initial_vnstat_transaction ||
+            echo "无法建立 vnStat 配置快照，且临时运行态未能完整回滚。" >&2
+        return 1
+    fi
+}
+
+commit_initial_vnstat_transaction() {
+    [ "${VNSTAT_CONFIG_TRANSACTION_ACTIVE:-false}" = "true" ] || return 0
+    if [ "${VNSTAT_TRANSACTION_DAEMON_WAS_RUNNING:-false}" != "true" ]; then
+        vnstat_daemon_is_running || return 1
+        # 这是事务最后一个可能失败的外部动作；成功后不再执行需要补偿的检查。
+        enable_transaction_vnstat_daemon || return 1
+    fi
+    VNSTAT_CONFIG_TRANSACTION_ACTIVE=false
+    VNSTAT_TRANSACTION_INTERFACE_ADDED=false
+    cleanup_initial_vnstat_transaction_files
+}
+
 run_privileged() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
@@ -755,24 +1030,34 @@ add_package_for_command() {
     local missing_command="$1"
 
     case "$PACKAGE_MANAGER:$missing_command" in
-        apt:ip) add_package_once "iproute2" ;;
+        apt:ip|apt:tc) add_package_once "iproute2" ;;
         apt:crontab) add_package_once "cron" ;;
         apt:flock) add_package_once "util-linux" ;;
         apt:tac) add_package_once "coreutils" ;;
-        dnf:ip|yum:ip) add_package_once "iproute" ;;
+        dnf:ip|dnf:tc|yum:ip|yum:tc) add_package_once "iproute" ;;
         dnf:crontab|yum:crontab) add_package_once "cronie" ;;
         dnf:flock|yum:flock) add_package_once "util-linux" ;;
         dnf:tac|yum:tac) add_package_once "coreutils" ;;
-        apk:ip) add_package_once "iproute2" ;;
+        apk:ip|apk:tc) add_package_once "iproute2" ;;
         apk:crontab) add_package_once "dcron" ;;
         apk:flock) add_package_once "util-linux-misc" ;;
         apk:tac) add_package_once "coreutils" ;;
-        pacman:ip) add_package_once "iproute2" ;;
+        pacman:ip|pacman:tc) add_package_once "iproute2" ;;
         pacman:crontab) add_package_once "cronie" ;;
         pacman:flock) add_package_once "util-linux" ;;
         pacman:tac) add_package_once "coreutils" ;;
         *) add_package_once "$missing_command" ;;
     esac
+}
+
+required_command_available() {
+    local command_name="$1"
+
+    if [ "$command_name" = "tc" ]; then
+        [ -n "${TC_BIN:-}" ]
+    else
+        command_exists "$command_name"
+    fi
 }
 
 detect_package_manager() {
@@ -856,14 +1141,16 @@ ensure_service_running() {
 
 
 check_and_install_packages() {
-    local required_commands=("vnstat" "jq" "bc" "ip" "crontab" "flock" "curl" "tac")
+    local required_commands=("vnstat" "jq" "bc" "ip" "tc" "crontab" "flock" "curl" "tac")
     local command_name
     local missing_commands=()
     local packages_to_install=()
     local PACKAGE_MANAGER
 
+    # 重新发现固定路径下的 tc，避免脚本启动后安装成功却继续使用旧的空值。
+    TC_BIN="$(find_tc_bin)"
     for command_name in "${required_commands[@]}"; do
-        if ! command_exists "$command_name"; then
+        if ! required_command_available "$command_name"; then
             missing_commands+=("$command_name")
         fi
     done
@@ -887,8 +1174,9 @@ check_and_install_packages() {
             return 1
         fi
 
+        TC_BIN="$(find_tc_bin)"
         for command_name in "${required_commands[@]}"; do
-            if ! command_exists "$command_name"; then
+            if ! required_command_available "$command_name"; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') 安装后仍缺少命令：$command_name，请手动检查。" | tee -a "$LOG_FILE"
                 return 1
             fi
@@ -901,11 +1189,10 @@ check_and_install_packages() {
         return 1
     fi
 
-    TC_BIN="$(find_tc_bin)"
-
     # 验证系统 tc 命令是否可用；独立版的 tc 快捷命令不会用于限速。
     if [ -z "$TC_BIN" ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 警告：'tc' 命令不可用，可能影响限速功能。" | tee -a "$LOG_FILE"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 错误：'tc' 命令不可用，无法安全启用 TC 限速。" | tee -a "$LOG_FILE"
+        return 1
     fi
 
     # 获取 vnstat 版本
@@ -1024,13 +1311,13 @@ validate_config() {
             ;;
     esac
 
-    PERIOD_START_DAY="${PERIOD_START_DAY:-1}"
-    if ! [[ "$PERIOD_START_DAY" =~ ^[0-9]+$ ]]; then
+    if [ "${PERIOD_START_DAY+x}" != "x" ]; then
         PERIOD_START_DAY=1
-    fi
-    PERIOD_START_DAY=$((10#$PERIOD_START_DAY))
-    if [ "$PERIOD_START_DAY" -lt 1 ] || [ "$PERIOD_START_DAY" -gt 31 ]; then
-        PERIOD_START_DAY=1
+    elif [[ "$PERIOD_START_DAY" =~ ^(0?[1-9]|[12][0-9]|3[01])$ ]]; then
+        PERIOD_START_DAY=$((10#$PERIOD_START_DAY))
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：PERIOD_START_DAY 必须是 1-31 的整数。" | tee -a "$LOG_FILE"
+        has_error=true
     fi
 
     PERIOD_START_MONTH="${PERIOD_START_MONTH:-1}"
@@ -1060,6 +1347,14 @@ validate_config() {
             has_error=true
             ;;
     esac
+
+    VNSTAT_MAX_BANDWIDTH="${VNSTAT_MAX_BANDWIDTH:-0}"
+    if ! vnstat_max_bandwidth_valid "$VNSTAT_MAX_BANDWIDTH"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：VNSTAT_MAX_BANDWIDTH 必须是 0-50000 的整数，0 表示关闭检查。" | tee -a "$LOG_FILE"
+        has_error=true
+    else
+        VNSTAT_MAX_BANDWIDTH=$((10#$VNSTAT_MAX_BANDWIDTH))
+    fi
 
     if [ -z "${MAIN_INTERFACE:-}" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：MAIN_INTERFACE 为空。" | tee -a "$LOG_FILE"
@@ -1094,12 +1389,12 @@ read_config() {
         chmod 600 "$CONFIG_FILE" 2>/dev/null || true
         unset TRAFFIC_MODE TRAFFIC_PERIOD TRAFFIC_LIMIT TRAFFIC_TOLERANCE TRAFFIC_UNIT
         unset PERIOD_START_DAY PERIOD_START_MONTH LIMIT_SPEED MAIN_INTERFACE LIMIT_MODE
-        unset ALLOW_PARTIAL_HISTORY TC_BOOT_GRACE_MINUTES
+        unset ALLOW_PARTIAL_HISTORY TC_BOOT_GRACE_MINUTES VNSTAT_MAX_BANDWIDTH
         unset DISABLED DISABLED_TIME
         while IFS='=' read -r key value; do
             value=${value%$'\r'}
             case "$key" in
-                TRAFFIC_MODE|TRAFFIC_PERIOD|TRAFFIC_LIMIT|TRAFFIC_TOLERANCE|TRAFFIC_UNIT|PERIOD_START_DAY|PERIOD_START_MONTH|LIMIT_SPEED|MAIN_INTERFACE|LIMIT_MODE|ALLOW_PARTIAL_HISTORY|TC_BOOT_GRACE_MINUTES|DISABLED|DISABLED_TIME)
+                TRAFFIC_MODE|TRAFFIC_PERIOD|TRAFFIC_LIMIT|TRAFFIC_TOLERANCE|TRAFFIC_UNIT|PERIOD_START_DAY|PERIOD_START_MONTH|LIMIT_SPEED|MAIN_INTERFACE|LIMIT_MODE|ALLOW_PARTIAL_HISTORY|TC_BOOT_GRACE_MINUTES|VNSTAT_MAX_BANDWIDTH|DISABLED|DISABLED_TIME)
                     printf -v "$key" '%s' "$value"
                     ;;
             esac
@@ -1126,6 +1421,7 @@ MAIN_INTERFACE=$MAIN_INTERFACE
 LIMIT_MODE=$LIMIT_MODE
 ALLOW_PARTIAL_HISTORY=${ALLOW_PARTIAL_HISTORY:-false}
 TC_BOOT_GRACE_MINUTES=${TC_BOOT_GRACE_MINUTES:-10}
+VNSTAT_MAX_BANDWIDTH=${VNSTAT_MAX_BANDWIDTH:-0}
 EOF
     then
         rm -f "$tmp_file"
@@ -1141,21 +1437,24 @@ restore_monitor_config_snapshot() {
     local had_config="$2"
     local enforcement_backup="$3"
     local had_enforcement="$4"
+    local tc_backup="${5:-}"
+    local had_tc="${6:-false}"
+    local shutdown_backup="${7:-}"
+    local had_shutdown="${8:-false}"
     local restore_failed=false
 
-    if [ "$had_config" = "true" ]; then
-        if [ ! -f "$config_backup" ] || ! mv -f "$config_backup" "$CONFIG_FILE"; then
-            restore_failed=true
-        fi
-    elif ! rm -f "$CONFIG_FILE"; then
+    if ! restore_file_snapshot "$config_backup" "$had_config" "$CONFIG_FILE"; then
         restore_failed=true
     fi
-
-    if [ "$had_enforcement" = "true" ]; then
-        if [ ! -f "$enforcement_backup" ] || ! mv -f "$enforcement_backup" "$ENFORCEMENT_STATE_FILE"; then
-            restore_failed=true
-        fi
-    elif ! rm -f "$ENFORCEMENT_STATE_FILE"; then
+    if ! restore_file_snapshot "$enforcement_backup" "$had_enforcement" "$ENFORCEMENT_STATE_FILE"; then
+        restore_failed=true
+    fi
+    if [ -n "$tc_backup" ] &&
+       ! restore_file_snapshot "$tc_backup" "$had_tc" "$TC_STATE_FILE"; then
+        restore_failed=true
+    fi
+    if [ -n "$shutdown_backup" ] &&
+       ! restore_file_snapshot "$shutdown_backup" "$had_shutdown" "$SHUTDOWN_STATE_FILE"; then
         restore_failed=true
     fi
 
@@ -1163,6 +1462,154 @@ restore_monitor_config_snapshot() {
         return 1
     fi
     return 0
+}
+
+CONFIG_SNAPSHOT_HAD_CONFIG=false
+CONFIG_SNAPSHOT_HAD_ENFORCEMENT=false
+CONFIG_SNAPSHOT_HAD_TC=false
+CONFIG_SNAPSHOT_HAD_SHUTDOWN=false
+CONFIG_SNAPSHOT_OLD_TC_ACTIVE=false
+CONFIG_SNAPSHOT_OLD_TC_INTERFACE=""
+CONFIG_SNAPSHOT_OLD_TC_SPEED=""
+CONFIG_SNAPSHOT_OLD_SHUTDOWN_PENDING=false
+
+snapshot_monitor_config_state() {
+    local config_backup="$1"
+    local enforcement_backup="$2"
+    local tc_backup="$3"
+    local shutdown_backup="$4"
+    local saved_interface state_interface state_boot current_boot runtime_status
+
+    CONFIG_SNAPSHOT_HAD_CONFIG=false
+    CONFIG_SNAPSHOT_HAD_ENFORCEMENT=false
+    CONFIG_SNAPSHOT_HAD_TC=false
+    CONFIG_SNAPSHOT_HAD_SHUTDOWN=false
+    CONFIG_SNAPSHOT_OLD_TC_ACTIVE=false
+    CONFIG_SNAPSHOT_OLD_TC_INTERFACE=""
+    CONFIG_SNAPSHOT_OLD_TC_SPEED=""
+    CONFIG_SNAPSHOT_OLD_SHUTDOWN_PENDING=false
+
+    if [ -f "$CONFIG_FILE" ]; then
+        cp -p "$CONFIG_FILE" "$config_backup" || return 1
+        chmod 600 "$config_backup" 2>/dev/null || true
+        CONFIG_SNAPSHOT_HAD_CONFIG=true
+    fi
+    if [ -f "$ENFORCEMENT_STATE_FILE" ]; then
+        cp -p "$ENFORCEMENT_STATE_FILE" "$enforcement_backup" || return 1
+        chmod 600 "$enforcement_backup" 2>/dev/null || true
+        CONFIG_SNAPSHOT_HAD_ENFORCEMENT=true
+    fi
+    if [ -f "$TC_STATE_FILE" ]; then
+        cp -p "$TC_STATE_FILE" "$tc_backup" || return 1
+        chmod 600 "$tc_backup" 2>/dev/null || true
+        CONFIG_SNAPSHOT_HAD_TC=true
+        state_interface=$(tc_state_interface)
+        if [ -n "$state_interface" ]; then
+            saved_interface="${MAIN_INTERFACE:-}"
+            MAIN_INTERFACE="$state_interface"
+            owned_tc_limit_active
+            runtime_status=$?
+            MAIN_INTERFACE="$saved_interface"
+            case "$runtime_status" in
+                0)
+                    CONFIG_SNAPSHOT_OLD_TC_ACTIVE=true
+                    CONFIG_SNAPSHOT_OLD_TC_INTERFACE="$state_interface"
+                    CONFIG_SNAPSHOT_OLD_TC_SPEED=$(tc_state_value LIMIT_SPEED)
+                    [[ "$CONFIG_SNAPSHOT_OLD_TC_SPEED" =~ ^[1-9][0-9]*$ ]] || return 1
+                    ;;
+                1) ;;
+                *) return 1 ;;
+            esac
+        fi
+    fi
+    if [ -f "$SHUTDOWN_STATE_FILE" ]; then
+        cp -p "$SHUTDOWN_STATE_FILE" "$shutdown_backup" || return 1
+        chmod 600 "$shutdown_backup" 2>/dev/null || true
+        CONFIG_SNAPSHOT_HAD_SHUTDOWN=true
+        state_boot=$(shutdown_state_value BOOT_ID)
+        current_boot=$(current_boot_id)
+        if [ -n "$state_boot" ] && [ -n "$current_boot" ] && [ "$state_boot" = "$current_boot" ] &&
+           has_pending_shutdown; then
+            CONFIG_SNAPSHOT_OLD_SHUTDOWN_PENDING=true
+        elif { [ -z "$state_boot" ] || [ -z "$current_boot" ]; } && has_pending_shutdown; then
+            return 1
+        fi
+    fi
+}
+
+restore_owned_tc_after_config_failure() {
+    local tc_backup="$1"
+    local saved_interface="${MAIN_INTERFACE:-}"
+    local runtime_status
+
+    [ "${CONFIG_SNAPSHOT_OLD_TC_ACTIVE:-false}" = "true" ] || return 0
+    MAIN_INTERFACE="$CONFIG_SNAPSHOT_OLD_TC_INTERFACE"
+    owned_tc_limit_active
+    runtime_status=$?
+    if [ "$runtime_status" -eq 0 ]; then
+        MAIN_INTERFACE="$saved_interface"
+        return 0
+    elif [ "$runtime_status" -eq 2 ]; then
+        MAIN_INTERFACE="$saved_interface"
+        return 1
+    fi
+
+    if ! rm -f "$TC_STATE_FILE" ||
+       ! apply_tc_limit "$CONFIG_SNAPSHOT_OLD_TC_SPEED"; then
+        restore_file_snapshot "$tc_backup" true "$TC_STATE_FILE" >/dev/null 2>&1 || true
+        MAIN_INTERFACE="$saved_interface"
+        return 1
+    fi
+    MAIN_INTERFACE="$saved_interface"
+}
+
+restore_owned_shutdown_after_config_failure() {
+    local shutdown_backup="$1"
+
+    [ "${CONFIG_SNAPSHOT_OLD_SHUTDOWN_PENDING:-false}" = "true" ] || return 0
+    has_pending_shutdown && return 0
+    restore_file_snapshot "$shutdown_backup" true "$SHUTDOWN_STATE_FILE" || return 1
+    if ! shutdown -h +1 "TrafficCop 配置回滚：恢复原计划关机"; then
+        if has_pending_shutdown; then
+            return 0
+        fi
+        restore_file_snapshot "$shutdown_backup" true "$SHUTDOWN_STATE_FILE" >/dev/null 2>&1 || true
+        return 1
+    fi
+}
+
+rollback_monitor_config_transaction() {
+    local config_backup="$1"
+    local enforcement_backup="$2"
+    local tc_backup="$3"
+    local shutdown_backup="$4"
+    local rollback_failed=false
+
+    if ! restore_monitor_config_snapshot "$config_backup" "$CONFIG_SNAPSHOT_HAD_CONFIG" \
+        "$enforcement_backup" "$CONFIG_SNAPSHOT_HAD_ENFORCEMENT" \
+        "$tc_backup" "$CONFIG_SNAPSHOT_HAD_TC" \
+        "$shutdown_backup" "$CONFIG_SNAPSHOT_HAD_SHUTDOWN"; then
+        rollback_failed=true
+    fi
+    if [ "${CONFIG_TC_CLEAR_ATTEMPTED:-false}" = "true" ] &&
+       ! restore_owned_tc_after_config_failure "$tc_backup"; then
+        rollback_failed=true
+    fi
+    if [ "${CONFIG_SHUTDOWN_CLEAR_ATTEMPTED:-false}" = "true" ] &&
+       ! restore_owned_shutdown_after_config_failure "$shutdown_backup"; then
+        rollback_failed=true
+    fi
+    if ! rollback_initial_vnstat_transaction; then
+        rollback_failed=true
+    fi
+    if [ "$CONFIG_SNAPSHOT_HAD_CONFIG" = "true" ] && ! read_config >/dev/null 2>&1; then
+        rollback_failed=true
+    fi
+
+    if $rollback_failed; then
+        return 1
+    fi
+    rm -f "$config_backup" "$enforcement_backup" "$tc_backup" "$shutdown_backup"
 }
 
 
@@ -1183,6 +1630,11 @@ show_current_config() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') 主要网络接口: $MAIN_INTERFACE"| tee -a "$LOG_FILE"
     echo "$(date '+%Y-%m-%d %H:%M:%S') 限制模式: $LIMIT_MODE"| tee -a "$LOG_FILE"
     echo "$(date '+%Y-%m-%d %H:%M:%S') 历史不足时继续统计: ${ALLOW_PARTIAL_HISTORY:-false}"| tee -a "$LOG_FILE"
+    if [ "${VNSTAT_MAX_BANDWIDTH:-0}" -eq 0 ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') vnStat 异常速率检查: 已关闭 (0)"| tee -a "$LOG_FILE"
+    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') vnStat 异常速率检查上限: ${VNSTAT_MAX_BANDWIDTH} Mbit/s"| tee -a "$LOG_FILE"
+    fi
     if [ "$LIMIT_MODE" = "tc" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 开机后限速宽限: ${TC_BOOT_GRACE_MINUTES:-10} 分钟"| tee -a "$LOG_FILE"
     fi
@@ -1337,11 +1789,12 @@ shutdown_state_value() {
     fi
 }
 
-write_enforcement_state() {
+write_enforcement_state_file() {
     local mode="$1"
     local until_epoch="$2"
     local reason="$3"
-    local tmp_file="${ENFORCEMENT_STATE_FILE}.tmp.$$"
+    local target_file="$4"
+    local tmp_file="${target_file}.tmp.$$"
 
     {
         printf 'MODE=%s\n' "$mode"
@@ -1350,7 +1803,11 @@ write_enforcement_state() {
         printf 'UPDATED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     } > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
     chmod 600 "$tmp_file" 2>/dev/null || true
-    mv -f "$tmp_file" "$ENFORCEMENT_STATE_FILE"
+    mv -f "$tmp_file" "$target_file"
+}
+
+write_enforcement_state() {
+    write_enforcement_state_file "$1" "$2" "$3" "$ENFORCEMENT_STATE_FILE"
 }
 
 clear_owned_shutdown_schedule() {
@@ -1378,66 +1835,133 @@ clear_owned_shutdown_schedule() {
 
 configure_post_save_enforcement() {
     local current_usage limit_threshold unit_label policy_choice grace_minutes until_epoch
+    local comparison_status desired_mode="" desired_reason="" desired_message=""
+    local enforcement_candidate="${ENFORCEMENT_STATE_FILE}.config-candidate.$$"
+
+    CONFIG_TC_CLEAR_ATTEMPTED=false
+    CONFIG_SHUTDOWN_CLEAR_ATTEMPTED=false
+    rm -f "$enforcement_candidate"
 
     if ! current_usage=$(get_traffic_usage); then
         echo "无法可靠读取当前流量，已取消本次配置；原监控配置不会被覆盖。"
         return 1
     fi
-    clear_owned_shutdown_schedule || return 1
-    rm -f "$ENFORCEMENT_STATE_FILE"
-    clear_owned_tc_rules "配置已更新" || return 1
-    [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && unit_label="GB" || unit_label="GiB"
-    limit_threshold=$(echo "$TRAFFIC_LIMIT - $TRAFFIC_TOLERANCE" | bc 2>/dev/null || echo "0")
-    if ! compare_decimal "$current_usage" "$limit_threshold" "ge"; then
-        return 0
+    if ! is_decimal "$current_usage"; then
+        echo "当前流量格式无效，已取消本次配置；现有执行策略保持不变。"
+        return 1
     fi
-
-    echo ""
-    echo "当前可统计流量为 $current_usage $unit_label，已经达到执行阈值 $limit_threshold $unit_label。"
-    echo "为避免保存配置后突然限速或关机，请选择本次执行策略："
-    echo "1) 宽限一段时间后再执行（推荐）"
-    echo "2) 立即执行"
-    echo "3) 仅监控，暂停执行限制，稍后在机器限速管理中恢复"
-    read -r -p "请输入选择 (1-3，默认为1): " policy_choice
-    case "$policy_choice" in
-        2)
-            rm -f "$ENFORCEMENT_STATE_FILE"
-            ;;
-        3)
-            write_enforcement_state "paused" "0" "manual" || return 1
-            echo "限制执行已暂停；流量统计和主页显示仍会继续。"
-            ;;
-        1|"")
-            read -r -p "请输入宽限分钟数 (1-1440，默认为10): " grace_minutes
-            grace_minutes=${grace_minutes:-10}
-            if ! [[ "$grace_minutes" =~ ^[0-9]+$ ]] || [ "$grace_minutes" -lt 1 ] || [ "$grace_minutes" -gt 1440 ]; then
-                echo "输入无效，使用默认值：10 分钟"
-                grace_minutes=10
-            fi
-            until_epoch=$(( $(date +%s) + grace_minutes * 60 ))
-            write_enforcement_state "grace" "$until_epoch" "config" || return 1
-            echo "已设置 $grace_minutes 分钟宽限；期间只统计流量，不执行限制。"
-            ;;
+    [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && unit_label="GB" || unit_label="GiB"
+    if ! limit_threshold=$(printf '%s - %s\n' "$TRAFFIC_LIMIT" "$TRAFFIC_TOLERANCE" | bc 2>/dev/null); then
+        echo "无法可靠计算当前执行阈值，已取消本次配置；现有执行策略保持不变。"
+        return 1
+    fi
+    case "$limit_threshold" in .*) limit_threshold="0$limit_threshold" ;; esac
+    if ! is_decimal "$limit_threshold"; then
+        echo "当前执行阈值格式无效，已取消本次配置；现有执行策略保持不变。"
+        return 1
+    fi
+    compare_decimal "$limit_threshold" "0" "gt"
+    comparison_status=$?
+    if [ "$comparison_status" -ne 0 ]; then
+        echo "当前执行阈值必须大于 0，已取消本次配置；现有执行策略保持不变。"
+        return 1
+    fi
+    compare_decimal "$current_usage" "$limit_threshold" "ge"
+    comparison_status=$?
+    case "$comparison_status" in
+        0) ;;
+        1) desired_mode="none" ;;
         *)
-            echo "输入无效，使用推荐值：宽限 10 分钟"
-            until_epoch=$(( $(date +%s) + 600 ))
-            write_enforcement_state "grace" "$until_epoch" "config" || return 1
+            echo "无法可靠比较当前流量与执行阈值，已取消本次配置；现有执行策略保持不变。"
+            return 1
             ;;
     esac
+
+    if [ "$desired_mode" != "none" ]; then
+        echo ""
+        echo "当前可统计流量为 $current_usage $unit_label，已经达到执行阈值 $limit_threshold $unit_label。"
+        echo "为避免保存配置后突然限速或关机，请选择本次执行策略："
+        echo "1) 宽限一段时间后再执行（推荐）"
+        echo "2) 立即执行"
+        echo "3) 仅监控，暂停执行限制，稍后在机器限速管理中恢复"
+        read -r -p "请输入选择 (1-3，默认为1): " policy_choice || return 1
+        case "$policy_choice" in
+            2) desired_mode="none" ;;
+            3)
+                desired_mode="paused"
+                desired_reason="manual"
+                until_epoch=0
+                desired_message="限制执行已暂停；流量统计和主页显示仍会继续。"
+                ;;
+            1|"")
+                read -r -p "请输入宽限分钟数 (1-1440，默认为10): " grace_minutes || return 1
+                grace_minutes=${grace_minutes:-10}
+                if ! [[ "$grace_minutes" =~ ^[0-9]+$ ]] || [ "$grace_minutes" -lt 1 ] || [ "$grace_minutes" -gt 1440 ]; then
+                    echo "输入无效，使用默认值：10 分钟"
+                    grace_minutes=10
+                fi
+                desired_mode="grace"
+                desired_reason="config"
+                until_epoch=$(( $(date +%s) + grace_minutes * 60 ))
+                desired_message="已设置 $grace_minutes 分钟宽限；期间只统计流量，不执行限制。"
+                ;;
+            *)
+                echo "输入无效，使用推荐值：宽限 10 分钟"
+                desired_mode="grace"
+                desired_reason="config"
+                until_epoch=$(( $(date +%s) + 600 ))
+                desired_message="已设置 10 分钟宽限；期间只统计流量，不执行限制。"
+                ;;
+        esac
+    fi
+
+    if [ "$desired_mode" != "none" ] &&
+       ! write_enforcement_state_file "$desired_mode" "$until_epoch" "$desired_reason" "$enforcement_candidate"; then
+        rm -f "$enforcement_candidate"
+        return 1
+    fi
+
+    # 先撤销 TC；若它失败，计划关机尚未触碰。后续任何失败由外层配置事务补偿旧运行态。
+    CONFIG_TC_CLEAR_ATTEMPTED=true
+    if ! clear_owned_tc_rules "配置已更新"; then
+        rm -f "$enforcement_candidate"
+        return 1
+    fi
+    CONFIG_SHUTDOWN_CLEAR_ATTEMPTED=true
+    if ! clear_owned_shutdown_schedule; then
+        rm -f "$enforcement_candidate"
+        return 1
+    fi
+    if [ "$desired_mode" = "none" ]; then
+        rm -f "$ENFORCEMENT_STATE_FILE" || return 1
+    elif ! mv -f "$enforcement_candidate" "$ENFORCEMENT_STATE_FILE"; then
+        rm -f "$enforcement_candidate"
+        return 1
+    fi
+    [ -n "$desired_message" ] && echo "$desired_message"
 }
 
 # 初始配置函数
-echo "$(date '+%Y-%m-%d %H:%M:%S') 开始初始化配置"| tee -a "$LOG_FILE"
 initial_config() {
     local config_backup="${CONFIG_FILE}.before-config.$$"
     local enforcement_backup="${ENFORCEMENT_STATE_FILE}.before-config.$$"
-    local had_config=false
-    local had_enforcement=false
+    local tc_backup="${TC_STATE_FILE}.before-config.$$"
+    local shutdown_backup="${SHUTDOWN_STATE_FILE}.before-config.$$"
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') 开始初始化配置" | tee -a "$LOG_FILE"
+    CONFIG_TC_CLEAR_ATTEMPTED=false
+    CONFIG_SHUTDOWN_CLEAR_ATTEMPTED=false
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') 正在检测主要网络接口..."| tee -a "$LOG_FILE"
     MAIN_INTERFACE=$(get_main_interface)
-    ensure_vnstat_runtime_config "$MAIN_INTERFACE" || return 1
-    ensure_vnstat_interface "$MAIN_INTERFACE" || return 1
+    prompt_vnstat_max_bandwidth || return 1
+    begin_initial_vnstat_transaction "$MAIN_INTERFACE" || return 1
+    if ! ensure_vnstat_runtime_config "$MAIN_INTERFACE" ||
+       ! ensure_vnstat_interface "$MAIN_INTERFACE"; then
+        rollback_initial_vnstat_transaction ||
+            echo "vnStat 初始化失败，且未能完整恢复修改前状态。" >&2
+        return 1
+    fi
 
     while true; do
         echo "$(date '+%Y-%m-%d %H:%M:%S') 请选择流量统计模式："| tee -a "$LOG_FILE"
@@ -1462,7 +1986,11 @@ initial_config() {
         m|"") TRAFFIC_PERIOD="monthly" ;;
         *) echo "无效输入，使用默认值：monthly"; TRAFFIC_PERIOD="monthly" ;;
     esac
-    ensure_vnstat_daily_retention || return 1
+    if ! ensure_vnstat_daily_retention; then
+        rollback_initial_vnstat_transaction ||
+            echo "本次配置已取消，但 vnStat 状态未能完整恢复。" >&2
+        return 1
+    fi
 
     echo "请选择流量单位："
     echo "1. GB（十进制，1 GB = 1000^3 字节，推荐用于服务商配额）"
@@ -1543,41 +2071,51 @@ initial_config() {
         esac
     done
 
-    configure_history_policy || return 1
-
-    if [ -f "$CONFIG_FILE" ]; then
-        cp -p "$CONFIG_FILE" "$config_backup" || return 1
-        chmod 600 "$config_backup" 2>/dev/null || true
-        had_config=true
+    if ! configure_history_policy; then
+        rollback_initial_vnstat_transaction ||
+            echo "本次配置已取消，但 vnStat 状态未能完整恢复。" >&2
+        return 1
     fi
-    if [ -f "$ENFORCEMENT_STATE_FILE" ]; then
-        if ! cp -p "$ENFORCEMENT_STATE_FILE" "$enforcement_backup"; then
-            rm -f "$config_backup"
-            return 1
-        fi
-        chmod 600 "$enforcement_backup" 2>/dev/null || true
-        had_enforcement=true
+
+    if ! snapshot_monitor_config_state "$config_backup" "$enforcement_backup" \
+        "$tc_backup" "$shutdown_backup"; then
+        rm -f "$config_backup" "$enforcement_backup" "$tc_backup" "$shutdown_backup"
+        rollback_initial_vnstat_transaction ||
+            echo "无法建立配置快照，且 vnStat 状态未能完整恢复。" >&2
+        return 1
     fi
 
     if ! write_config; then
-        if restore_monitor_config_snapshot "$config_backup" "$had_config" "$enforcement_backup" "$had_enforcement"; then
-            echo "配置写入失败，已恢复修改前的监控配置与执行策略。"
+        if rollback_monitor_config_transaction "$config_backup" "$enforcement_backup" \
+            "$tc_backup" "$shutdown_backup"; then
+            echo "配置写入失败，已恢复修改前的监控配置、执行策略与 vnStat 状态。"
         else
-            echo "配置写入失败，且无法完整恢复修改前状态；可用备份会保留在 $config_backup 或 $enforcement_backup。"
+            echo "配置写入失败，且无法完整恢复修改前状态；配置与运行态备份已保留，请立即检查。"
         fi
         return 1
     fi
 
     if ! configure_post_save_enforcement; then
-        if restore_monitor_config_snapshot "$config_backup" "$had_config" "$enforcement_backup" "$had_enforcement"; then
-            echo "后续安全处理失败，已恢复修改前的监控配置与执行策略。"
+        if rollback_monitor_config_transaction "$config_backup" "$enforcement_backup" \
+            "$tc_backup" "$shutdown_backup"; then
+            echo "后续安全处理失败，已恢复修改前的监控配置、执行策略与 vnStat 状态。"
         else
-            echo "后续安全处理失败，且无法完整恢复修改前状态；可用备份会保留在 $config_backup 或 $enforcement_backup。"
+            echo "后续安全处理失败，且无法完整恢复旧运行态；配置与运行态备份已保留，请立即检查。"
         fi
         return 1
     fi
 
-    rm -f "$config_backup" "$enforcement_backup"
+    if ! commit_initial_vnstat_transaction; then
+        if rollback_monitor_config_transaction "$config_backup" "$enforcement_backup" \
+            "$tc_backup" "$shutdown_backup"; then
+            echo "vnStat 服务持久化失败，已恢复修改前的配置与运行态。"
+        else
+            echo "vnStat 服务持久化失败，且无法完整恢复旧运行态；备份已保留，请立即检查。"
+        fi
+        return 1
+    fi
+
+    rm -f "$config_backup" "$enforcement_backup" "$tc_backup" "$shutdown_backup"
 }
 
 # 返回指定年月的周期锚点。若用户配置了不存在的日期（如 2 月 31 日），使用当月最后一天。
@@ -1926,11 +2464,78 @@ is_default_qdisc_line() {
     esac
 }
 
+tc_file_is_secure() {
+    local file="$1"
+    local owner_uid mode
+
+    [ -f "$file" ] && [ ! -L "$file" ] || return 1
+    owner_uid=$(stat -c '%u' "$file" 2>/dev/null) || return 1
+    [ "$owner_uid" = "$(id -u)" ] || return 1
+    mode=$(stat -c '%a' "$file" 2>/dev/null) || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    [ $((8#$mode & 8#022)) -eq 0 ]
+}
+
+tc_file_unique_value() {
+    local file="$1"
+    local key="$2"
+    local count
+
+    count=$(grep -Ec "^${key}=" "$file" 2>/dev/null || true)
+    [ "$count" -eq 1 ] || return 1
+    grep "^${key}=" "$file" | cut -d'=' -f2-
+}
+
+tc_file_optional_unique_value() {
+    local file="$1"
+    local key="$2"
+    local count
+
+    count=$(grep -Ec "^${key}=" "$file" 2>/dev/null || true)
+    [ "$count" -le 1 ] || return 1
+    if [ "$count" -eq 1 ]; then
+        grep "^${key}=" "$file" | cut -d'=' -f2-
+    fi
+    return 0
+}
+
+tc_state_file_is_interpretable() {
+    local key
+
+    tc_file_is_secure "$TC_STATE_FILE" || return 1
+    tc_file_unique_value "$TC_STATE_FILE" INTERFACE >/dev/null || return 1
+    tc_file_unique_value "$TC_STATE_FILE" LIMIT_SPEED >/dev/null || return 1
+    for key in SCHEMA PROVIDER QDISC_LINE BOOT_ID PERIOD_START APPLIED_AT; do
+        tc_file_optional_unique_value "$TC_STATE_FILE" "$key" >/dev/null || return 1
+    done
+}
+
 tc_state_value() {
     local key="$1"
-    if [ -f "$TC_STATE_FILE" ]; then
-        grep "^${key}=" "$TC_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-
+    [ -e "$TC_STATE_FILE" ] || return 1
+    tc_state_file_is_interpretable || return 1
+    tc_file_optional_unique_value "$TC_STATE_FILE" "$key"
+}
+
+# 供未加载配置的 --self-check 使用；返回 0=禁用、1=启用/未配置、2=配置不可信。
+trafficcop_config_is_disabled() {
+    local disabled
+
+    if [ -n "${DISABLED+x}" ]; then
+        case "$DISABLED" in
+            true) return 0 ;;
+            false) return 1 ;;
+            *) return 2 ;;
+        esac
     fi
+    [ -e "$CONFIG_FILE" ] || return 1
+    tc_file_is_secure "$CONFIG_FILE" || return 2
+    disabled=$(tc_file_optional_unique_value "$CONFIG_FILE" DISABLED) || return 2
+    case "$disabled" in
+        true) return 0 ;;
+        ""|false) return 1 ;;
+        *) return 2 ;;
+    esac
 }
 
 tc_state_interface() {
@@ -2074,38 +2679,131 @@ tc_state_is_unified_for_interface() {
         [ "$(tc_state_interface)" = "$interface" ]
 }
 
-dog_configured_class_ids() {
-    local port class_id start_port end_port mark_id minor
+dog_bandwidth_to_tc() {
+    local value="${1,,}"
+
+    case "$value" in
+        *kbps) [[ "$value" =~ ^[0-9]+kbps$ ]] && printf '%skbit\n' "${value%kbps}" ;;
+        *mbps) [[ "$value" =~ ^[0-9]+mbps$ ]] && printf '%smbit\n' "${value%mbps}" ;;
+        *gbps) [[ "$value" =~ ^[0-9]+gbps$ ]] && printf '%sgbit\n' "${value%gbps}" ;;
+        *) return 1 ;;
+    esac
+}
+
+dog_configured_class_records() {
+    local port class_id rate mark_id start_port end_port generated_mark minor tc_rate raw_records
 
     [ -r "$DOG_CONFIG_FILE" ] && command -v jq >/dev/null 2>&1 || return 1
     jq -e '(.ports // {}) | type == "object"' "$DOG_CONFIG_FILE" >/dev/null 2>&1 || return 1
-    while IFS=$'\t' read -r port class_id; do
-        if [[ "$class_id" =~ ^1:([0-9a-fA-F]+)$ ]]; then
-            printf '%s\n' "$class_id"
-        elif [[ "$port" =~ ^[0-9]+$ ]]; then
-            printf '1:%x\n' "$((0x1000 + port))"
-        elif [[ "$port" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            start_port="${BASH_REMATCH[1]}"
-            end_port="${BASH_REMATCH[2]}"
-            mark_id=$(((start_port * 1000 + end_port) % 65536))
-            minor=$((0x2000 + mark_id))
-            [ "$minor" -le 65535 ] || continue
-            printf '1:%x\n' "$minor"
-        fi
-    done < <(jq -r '
+    raw_records=$(jq -r '
         .ports // {} | to_entries[] |
         select((.value.enabled // true) == true) |
         select((.value.bandwidth_limit.enabled // false) == true) |
         select((.value.bandwidth_limit.rate // "unlimited") != "unlimited") |
-        [.key, (.value.bandwidth_limit.class_id // "")] | @tsv
-    ' "$DOG_CONFIG_FILE" 2>/dev/null) | sort -u
+        [.key, (.value.bandwidth_limit.class_id // ""),
+         (.value.bandwidth_limit.rate // ""),
+         ((.value.bandwidth_limit.mark_id // "") | tostring)] | @tsv
+    ' "$DOG_CONFIG_FILE" 2>/dev/null) || return 1
+    [ -n "$raw_records" ] || return 0
+    while IFS=$'\t' read -r port class_id rate mark_id; do
+        tc_rate=$(dog_bandwidth_to_tc "$rate") || return 1
+        if ! [[ "$class_id" =~ ^1:([0-9a-fA-F]+)$ ]]; then
+            if [[ "$port" =~ ^[0-9]+$ ]]; then
+                class_id=$(printf '1:%x' "$((0x1000 + port))")
+            elif [[ "$port" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                start_port="${BASH_REMATCH[1]}"
+                end_port="${BASH_REMATCH[2]}"
+                generated_mark=$(((start_port * 1000 + end_port) % 65536))
+                minor=$((0x2000 + generated_mark))
+                [ "$minor" -le 65535 ] || return 1
+                class_id=$(printf '1:%x' "$minor")
+            else
+                return 1
+            fi
+        fi
+        if [[ "$port" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            start_port="${BASH_REMATCH[1]}"
+            end_port="${BASH_REMATCH[2]}"
+            [[ "$mark_id" =~ ^[0-9]+$ ]] || return 1
+        elif ! [[ "$port" =~ ^[0-9]+$ ]]; then
+            return 1
+        fi
+        printf '%s\t%s\t%s\t%s\n' "$port" "$class_id" "$tc_rate" "$mark_id"
+    done <<< "$raw_records"
+}
+
+dog_configured_class_ids() {
+    local records
+    records=$(dog_configured_class_records) || return 1
+    printf '%s\n' "$records" | awk -F '\t' 'NF >= 2 { print $2 }' | sort -u
+}
+
+dog_single_port_filters_complete() {
+    local interface="$1"
+    local port="$2"
+    local class_id="$3"
+    local filter_prio=$((port % 1000 + 1))
+    local sport_hex dport_hex filter_json
+
+    sport_hex=$(printf '%x' "$((port << 16))")
+    dport_hex=$(printf '%x' "$port")
+    filter_json=$("$TC_BIN" -j filter show dev "$interface" parent 1:0 2>/dev/null) || return 2
+    jq -e \
+        --arg class_id "$class_id" \
+        --arg sport_hex "$sport_hex" \
+        --arg dport_hex "$dport_hex" \
+        --argjson port "$port" \
+        --argjson tcp_pref "$filter_prio" \
+        --argjson udp_pref "$((filter_prio + 1000))" '
+        def normhex:
+            tostring | ascii_downcase | sub("^0x"; "") | sub("^0+"; "") |
+            if . == "" then "0" else . end;
+        def u32_count($pref; $value; $mask):
+            [.[] | select(
+                .protocol == "ip" and .kind == "u32" and .pref == $pref and
+                .options.flowid == $class_id and
+                ((.options.match.value // "") | normhex) == ($value | normhex) and
+                ((.options.match.mask // "") | normhex) == ($mask | normhex) and
+                (.options.match.off // -1) == 20
+            )] | length;
+        def flower_count($proto; $key):
+            [.[] | select(
+                .protocol == "ipv6" and .kind == "flower" and
+                .options.classid == $class_id and
+                .options.keys.ip_proto == $proto and
+                .options.keys[$key] == $port
+            )] | length;
+        u32_count($tcp_pref; $sport_hex; "ffff0000") == 1 and
+        u32_count($tcp_pref; $dport_hex; "ffff") == 1 and
+        u32_count($udp_pref; $sport_hex; "ffff0000") == 1 and
+        u32_count($udp_pref; $dport_hex; "ffff") == 1 and
+        flower_count("tcp"; "src_port") == 1 and
+        flower_count("tcp"; "dst_port") == 1 and
+        flower_count("udp"; "src_port") == 1 and
+        flower_count("udp"; "dst_port") == 1
+    ' <<< "$filter_json" >/dev/null
+}
+
+dog_port_range_filter_complete() {
+    local interface="$1"
+    local class_id="$2"
+    local mark_id="$3"
+    local mark_handle filter_state
+
+    mark_handle=$(printf '0x%x/0x%x' "$mark_id" "$TC_MARK_MASK")
+    filter_state=$("$TC_BIN" filter show dev "$interface" parent 1:0 2>/dev/null) || return 2
+    [ "$(printf '%s\n' "$filter_state" |
+        grep -F "handle $mark_handle" |
+        grep -Fc "classid $class_id")" -eq 1 ]
 }
 
 dog_live_objects_match_config() {
     local interface="$1"
-    local configured_ids class_output filter_output actual_ids filter_ids class_id status
+    local configured_records configured_ids class_output filter_output actual_ids filter_ids
+    local port class_id expected_rate mark_id minor_hex minor expected_mark status
 
-    configured_ids=$(dog_configured_class_ids) || return 1
+    configured_records=$(dog_configured_class_records) || return 1
+    configured_ids=$(printf '%s\n' "$configured_records" | awk -F '\t' 'NF >= 2 { print $2 }' | sort -u)
     class_output=$(tc_class_output "$interface")
     status=$?
     [ "$status" -eq 0 ] || return "$status"
@@ -2132,6 +2830,26 @@ dog_live_objects_match_config() {
         printf '%s\n' "$actual_ids" | grep -Fqx "$class_id" || return 1
         printf '%s\n' "$filter_ids" | grep -Fqx "$class_id" || return 1
     done <<< "$configured_ids"
+
+    while IFS=$'\t' read -r port class_id expected_rate mark_id; do
+        [ -n "$port" ] || continue
+        tc_class_rate_matches "$interface" "$class_id" "$TC_DEFAULT_CLASS_RATE" "$expected_rate"
+        status=$?
+        [ "$status" -eq 0 ] || return "$status"
+        if [[ "$port" =~ ^[0-9]+$ ]]; then
+            dog_single_port_filters_complete "$interface" "$port" "$class_id"
+            status=$?
+        else
+            minor_hex=${class_id#1:}
+            [[ "$minor_hex" =~ ^[0-9a-fA-F]+$ ]] || return 1
+            minor=$((16#$minor_hex))
+            expected_mark=$((0x50000000 | (minor << 12)))
+            [[ "$mark_id" =~ ^[0-9]+$ ]] && [ "$mark_id" -eq "$expected_mark" ] || return 1
+            dog_port_range_filter_complete "$interface" "$class_id" "$mark_id"
+            status=$?
+        fi
+        [ "$status" -eq 0 ] || return "$status"
+    done <<< "$configured_records"
 }
 
 tc_root_is_recognized_dog_htb() {
@@ -2254,7 +2972,7 @@ write_tc_state() {
         printf 'PERIOD_START=%s\n' "$period_start"
         printf 'APPLIED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     } > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
-    chmod 600 "$tmp_file" 2>/dev/null || true
+    chmod 600 "$tmp_file" 2>/dev/null || { rm -f "$tmp_file"; return 1; }
     mv -f "$tmp_file" "$state_file" || { rm -f "$tmp_file"; return 1; }
 }
 
@@ -2567,6 +3285,34 @@ clear_owned_tc_rules_locked() {
         echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：TC 层级查询失败，保留规则和状态。" | tee -a "$LOG_FILE"
         return 1
     elif [ "$verify_status" -ne 0 ]; then
+        local disabled_status=0
+        trafficcop_config_is_disabled || disabled_status=$?
+        if [ "$disabled_status" -eq 0 ] &&
+           tc_verify_unified_hierarchy "$state_interface" "$TC_PARENT_RATE"; then
+            tc_has_other_consumers "$state_interface"
+            query_status=$?
+            if [ "$query_status" -eq 2 ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：无法确认其他 TC 使用者，保留规则和状态。" | tee -a "$LOG_FILE"
+                return 1
+            elif [ "$query_status" -eq 0 ]; then
+                if rm -f "$TC_STATE_FILE"; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：整机上限已撤销，已清理残留状态并保留端口子类。" | tee -a "$LOG_FILE"
+                    return 0
+                fi
+                return 1
+            fi
+            if ! "$TC_BIN" qdisc del dev "$state_interface" root handle 1: 2>/dev/null; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：残留统一 HTB root 清理失败，保留状态。" | tee -a "$LOG_FILE"
+                return 1
+            fi
+            if rm -f "$TC_STATE_FILE"; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：已清理残留的整机限速状态和 HTB root。" | tee -a "$LOG_FILE"
+                return 0
+            fi
+            "$TC_BIN" qdisc replace dev "$state_interface" root handle 1: htb default 30 2>/dev/null &&
+                tc_replace_base_classes "$state_interface" "$TC_PARENT_RATE" >/dev/null 2>&1 || true
+            return 1
+        fi
         echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB 与本脚本状态不一致，保留规则和状态。" | tee -a "$LOG_FILE"
         return 1
     fi
@@ -2793,7 +3539,8 @@ tc_boot_grace_active() {
 
 # 修改 check_and_limit_traffic 函数
 check_and_limit_traffic() {
-    local current_usage limit_threshold unit_label shutdown_guard_status
+    local current_usage limit_threshold unit_label shutdown_guard_status comparison_status
+    local limit_reached=false
     [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && unit_label="GB" || unit_label="GiB"
 
     if ! current_usage=$(get_traffic_usage); then
@@ -2801,16 +3548,50 @@ check_and_limit_traffic() {
         return 1
     fi
 
-    limit_threshold=$(echo "$TRAFFIC_LIMIT - $TRAFFIC_TOLERANCE" | bc 2>/dev/null || echo "0")
-
-    if (( $(echo "$limit_threshold <= 0" | bc -l 2>/dev/null || echo "0") )); then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到配置异常：限制阈值必须大于 0 $unit_label，本轮跳过限速判断" | tee -a "$LOG_FILE"
+    if ! limit_threshold=$(printf '%s - %s\n' "$TRAFFIC_LIMIT" "$TRAFFIC_TOLERANCE" | bc 2>/dev/null); then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 无法计算流量阈值，本轮跳过限速判断并保留现有限速状态。" | tee -a "$LOG_FILE"
         return 1
     fi
+    case "$limit_threshold" in
+        .*) limit_threshold="0$limit_threshold" ;;
+    esac
+    if ! is_decimal "$limit_threshold"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 流量阈值计算结果无效，本轮跳过限速判断并保留现有限速状态。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+
+    compare_decimal "$limit_threshold" "0" "gt"
+    comparison_status=$?
+    case "$comparison_status" in
+        0) ;;
+        1)
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 检测到配置异常：限制阈值必须大于 0 $unit_label，本轮跳过限速判断" | tee -a "$LOG_FILE"
+            return 1
+            ;;
+        *)
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 无法校验流量阈值，本轮跳过限速判断并保留现有限速状态。" | tee -a "$LOG_FILE"
+            return 1
+            ;;
+    esac
+    if ! is_decimal "$current_usage"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 当前流量格式无效，本轮跳过限速判断并保留现有限速状态。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+
+    compare_decimal "$current_usage" "$limit_threshold" "ge"
+    comparison_status=$?
+    case "$comparison_status" in
+        0) limit_reached=true ;;
+        1) limit_reached=false ;;
+        *)
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 无法比较当前流量与阈值，本轮跳过限速判断并保留现有限速状态。" | tee -a "$LOG_FILE"
+            return 1
+            ;;
+    esac
     
     echo "$(date '+%Y-%m-%d %H:%M:%S') 当前使用流量: $current_usage $unit_label，限制流量: $limit_threshold $unit_label" | tee -a "$LOG_FILE"
     
-    if (( $(echo "$current_usage >= $limit_threshold" | bc -l 2>/dev/null || echo "0") )); then
+    if $limit_reached; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制" | tee -a "$LOG_FILE"
         if [ "$LIMIT_MODE" = "shutdown" ]; then
             if [ -f "$TC_STATE_FILE" ] && ! clear_owned_tc_rules "关机模式不保留 TC 限速"; then
@@ -2957,6 +3738,28 @@ recover_owned_tc_hierarchy() {
             ;;
     esac
 
+    local disabled_status=0
+    trafficcop_config_is_disabled || disabled_status=$?
+    case "$disabled_status" in
+        0)
+            if [ "$mode" = "--auto" ]; then
+                echo "TrafficCop 当前已禁用，不会自动恢复残留的整机上限。"
+                return 0
+            fi
+            if [ -e "$TC_STATE_FILE" ]; then
+                clear_owned_tc_rules "TrafficCop 已禁用"
+                return $?
+            fi
+            echo "TrafficCop 当前已禁用，没有需要恢复的 TC 规则。"
+            return 0
+            ;;
+        1) ;;
+        *)
+            echo "TrafficCop 配置无法安全解释，拒绝修改 TC。" >&2
+            return 1
+            ;;
+    esac
+
     [ -n "$TC_BIN" ] || {
         echo "未找到系统 tc 命令，无法恢复。" >&2
         return 1
@@ -2972,6 +3775,10 @@ recover_owned_tc_hierarchy() {
     local state_provider=""
     local state_speed=""
     if [ -e "$TC_STATE_FILE" ]; then
+        if ! tc_state_file_is_interpretable; then
+            echo "TrafficCop TC 状态文件无法安全解释，拒绝删除 qdisc。" >&2
+            return 1
+        fi
         state_interface=$(tc_state_interface)
         state_schema=$(tc_state_value SCHEMA)
         state_provider=$(tc_state_value PROVIDER)
@@ -2986,10 +3793,6 @@ recover_owned_tc_hierarchy() {
         state_expected=true
     fi
 
-    if [ "${DISABLED:-false}" = "true" ] && [ "$state_expected" = "false" ]; then
-        echo "TrafficCop 当前已禁用，没有需要恢复的 TC 规则。"
-        return 0
-    fi
     if [ "${LIMIT_MODE:-}" != "tc" ] && [ "$state_expected" = "false" ]; then
         echo "TrafficCop 当前不是 TC 限速模式，没有需要恢复的 TC 规则。"
         return 0
@@ -3004,7 +3807,7 @@ recover_owned_tc_hierarchy() {
         return 1
     fi
 
-    local qdisc_line query_status unified_status verify_status
+    local qdisc_line query_status unified_status verify_status dog_status
     qdisc_line=$(tc_root_qdisc "$MAIN_INTERFACE")
     query_status=$?
     if [ "$query_status" -eq 2 ]; then
@@ -3029,9 +3832,19 @@ recover_owned_tc_hierarchy() {
             echo "TC 层级查询失败，未作任何 TC 修改。" >&2
             return 1
         elif [ "$verify_status" -eq 0 ]; then
-            release_tc_hierarchy_lock
-            echo "Dog/NTC TC 规则完整，无需重建。"
-            return 0
+            dog_status=0
+            if [ -e "$DOG_CONFIG_FILE" ] || [ -L "$DOG_CONFIG_FILE" ]; then
+                dog_live_objects_match_config "$MAIN_INTERFACE" || dog_status=$?
+            fi
+            if [ "$dog_status" -eq 2 ]; then
+                release_tc_hierarchy_lock
+                echo "Dog TC 层级查询失败，未作任何 TC 修改。" >&2
+                return 1
+            elif [ "$dog_status" -eq 0 ]; then
+                release_tc_hierarchy_lock
+                echo "Dog/NTC TC 规则完整，无需重建。"
+                return 0
+            fi
         fi
     fi
 
@@ -3103,7 +3916,7 @@ recover_owned_tc_hierarchy() {
 
 tc_self_check() {
     local interface qdisc_line state_speed state_schema result=1
-    local query_status verify_status default_status default_line
+    local query_status verify_status default_status default_line disabled_status dog_status
 
     if [ -z "$TC_BIN" ]; then
         echo "TC_SELF_CHECK=ERROR REASON=tc-not-found"
@@ -3116,6 +3929,24 @@ tc_self_check() {
     fi
     if ! acquire_tc_hierarchy_lock; then
         echo "TC_SELF_CHECK=ERROR INTERFACE=$interface REASON=lock-timeout"
+        return 1
+    fi
+
+    disabled_status=0
+    trafficcop_config_is_disabled || disabled_status=$?
+    if [ "$disabled_status" -eq 2 ]; then
+        echo "TC_SELF_CHECK=ERROR INTERFACE=$interface REASON=trafficcop-config-invalid"
+        release_tc_hierarchy_lock
+        return 1
+    fi
+    if [ -e "$TC_STATE_FILE" ] && ! tc_state_file_is_interpretable; then
+        echo "TC_SELF_CHECK=CONFLICT INTERFACE=$interface REASON=trafficcop-state-invalid"
+        release_tc_hierarchy_lock
+        return 1
+    fi
+    if [ "$disabled_status" -eq 0 ] && [ -e "$TC_STATE_FILE" ]; then
+        echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=disabled-trafficcop-state-remains ACTION=manual-rebuild"
+        release_tc_hierarchy_lock
         return 1
     fi
 
@@ -3167,8 +3998,18 @@ tc_self_check() {
                 if [ "$verify_status" -eq 2 ]; then
                     echo "TC_SELF_CHECK=ERROR INTERFACE=$interface REASON=tc-query-failed"
                 elif [ "$verify_status" -eq 0 ]; then
-                    echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=$TC_STATE_SCHEMA OWNER=trafficcop-lite"
-                    result=0
+                    dog_status=0
+                    if [ -e "$DOG_CONFIG_FILE" ] || [ -L "$DOG_CONFIG_FILE" ]; then
+                        dog_live_objects_match_config "$interface" || dog_status=$?
+                    fi
+                    if [ "$dog_status" -eq 2 ]; then
+                        echo "TC_SELF_CHECK=ERROR INTERFACE=$interface REASON=tc-query-failed"
+                    elif [ "$dog_status" -ne 0 ]; then
+                        echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=dog-port-rules-mismatch"
+                    else
+                        echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=$TC_STATE_SCHEMA OWNER=trafficcop-lite"
+                        result=0
+                    fi
                 else
                     echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=trafficcop-parent-mismatch"
                 fi
@@ -3349,5 +4190,5 @@ main() {
 # 执行主函数
 main "$@"
 exit_code=$?
-echo "-----------------------------------------------------"| tee -a "$LOG_FILE"
+write_invocation_log_footer "${1:-}"
 exit "$exit_code"

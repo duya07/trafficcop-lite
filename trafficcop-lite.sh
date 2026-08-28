@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.1.9"
-LAST_UPDATE="2026-08-26"
+SCRIPT_VERSION="1.1.10"
+LAST_UPDATE="2026-08-29"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
@@ -177,6 +177,10 @@ tc_auto_recovery_state() {
         echo "不可用（当前系统未运行 systemd）"
     elif [ -e "$TC_RECOVERY_UNIT_FILE" ] && ! tc_recovery_unit_is_owned; then
         echo "冲突（同名 unit 不属于 Dog/NTC）"
+    elif [ -e "$TC_RECOVERY_RUNNER" ] && ! tc_recovery_runner_is_owned; then
+        echo "冲突（恢复入口不属于 Dog/NTC）"
+    elif [ -e "$TC_RECOVERY_UNIT_FILE" ] && [ ! -e "$TC_RECOVERY_RUNNER" ]; then
+        echo "损坏（恢复入口缺失）"
     elif [ ! -e "$TC_RECOVERY_UNIT_FILE" ]; then
         echo "未启用"
     elif "$TC_RECOVERY_SYSTEMCTL" is-enabled --quiet "$TC_RECOVERY_SERVICE" 2>/dev/null; then
@@ -1413,6 +1417,11 @@ show_traffic_overview() {
     if ! [[ "$TRAFFIC_LIMIT" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! lite_compare_ge "$TRAFFIC_LIMIT" "0.000001"; then
         TRAFFIC_LIMIT=""
     fi
+    if ! [[ "$PERIOD_START_DAY" =~ ^(0?[1-9]|[12][0-9]|3[01])$ ]]; then
+        echo -e "${CYAN}流量概览:${NC} ${YELLOW}配置异常（周期起始日必须为 1-31）${NC}"
+        return
+    fi
+    PERIOD_START_DAY=$((10#$PERIOD_START_DAY))
 
     start_date=$(lite_period_start_date)
     end_date=$(lite_period_end_date)
@@ -1480,7 +1489,7 @@ lite_state_value() {
 show_enforcement_overview() {
     local config_file="$WORK_DIR/traffic_monitor_config.txt"
     local mode until_epoch reason now remaining
-    local limit_mode="" boot_grace_minutes=10 key value uptime_seconds
+    local limit_mode="" boot_grace_minutes=10 disabled=false key value uptime_seconds
 
     [ -s "$config_file" ] || return
     while IFS='=' read -r key value; do
@@ -1488,8 +1497,14 @@ show_enforcement_overview() {
         case "$key" in
             LIMIT_MODE) limit_mode="$value" ;;
             TC_BOOT_GRACE_MINUTES) boot_grace_minutes="$value" ;;
+            DISABLED) disabled="$value" ;;
         esac
     done < "$config_file"
+
+    if [ "$disabled" = "true" ]; then
+        echo -e "${CYAN}限制执行:${NC} ${RED}已禁用${NC}"
+        return
+    fi
 
     mode=$(lite_state_value "$ENFORCEMENT_STATE_FILE" "MODE")
     until_epoch=$(lite_state_value "$ENFORCEMENT_STATE_FILE" "UNTIL_EPOCH")

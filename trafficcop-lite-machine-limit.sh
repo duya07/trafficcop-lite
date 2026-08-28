@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# TrafficCop 机器限速管理脚本 v2.7
+# TrafficCop 机器限速管理脚本 v2.8
 # 提供完整的启用/禁用/恢复机器限速功能
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -115,11 +115,12 @@ has_pending_shutdown() {
     fi
 }
 
-write_enforcement_state() {
+write_enforcement_state_file() {
     local mode="$1"
     local until_epoch="$2"
     local reason="$3"
-    local tmp_file="${ENFORCEMENT_STATE_FILE}.tmp.$$"
+    local target_file="$4"
+    local tmp_file="${target_file}.tmp.$$"
 
     {
         printf 'MODE=%s\n' "$mode"
@@ -128,7 +129,11 @@ write_enforcement_state() {
         printf 'UPDATED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
     } > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
     chmod 600 "$tmp_file" 2>/dev/null || true
-    mv -f "$tmp_file" "$ENFORCEMENT_STATE_FILE"
+    mv -f "$tmp_file" "$target_file"
+}
+
+write_enforcement_state() {
+    write_enforcement_state_file "$1" "$2" "$3" "$ENFORCEMENT_STATE_FILE"
 }
 
 cancel_owned_shutdown() {
@@ -157,12 +162,37 @@ cancel_owned_shutdown() {
 
 begin_enable_grace() {
     local grace_minutes="${1:-10}"
-    local until_epoch
+    local until_epoch result=0
+    local enforcement_candidate="${ENFORCEMENT_STATE_FILE}.enable-candidate.$$"
 
-    [[ "$grace_minutes" =~ ^[0-9]+$ ]] || grace_minutes=10
+    ENABLE_TC_CLEAR_ATTEMPTED=false
+    if ! [[ "$grace_minutes" =~ ^[0-9]+$ ]] || [ "$grace_minutes" -lt 1 ] || [ "$grace_minutes" -gt 1440 ]; then
+        grace_minutes=10
+    fi
     until_epoch=$(( $(date +%s) + grace_minutes * 60 ))
-    cancel_owned_shutdown || return 1
-    write_enforcement_state "grace" "$until_epoch" "enable"
+    rm -f "$enforcement_candidate"
+    if ! write_enforcement_state_file "grace" "$until_epoch" "enable" "$enforcement_candidate"; then
+        rm -f "$enforcement_candidate"
+        return 1
+    fi
+
+    if ! acquire_monitor_cleanup_lock; then
+        rm -f "$enforcement_candidate"
+        return 1
+    fi
+    # 在同一监控锁内先撤销旧整机限速，再取消自有计划关机，最后提交宽限状态。
+    # 因此成功返回时，“宽限期间只统计”与实际 TC/关机运行态一致。
+    ENABLE_TC_CLEAR_ATTEMPTED=true
+    clear_tc_rules || result=$?
+    if [ "$result" -eq 0 ]; then
+        cancel_owned_shutdown || result=$?
+    fi
+    if [ "$result" -eq 0 ] && ! mv -f "$enforcement_candidate" "$ENFORCEMENT_STATE_FILE"; then
+        result=1
+    fi
+    release_monitor_cleanup_lock
+    rm -f "$enforcement_candidate"
+    return "$result"
 }
 
 # 颜色定义
@@ -368,11 +398,59 @@ disable_machine_limit() {
     echo -e "${CYAN}说明: 原配置已备份，可随时恢复${NC}"
 }
 
+rollback_enable_machine_limit() {
+    local config_backup="$1"
+    local enforcement_backup="$2"
+    local had_enforcement="$3"
+    local activation_from_disabled="$4"
+    local config_tmp="${CONFIG_FILE}.enable-rollback.$$"
+    local enforcement_tmp="${ENFORCEMENT_STATE_FILE}.enable-rollback.$$"
+    local rollback_failed=false
+
+    if ! cp -p "$config_backup" "$config_tmp" 2>/dev/null ||
+       ! chmod 600 "$config_tmp" 2>/dev/null ||
+       ! mv -f "$config_tmp" "$CONFIG_FILE"; then
+        rm -f "$config_tmp"
+        rollback_failed=true
+    fi
+
+    if [ "${ENABLE_TC_CLEAR_ATTEMPTED:-false}" = "true" ] &&
+       [ "$activation_from_disabled" = "true" ]; then
+        rm -f "$ENFORCEMENT_STATE_FILE" || rollback_failed=true
+    elif [ "$had_enforcement" = "true" ]; then
+        if ! cp -p "$enforcement_backup" "$enforcement_tmp" 2>/dev/null ||
+           ! chmod 600 "$enforcement_tmp" 2>/dev/null ||
+           ! mv -f "$enforcement_tmp" "$ENFORCEMENT_STATE_FILE"; then
+            rm -f "$enforcement_tmp"
+            rollback_failed=true
+        fi
+    elif ! rm -f "$ENFORCEMENT_STATE_FILE"; then
+        rollback_failed=true
+    fi
+
+    # 启用失败采用 fail-open：恢复配置/执行控制，但不重新施加刚撤销的旧限速。
+    # 这样即使原限速状态异常，也不会在失败回滚时再次锁住网络。
+    if [ "${ENABLE_TC_CLEAR_ATTEMPTED:-false}" = "true" ]; then
+        clear_tc_rules_with_lock >/dev/null 2>&1 || rollback_failed=true
+    fi
+
+    if $rollback_failed; then
+        return 1
+    fi
+    rm -f "$config_backup" "$enforcement_backup"
+}
+
 # 启用机器限速
 enable_machine_limit() {
     local enable_backup="$CONFIG_FILE.enable-backup.$$"
+    local enforcement_backup="$ENFORCEMENT_STATE_FILE.enable-backup.$$"
     local config_tmp="${CONFIG_FILE}.tmp.$$"
-    local had_tc_state=false
+    local had_enforcement=false
+    local activation_from_disabled=false
+
+    if [ "${1:-}" = "--from-disabled-restore" ]; then
+        activation_from_disabled=true
+    fi
 
     echo -e "${YELLOW}==================== 启用机器限速 ====================${NC}"
     echo ""
@@ -385,60 +463,76 @@ enable_machine_limit() {
     
     cp "$CONFIG_FILE" "$enable_backup" || return 1
     chmod 600 "$enable_backup" 2>/dev/null || true
-    [ -f "$TC_STATE_FILE" ] && had_tc_state=true
+    if grep -q '^DISABLED=true$' "$CONFIG_FILE" 2>/dev/null; then
+        activation_from_disabled=true
+    fi
+    if [ -f "$ENFORCEMENT_STATE_FILE" ]; then
+        if ! cp -p "$ENFORCEMENT_STATE_FILE" "$enforcement_backup"; then
+            rm -f "$enable_backup"
+            return 1
+        fi
+        chmod 600 "$enforcement_backup" 2>/dev/null || true
+        had_enforcement=true
+    fi
 
-    # 1. 恢复配置文件（移除DISABLED标记）
-    if grep -q "DISABLED=true" "$CONFIG_FILE" 2>/dev/null; then
+    # 1. 先保留当前禁用标记建立安全窗口。监控脚本据此可识别并清理
+    # “父类已由 Dog 恢复、但 NTC 状态文件仍残留”的禁用态收尾场景。
+    if ! begin_enable_grace 10; then
+        if rollback_enable_machine_limit "$enable_backup" "$enforcement_backup" \
+            "$had_enforcement" "$activation_from_disabled"; then
+            if [ "${ENABLE_TC_CLEAR_ATTEMPTED:-false}" = "true" ]; then
+                echo -e "${RED}无法建立无旧限速的启用宽限；配置/执行控制已恢复，旧 TC 限速保持撤销。${NC}"
+            else
+                echo -e "${RED}无法建立启用宽限；原配置、执行控制和 TC 均保持不变。${NC}"
+            fi
+        else
+            echo -e "${RED}无法建立启用宽限，且回滚不完整；备份已保留，请立即检查。${NC}"
+        fi
+        return 1
+    fi
+    echo "✓ 已设置 10 分钟启用宽限，期间只统计流量"
+
+    # 2. 旧 TC/关机状态已撤销后，再恢复配置文件（移除 DISABLED 标记）。
+    if grep -q '^DISABLED=true$' "$CONFIG_FILE" 2>/dev/null; then
         echo "恢复配置文件..."
         if ! grep -v -E '^(DISABLED|DISABLED_TIME)=' "$CONFIG_FILE" > "$config_tmp" \
             || ! chmod 600 "$config_tmp" 2>/dev/null \
             || ! mv -f "$config_tmp" "$CONFIG_FILE"; then
             rm -f "$config_tmp"
-            rm -f "$enable_backup"
-            echo -e "${RED}配置文件恢复失败，未启动监控。${NC}"
+            if rollback_enable_machine_limit "$enable_backup" "$enforcement_backup" \
+                "$had_enforcement" "$activation_from_disabled"; then
+                echo -e "${RED}配置文件恢复失败；原配置/执行控制已恢复，旧 TC 限速保持撤销。${NC}"
+            else
+                echo -e "${RED}配置文件恢复失败且回滚不完整；备份已保留，请立即检查。${NC}"
+            fi
             return 1
         fi
         chmod 600 "$CONFIG_FILE" 2>/dev/null || true
         echo "✓ 配置文件已恢复"
     fi
 
-    # 2. 启用后先留出安全窗口，再执行一次监控确认配置和运行环境。
-    if ! begin_enable_grace 10; then
-        cp "$enable_backup" "$CONFIG_FILE" 2>/dev/null || true
-        rm -f "$enable_backup"
-        echo -e "${RED}无法创建启用宽限状态，未启动监控。${NC}"
-        return 1
-    fi
-    echo "✓ 已设置 10 分钟启用宽限，期间只统计流量"
-
     echo "启动TrafficCop监控测试..."
     if ! cd "$WORK_DIR" || ! bash "$SCRIPT_PATH" --run; then
-        rm -f "$ENFORCEMENT_STATE_FILE"
-        $had_tc_state || clear_tc_rules || true
-        if cp "$enable_backup" "$CONFIG_FILE"; then
-            chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-            rm -f "$enable_backup"
-            echo -e "${RED}监控测试失败，已恢复启用前配置且未添加定时任务。${NC}"
+        if rollback_enable_machine_limit "$enable_backup" "$enforcement_backup" \
+            "$had_enforcement" "$activation_from_disabled"; then
+            echo -e "${RED}监控测试失败；配置/执行控制已恢复，旧 TC 限速出于安全未恢复，且未添加定时任务。${NC}"
         else
-            echo -e "${RED}监控测试失败，且配置恢复失败；备份保留在 $enable_backup。${NC}"
+            echo -e "${RED}监控测试失败且回滚不完整；备份已保留，请立即检查。${NC}"
         fi
         return 1
     fi
 
     # 3. 测试成功后再添加定时任务
     if ! add_cron_job; then
-        rm -f "$ENFORCEMENT_STATE_FILE"
-        $had_tc_state || clear_tc_rules || true
-        if cp "$enable_backup" "$CONFIG_FILE"; then
-            chmod 600 "$CONFIG_FILE" 2>/dev/null || true
-            rm -f "$enable_backup"
-            echo -e "${RED}定时任务添加失败，已恢复启用前配置。${NC}"
+        if rollback_enable_machine_limit "$enable_backup" "$enforcement_backup" \
+            "$had_enforcement" "$activation_from_disabled"; then
+            echo -e "${RED}定时任务添加失败；配置/执行控制已恢复，旧 TC 限速出于安全未恢复。${NC}"
         else
-            echo -e "${RED}定时任务添加失败，且配置恢复失败；备份保留在 $enable_backup。${NC}"
+            echo -e "${RED}定时任务添加失败且回滚不完整；备份已保留，请立即检查。${NC}"
         fi
         return 1
     fi
-    rm -f "$enable_backup"
+    rm -f "$enable_backup" "$enforcement_backup"
     
     echo ""
     echo -e "${GREEN}✓ 机器限速已启用${NC}"
@@ -451,6 +545,7 @@ restore_machine_limit() {
     local restore_tmp="${CONFIG_FILE}.tmp.$$"
     local rollback_file="${CONFIG_FILE}.restore-backup.$$"
     local had_config=false
+    local operation_from_disabled=false
     echo -e "${YELLOW}==================== 恢复机器限速 ====================${NC}"
     echo ""
     
@@ -461,6 +556,7 @@ restore_machine_limit() {
     fi
 
     if [ -f "$CONFIG_FILE" ]; then
+        grep -q '^DISABLED=true$' "$CONFIG_FILE" 2>/dev/null && operation_from_disabled=true
         if ! cp "$CONFIG_FILE" "$rollback_file" || ! chmod 600 "$rollback_file" 2>/dev/null; then
             rm -f "$rollback_file"
             echo -e "${RED}无法备份当前配置，未执行恢复。${NC}"
@@ -481,7 +577,8 @@ restore_machine_limit() {
     echo "✓ 配置已恢复"
     
     # 启用监控
-    if enable_machine_limit; then
+    if { $operation_from_disabled && enable_machine_limit --from-disabled-restore; } ||
+       { ! $operation_from_disabled && enable_machine_limit; }; then
         rm -f "$rollback_file"
         return 0
     fi
@@ -586,18 +683,40 @@ manage_enforcement_control() {
     esac
 }
 
+show_monitor_task_status() {
+    local log_file="$WORK_DIR/traffic_monitor.log"
+    local last_run last_run_timestamp current_timestamp time_diff
+
+    last_run=$(grep ' 正在以自动化模式运行$' "$log_file" 2>/dev/null | tail -n 1 | awk '{print $1, $2}')
+    if [ -z "$last_run" ] ||
+       ! last_run_timestamp=$(date -d "$last_run" +%s 2>/dev/null); then
+        echo -e "监控任务: ${YELLOW}尚无执行记录${NC}"
+        return
+    fi
+
+    current_timestamp=$(date +%s)
+    time_diff=$((current_timestamp - last_run_timestamp))
+    if [ "$time_diff" -lt 600 ]; then
+        echo -e "监控任务: ${GREEN}最近已执行${NC} (最后执行: $last_run)"
+    else
+        echo -e "监控任务: ${YELLOW}空闲中${NC} (最后执行: $last_run)"
+    fi
+}
+
 # 查看当前状态
 show_status() {
-    local disabled_time last_run last_run_timestamp current_timestamp time_diff
+    local disabled_time
     local enforcement_mode enforcement_until enforcement_reason remaining boot_grace
+    local config_disabled=false
 
     echo -e "${CYAN}==================== 当前状态 ====================${NC}"
     echo ""
     
     # 检查配置文件
     if [ -f "$CONFIG_FILE" ]; then
-        if grep -q "DISABLED=true" "$CONFIG_FILE" 2>/dev/null; then
-            disabled_time=$(grep "DISABLED_TIME=" "$CONFIG_FILE" | cut -d'=' -f2)
+        if grep -q '^DISABLED=true$' "$CONFIG_FILE" 2>/dev/null; then
+            config_disabled=true
+            disabled_time=$(grep '^DISABLED_TIME=' "$CONFIG_FILE" | tail -n 1 | cut -d'=' -f2-)
             echo -e "配置状态: ${RED}已禁用${NC} (禁用时间: $disabled_time)"
         else
             echo -e "配置状态: ${GREEN}已启用${NC}"
@@ -609,7 +728,9 @@ show_status() {
     enforcement_mode=$(enforcement_state_value "MODE")
     enforcement_until=$(enforcement_state_value "UNTIL_EPOCH")
     enforcement_reason=$(enforcement_state_value "REASON")
-    if [ "$enforcement_mode" = "paused" ]; then
+    if $config_disabled; then
+        echo -e "限制执行: ${RED}已禁用${NC}"
+    elif [ "$enforcement_mode" = "paused" ]; then
         if [ "$enforcement_reason" = "shutdown_reboot" ]; then
             echo -e "限制执行: ${RED}关机后重启保护，已暂停${NC}"
         else
@@ -627,21 +748,8 @@ show_status() {
         echo "TC 开机宽限: $boot_grace 分钟"
     fi
     
-    # 检查进程状态（检查最近的执行记录而不是实时进程）
-    last_run=$(grep "当前版本" "$WORK_DIR/traffic_monitor.log" 2>/dev/null | tail -1 | awk '{print $1, $2}')
-    if [ -n "$last_run" ]; then
-        last_run_timestamp=$(stat -c %Y "$WORK_DIR/traffic_monitor.log" 2>/dev/null || echo "0")
-        current_timestamp=$(date +%s)
-        time_diff=$((current_timestamp - last_run_timestamp))
-        
-        if [ $time_diff -lt 600 ]; then  # 10分钟内有执行记录
-            echo -e "监控进程: ${GREEN}运行中${NC} (最后执行: $last_run)"
-        else
-            echo -e "监控进程: ${YELLOW}空闲中${NC} (最后执行: $last_run)"
-        fi
-    else
-        echo -e "监控进程: ${RED}未运行${NC}"
-    fi
+    # 这里只报告最近一次 cron/--run 任务，不把普通日志写入误称为实时进程。
+    show_monitor_task_status
     
     # 检查定时任务
     if read_root_crontab_locked 2>/dev/null | grep -F -q "$SCRIPT_PATH"; then

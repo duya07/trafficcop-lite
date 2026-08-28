@@ -40,8 +40,11 @@
 24. TC 模式直接管理 `traffic-tools-unified-htb-v1`：`1:1` 实施整机上限，`1:30` 承接默认流量，并保留 Dog 的端口子类。TrafficCop Lite 可单独安装；日常应用在可验证的 Dog 层级中原地协调，共享恢复入口在两者并存时按顺序调用两边的恢复接口，安装顺序不限。
 25. 主页只读显示 TC 状态；用户明确确认后，可删除冲突 root 并按 Dog/NTC 现有状态重建。第三方 TC 配置不会被识别、迁移或保留。
 26. Dog 与 NTC 共用唯一的 `traffic-tools-tc-recovery.service`。服务默认关闭；启用后在网络就绪时执行一次，不使用固定延迟，也不做运行期高频抢占。
-27. 自动校准 vnStat 的高速接口上限和写盘间隔，避免云网卡实际速率超过默认回退上限时整段采样被丢弃；仅在配置实际变化时向 `vnstatd` 发送 HUP，失败会恢复旧配置。
+27. vnStat 异常速率检查默认关闭（`MaxBW=0`），也可在监控配置中设置 `1-50000 Mbit/s` 的自定义上限；脚本同时校准写盘间隔，仅在配置实际变化时向 `vnstatd` 发送 HUP，失败会恢复旧配置。
 28. 流量读取前同时检查 `vnstatd` 和数据库更新时间；TC 的 root/class/filter 查询保留“存在、缺失、查询失败”三种状态，查询失败时不会按“规则不存在”继续修改。
+29. 机器限速启用宽限会在同一监控锁内先撤销 NTC 自有整机限速和计划关机，再提交宽限状态；Dog 的端口 class/filter 会保留。
+30. 显式配置的周期起始日必须是 `1-31`；非法值会停止本轮计算并在主页提示配置异常，不再由不同组件各自归一化。
+31. TC 自检不会写入通用监控日志；机器状态只把明确的自动化执行标记视为最近运行，打开主页或执行自检不会伪造监控活动。
 
 ## 下载方式说明
 
@@ -160,6 +163,7 @@ sudo env RAW_BASE="https://v6.gh-proxy.org/https://raw.githubusercontent.com/duy
 - 旧配置没有 `TRAFFIC_UNIT` 时继续按 GiB 计算，不会因更新改变原配额含义。
 - 旧配置没有 `ALLOW_PARTIAL_HISTORY` 时保持严格模式，不会擅自按残缺历史执行限制。
 - 旧配置没有 `TC_BOOT_GRACE_MINUTES` 时默认使用 10 分钟开机限速宽限。
+- 旧配置没有 `VNSTAT_MAX_BANDWIDTH` 时默认使用 `0`，即关闭 vnStat 异常速率检查。
 - 旧 Telegram 配置没有 `TG_DISABLED` 时保持原行为，自动通知默认开启。
 - 下载到临时文件并通过 `bash -n` 语法检查后才替换。
 - 校验每个候选脚本的版本，拒绝代理缓存或错误更新源造成的组件降级。
@@ -184,7 +188,7 @@ sudo env RAW_BASE="https://v6.gh-proxy.org/https://raw.githubusercontent.com/duy
 
 配置时还可选择流量单位：`GB` 使用十进制（1000³ 字节，适合服务商配额），`GiB` 使用二进制（1024³ 字节，兼容旧版）。容错范围必须大于等于 `0` 且小于流量限制，异常旧配置会停止本轮判断，不会按 `0` 阈值触发限速或关机。季度和年度统计依赖 vnStat 的每日历史；脚本可调整 `DailyDays`，并按实际配置文件的规范路径分别保留原配置备份（首个通常为 `/etc/trafficcop-lite/vnstat.conf.before-trafficcop-lite`，切换路径后使用编号备份及对应 `.source-path` 标记）。`DailyDays=-1` 会按无限保留处理，`TrafficlessEntries=0` 产生的无流量日期缺口不会被误判为历史丢失。
 
-TrafficCop Lite 会保留 vnStat 配置中的其他自定义项，并幂等设置 `SaveInterval 1`。当 `UpdateInterval` 大于 60 秒时才将其收紧到 60 秒，以满足 vnStat 的保存间隔约束。vnStat 2.9 及以上使用当前网卡的 `MaxBW<接口名> 50000`；2.0–2.8 因自动带宽检测会覆盖接口值，兼容模式还会设置 `BandwidthDetection 0` 和 `MaxBandwidth 50000`。这里使用 vnStat 支持的 50000 Mbit 上限，不使用 `0`（完全关闭异常速率保护）。
+TrafficCop Lite 会保留 vnStat 配置中的其他自定义项，并幂等设置 `SaveInterval 1`。当 `UpdateInterval` 大于 60 秒时才将其收紧到 60 秒，以满足 vnStat 的保存间隔约束。配置监控时可以设置 `VNSTAT_MAX_BANDWIDTH`：默认 `0` 表示关闭 vnStat 异常速率检查，也可以输入 `1-50000` 作为 Mbit/s 上限。vnStat 2.9 及以上使用当前网卡的 `MaxBW<接口名>`；2.0–2.8 兼容模式还会设置 `BandwidthDetection 0` 和全局 `MaxBandwidth`。关闭检查可避免高速云网卡被过低上限丢弃采样，但也会失去 vnStat 对异常接口计数跳变的保护；如需该保护，请按机器合理峰值设置非零上限。
 
 `SaveInterval 1` 会让数据库通常每分钟落盘一次，相比常见的 5 分钟默认值会增加少量磁盘写入，但缩短崩溃或断电时未保存流量的窗口。统计仍不是秒级实时值；正常可有约 1–3 分钟延迟。若 `vnstatd` 未运行、数据库因磁盘满等原因长期未更新，或 JSON API 版本、接口名、日期、每日 `rx/tx` 字段无效，本轮判断会失败关闭：不下发新限制，也不清除已有规则。vnStat 已经因“实际速率高于 MaxBandwidth”而忽略的历史采样无法从数据库补回，只能从修复生效后重新准确累计。
 
@@ -305,7 +309,7 @@ sudo /usr/sbin/tc qdisc show
 - Telegram cron 日志默认保留最近 2000 行；如需详细调试，可临时设置 `TG_DEBUG=true`。
 - 流量监控日志默认保留最近 5000 行，可通过 `LOG_MAX_LINES` 调整。
 - Telegram 报告时区可独立配置；旧配置默认使用 `Asia/Shanghai`。时区名称必须对应系统 `/usr/share/zoneinfo` 中的有效文件，因此精简系统需要安装 `tzdata`。到达设定时间后当天只发送一次，任务短暂中断时会在恢复后补发。
-- 需要 vnStat 2.x 或更高版本。脚本兼容 `vnstat --showconfig` 中带分号或井号的默认配置项，会管理 `SaveInterval`、必要时的 `UpdateInterval`、当前接口 `MaxBW`，并按周期需求管理 `DailyDays`；vnStat 2.0–2.8 还使用上述兼容设置。守护进程未显式指定 `--config` 时，只有运行中的 `vnstatd`、系统 `vnstatd` 命令和 `vnstat` 客户端能证明来自同一安装前缀，脚本才采用客户端报告的默认配置。每个实际配置路径首次变更前都会单独保留原配置备份，卸载时不会自动恢复全局 vnStat 配置。
+- 需要 vnStat 2.x 或更高版本。脚本兼容 `vnstat --showconfig` 中带分号或井号的默认配置项，会管理 `SaveInterval`、必要时的 `UpdateInterval`、当前接口 `MaxBW`，并按周期需求管理 `DailyDays`；`VNSTAT_MAX_BANDWIDTH=0` 为默认值并表示关闭异常速率检查，非零值必须在 `1-50000` 范围内；vnStat 2.0–2.8 还使用上述兼容设置。守护进程未显式指定 `--config` 时，只有运行中的 `vnstatd`、系统 `vnstatd` 命令和 `vnstat` 客户端能证明来自同一安装前缀，脚本才采用客户端报告的默认配置。每个实际配置路径首次变更前都会单独保留原配置备份，卸载时不会自动恢复全局 vnStat 配置。
 - Debian/Ubuntu、RHEL 系、Alpine 和 Arch 系会按已识别的包管理器尝试安装依赖；无法自动启动 cron 或 vnStat 服务时会给出明确提示，请按系统服务管理方式确认其已运行。
 - 网络受限时，优先使用带 `v6.gh-proxy.org` 的命令。
 

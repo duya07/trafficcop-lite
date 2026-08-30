@@ -42,7 +42,7 @@ VNSTAT_TRANSACTION_HAD_CONFIG_PATH_FILE=false
 DOG_CONFIG_FILE="/etc/port-traffic-dog/config.json"
 DOG_TC_OWNER_FILE="/etc/port-traffic-dog/tc-root-qdisc.owner"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.1.8"
+SCRIPT_VERSION="1.1.9"
 mkdir -p "$WORK_DIR"
 chmod 700 "$WORK_DIR" 2>/dev/null || true
 
@@ -1114,7 +1114,8 @@ ensure_service_running() {
                 fi
             fi
         done
-    elif command_exists rc-service; then
+    fi
+    if command_exists rc-service; then
         for service_name in "$@"; do
             if [ -x "/etc/init.d/$service_name" ]; then
                 if command_exists rc-update; then
@@ -1125,7 +1126,8 @@ ensure_service_running() {
                 fi
             fi
         done
-    elif command_exists service; then
+    fi
+    if command_exists service; then
         for service_name in "$@"; do
             if [ -x "/etc/init.d/$service_name" ] && { run_privileged service "$service_name" start >/dev/null 2>&1 || service "$service_name" status >/dev/null 2>&1; }; then
                 return 0
@@ -1134,7 +1136,7 @@ ensure_service_running() {
     fi
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') 提示：无法自动确认 $display_name 服务状态，请确保对应服务正在运行。" | tee -a "$LOG_FILE"
-    return 0
+    return 1
 }
 
 
@@ -1183,7 +1185,9 @@ check_and_install_packages() {
         done
     fi
 
-    ensure_service_running "cron" cron crond dcron cronie
+    if ! ensure_service_running "cron" cron crond dcron cronie; then
+        return 1
+    fi
     if ! ensure_vnstat_daemon_running; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 错误：无法确认 vnStat 守护进程正在运行。" | tee -a "$LOG_FILE"
         return 1
@@ -1344,6 +1348,15 @@ validate_config() {
         true|false) ;;
         *)
             echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：ALLOW_PARTIAL_HISTORY 必须是 true 或 false。" | tee -a "$LOG_FILE"
+            has_error=true
+            ;;
+    esac
+
+    DISABLED="${DISABLED:-false}"
+    case "$DISABLED" in
+        true|false) ;;
+        *)
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：DISABLED 必须是 true 或 false。" | tee -a "$LOG_FILE"
             has_error=true
             ;;
     esac
@@ -1530,7 +1543,11 @@ snapshot_monitor_config_state() {
         current_boot=$(current_boot_id)
         if [ -n "$state_boot" ] && [ -n "$current_boot" ] && [ "$state_boot" = "$current_boot" ] &&
            has_pending_shutdown; then
-            CONFIG_SNAPSHOT_OLD_SHUTDOWN_PENDING=true
+            if pending_shutdown_matches_owned_state; then
+                CONFIG_SNAPSHOT_OLD_SHUTDOWN_PENDING=true
+            else
+                return 1
+            fi
         elif { [ -z "$state_boot" ] || [ -z "$current_boot" ]; } && has_pending_shutdown; then
             return 1
         fi
@@ -1565,17 +1582,17 @@ restore_owned_tc_after_config_failure() {
 
 restore_owned_shutdown_after_config_failure() {
     local shutdown_backup="$1"
+    local task_token
 
     [ "${CONFIG_SNAPSHOT_OLD_SHUTDOWN_PENDING:-false}" = "true" ] || return 0
-    has_pending_shutdown && return 0
-    restore_file_snapshot "$shutdown_backup" true "$SHUTDOWN_STATE_FILE" || return 1
-    if ! shutdown -h +1 "TrafficCop 配置回滚：恢复原计划关机"; then
-        if has_pending_shutdown; then
-            return 0
-        fi
-        restore_file_snapshot "$shutdown_backup" true "$SHUTDOWN_STATE_FILE" >/dev/null 2>&1 || true
-        return 1
+    if has_pending_shutdown; then
+        pending_shutdown_matches_owned_state
+        return $?
     fi
+    restore_file_snapshot "$shutdown_backup" true "$SHUTDOWN_STATE_FILE" || return 1
+    task_token=$(shutdown_task_token_from_state) || return 1
+    shutdown -h +1 "TrafficCop-Lite[$task_token] 配置回滚：恢复原计划关机" >/dev/null 2>&1 || true
+    pending_shutdown_matches_owned_state
 }
 
 rollback_monitor_config_transaction() {
@@ -1825,9 +1842,15 @@ clear_owned_shutdown_schedule() {
             echo "$(date '+%Y-%m-%d %H:%M:%S') 无法确认计划关机是否属于本脚本，已保留系统任务和状态文件。" | tee -a "$LOG_FILE"
             return 1
         fi
-        if has_pending_shutdown && ! shutdown -c 2>/dev/null; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 无法取消本脚本记录的计划关机，已保留状态文件。" | tee -a "$LOG_FILE"
-            return 1
+        if has_pending_shutdown; then
+            if ! pending_shutdown_matches_owned_state; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 当前计划关机无法与本脚本任务标识匹配，已保留系统任务和状态文件。" | tee -a "$LOG_FILE"
+                return 1
+            fi
+            if ! shutdown -c 2>/dev/null || has_pending_shutdown; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 无法取消本脚本记录的计划关机，已保留状态文件。" | tee -a "$LOG_FILE"
+                return 1
+            fi
         fi
         rm -f "$SHUTDOWN_STATE_FILE" || return 1
     fi
@@ -3169,8 +3192,11 @@ apply_tc_limit() {
                     "$TC_BIN" class replace dev "$MAIN_INTERFACE" parent 1:1 classid 1:30 htb \
                         rate "$old_default_rate" ceil "$old_default_ceil" 2>/dev/null && rollback_ok=true
                 else
-                    "$TC_BIN" class del dev "$MAIN_INTERFACE" classid 1:30 2>/dev/null || true
-                    rollback_ok=true
+                    if "$TC_BIN" class del dev "$MAIN_INTERFACE" classid 1:30 2>/dev/null; then
+                        tc_class_line "$MAIN_INTERFACE" "1:30" >/dev/null
+                        query_status=$?
+                        [ "$query_status" -eq 1 ] && rollback_ok=true
+                    fi
                 fi
             fi
             ;;
@@ -3237,9 +3263,12 @@ clear_owned_tc_rules_locked() {
 
     if [ -z "$state_schema" ]; then
         if is_default_qdisc_line "$qdisc_line" && tc_state_allows_boot_rebuild "$state_interface"; then
-            rm -f "$TC_STATE_FILE"
-            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：旧 TBF 已随重启消失，仅清理旧状态。" | tee -a "$LOG_FILE"
-            return 0
+            if rm -f "$TC_STATE_FILE"; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：旧 TBF 已随重启消失，仅清理旧状态。" | tee -a "$LOG_FILE"
+                return 0
+            fi
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：旧 TBF 已随重启消失，但状态文件删除失败。" | tee -a "$LOG_FILE"
+            return 1
         fi
         if ! tc_legacy_tbf_is_owned "$state_interface" "$qdisc_line"; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：旧 TBF 与状态记录不一致，保留规则和状态。" | tee -a "$LOG_FILE"
@@ -3265,9 +3294,12 @@ clear_owned_tc_rules_locked() {
     fi
 
     if is_default_qdisc_line "$qdisc_line"; then
-        rm -f "$TC_STATE_FILE"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB 已不存在，仅清理本脚本状态。" | tee -a "$LOG_FILE"
-        return 0
+        if rm -f "$TC_STATE_FILE"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB 已不存在，仅清理本脚本状态。" | tee -a "$LOG_FILE"
+            return 0
+        fi
+        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB 已不存在，但状态文件删除失败。" | tee -a "$LOG_FILE"
+        return 1
     fi
     tc_root_is_unified_compatible "$state_interface"
     query_status=$?
@@ -3409,22 +3441,60 @@ has_pending_shutdown() {
     fi
 }
 
+shutdown_task_token_from_state() {
+    local task_token
+    task_token=$(shutdown_state_value TASK_TOKEN)
+    [[ "$task_token" =~ ^trafficcop-lite-[0-9A-Za-z-]{8,80}$ ]] || return 1
+    printf '%s\n' "$task_token"
+}
+
+pending_shutdown_matches_owned_state() {
+    local task_token wall_state
+    has_pending_shutdown || return 1
+    task_token=$(shutdown_task_token_from_state) || return 1
+
+    if command_exists busctl; then
+        wall_state=$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
+            org.freedesktop.login1.Manager WallMessage 2>/dev/null || true)
+        if [ -n "$wall_state" ] && grep -Fq "$task_token" <<< "$wall_state"; then
+            return 0
+        fi
+    fi
+    if [ -r /run/systemd/shutdown/scheduled ] &&
+       grep -Fq "$task_token" /run/systemd/shutdown/scheduled 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+new_shutdown_task_token() {
+    local random_id
+    random_id=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)
+    if ! [[ "$random_id" =~ ^[0-9A-Fa-f-]{8,64}$ ]]; then
+        random_id="$(date +%s)-${BASHPID:-$$}-${RANDOM}"
+    fi
+    printf 'trafficcop-lite-%s\n' "$random_id"
+}
+
 write_shutdown_state() {
-    local period_start boot_id
+    local period_start boot_id task_token
     local tmp_file="${SHUTDOWN_STATE_FILE}.tmp.$$"
 
     period_start=$(get_period_start_date)
     boot_id=$(current_boot_id)
+    task_token=$(new_shutdown_task_token) || return 1
     [[ "$period_start" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
     [ -n "$boot_id" ] || return 1
 
     {
         printf 'PERIOD_START=%s\n' "$period_start"
         printf 'BOOT_ID=%s\n' "$boot_id"
+        printf 'TASK_TOKEN=%s\n' "$task_token"
         printf 'SCHEDULED_EPOCH=%s\n' "$(date +%s)"
     } > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
     chmod 600 "$tmp_file" 2>/dev/null || true
-    mv -f "$tmp_file" "$SHUTDOWN_STATE_FILE"
+    mv -f "$tmp_file" "$SHUTDOWN_STATE_FILE" || return 1
+    SHUTDOWN_TASK_TOKEN="$task_token"
 }
 
 shutdown_reboot_guard_active() {
@@ -3639,7 +3709,7 @@ check_and_limit_traffic() {
                     echo "$(date '+%Y-%m-%d %H:%M:%S') 无法预写关机保护状态，本轮拒绝提交计划关机" | tee -a "$LOG_FILE"
                     return 1
                 fi
-                if ! shutdown -h +1 "流量超出限制，系统将在 1 分钟后关机"; then
+                if ! shutdown -h +1 "TrafficCop-Lite[$SHUTDOWN_TASK_TOKEN] 流量超出限制，系统将在 1 分钟后关机"; then
                     if has_pending_shutdown; then
                         echo "$(date '+%Y-%m-%d %H:%M:%S') 关机命令返回失败但仍检测到计划任务，已保留归属状态供安全清理" | tee -a "$LOG_FILE"
                     elif ! rm -f "$SHUTDOWN_STATE_FILE"; then
@@ -4041,7 +4111,7 @@ tc_self_check() {
 }
 
 setup_crontab() {
-    local current_crontab new_crontab cron_entry
+    local current_crontab cron_entry crontab_tmp
 
     if ! acquire_root_crontab_lock; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 无法取得 TrafficCop-Lite crontab 锁" | tee -a "$LOG_FILE"
@@ -4051,14 +4121,30 @@ setup_crontab() {
         release_root_crontab_lock
         return 1
     fi
-    new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
     cron_entry="* * * * * $SCRIPT_PATH --run >/dev/null 2>&1 # TrafficCop-Lite Monitor"
 
-    if ! { printf '%s\n' "$new_crontab"; printf '%s\n' "$cron_entry"; } | sed '/^[[:space:]]*$/d' | crontab -; then
+    if ! crontab_tmp="$(mktemp)"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 无法创建 crontab 临时文件，未作修改" | tee -a "$LOG_FILE"
+        release_root_crontab_lock
+        return 1
+    fi
+    chmod 600 "$crontab_tmp" 2>/dev/null || true
+    if ! awk -v script="$SCRIPT_PATH" '
+        index($0, script) == 0 && $0 !~ /^[[:space:]]*$/ { print }
+    ' <<< "$current_crontab" > "$crontab_tmp" \
+        || ! printf '%s\n' "$cron_entry" >> "$crontab_tmp"; then
+        rm -f "$crontab_tmp"
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 生成 crontab 候选内容失败，未作修改" | tee -a "$LOG_FILE"
+        release_root_crontab_lock
+        return 1
+    fi
+    if ! crontab "$crontab_tmp"; then
+        rm -f "$crontab_tmp"
         echo "$(date '+%Y-%m-%d %H:%M:%S') Crontab 设置失败" | tee -a "$LOG_FILE"
         release_root_crontab_lock
         return 1
     fi
+    rm -f "$crontab_tmp"
 
     release_root_crontab_lock
     echo "$(date '+%Y-%m-%d %H:%M:%S') Crontab 已设置，每分钟运行一次"| tee -a "$LOG_FILE"

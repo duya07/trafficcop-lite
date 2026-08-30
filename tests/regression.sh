@@ -174,6 +174,104 @@ test_shutdown_cleanup_blocks_unverifiable_pending_task() {
     assert_absent "$work/shutdown-called"
 }
 
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_shutdown_cleanup_requires_exact_task_identity_in_all_entrypoints() {
+    local work pending wall_message cancel_count=0
+    work=$(mktemp -d "$TEST_ROOT/shutdown-task-identity.XXXXXX") || return 1
+    LOG_FILE="$work/log"
+    RED=''
+    NC=''
+    WORK_DIR="$work"
+
+    cat() {
+        if [ "${1:-}" = /proc/sys/kernel/random/boot_id ]; then
+            printf '%s\n' boot-a
+        else
+            command cat "$@"
+        fi
+    }
+    command_exists() { [ "$1" = busctl ]; }
+    busctl() { printf 's "%s"\n' "$wall_message"; }
+    has_pending_shutdown() { [ "$pending" = true ]; }
+    lite_has_pending_shutdown() { [ "$pending" = true ]; }
+    shutdown() {
+        [ "${1:-}" = -c ] || return 1
+        cancel_count=$((cancel_count + 1))
+        pending=false
+    }
+    write_shutdown_marker() {
+        printf '%s\n' \
+            'PERIOD_START=2026-08-01' \
+            'BOOT_ID=boot-a' \
+            "TASK_TOKEN=$2" \
+            'SCHEDULED_EPOCH=1787900000' > "$1"
+    }
+
+    load_function "$MONITOR_SCRIPT" shutdown_state_value || return 1
+    load_function "$MONITOR_SCRIPT" shutdown_task_token_from_state || return 1
+    load_function "$MONITOR_SCRIPT" pending_shutdown_matches_owned_state || return 1
+    load_function "$MONITOR_SCRIPT" clear_owned_shutdown_schedule || return 1
+    SHUTDOWN_STATE_FILE="$work/monitor-owned"
+    write_shutdown_marker "$SHUTDOWN_STATE_FILE" trafficcop-lite-monitor-12345678
+    pending=true
+    wall_message='TrafficCop-Lite[trafficcop-lite-monitor-12345678] owned task'
+    clear_owned_shutdown_schedule >/dev/null || return 1
+    [ "$cancel_count" -eq 1 ] || return 1
+    assert_absent "$SHUTDOWN_STATE_FILE" || return 1
+
+    SHUTDOWN_STATE_FILE="$work/monitor-foreign"
+    write_shutdown_marker "$SHUTDOWN_STATE_FILE" trafficcop-lite-monitor-87654321
+    pending=true
+    wall_message='external maintenance shutdown'
+    if clear_owned_shutdown_schedule >/dev/null; then
+        return 1
+    fi
+    [ "$cancel_count" -eq 1 ] || return 1
+    [ -f "$SHUTDOWN_STATE_FILE" ] || return 1
+
+    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" shutdown_task_token_from_state || return 1
+    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" pending_shutdown_matches_owned_state || return 1
+    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" cancel_owned_shutdown || return 1
+    SHUTDOWN_STATE_FILE="$work/machine-owned"
+    write_shutdown_marker "$SHUTDOWN_STATE_FILE" trafficcop-lite-machine-12345678
+    pending=true
+    wall_message='TrafficCop-Lite[trafficcop-lite-machine-12345678] owned task'
+    cancel_owned_shutdown >/dev/null || return 1
+    [ "$cancel_count" -eq 2 ] || return 1
+    assert_absent "$SHUTDOWN_STATE_FILE" || return 1
+
+    SHUTDOWN_STATE_FILE="$work/machine-foreign"
+    write_shutdown_marker "$SHUTDOWN_STATE_FILE" trafficcop-lite-machine-87654321
+    pending=true
+    wall_message='external maintenance shutdown'
+    if cancel_owned_shutdown >/dev/null; then
+        return 1
+    fi
+    [ "$cancel_count" -eq 2 ] || return 1
+    [ -f "$SHUTDOWN_STATE_FILE" ] || return 1
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" lite_shutdown_task_token_from_state || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" lite_pending_shutdown_matches_owned_state || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" cancel_shutdown_interactive || return 1
+    SHUTDOWN_STATE_FILE="$work/main-owned"
+    write_shutdown_marker "$SHUTDOWN_STATE_FILE" trafficcop-lite-main-12345678
+    pending=true
+    wall_message='TrafficCop-Lite[trafficcop-lite-main-12345678] owned task'
+    cancel_shutdown_interactive >/dev/null || return 1
+    [ "$cancel_count" -eq 3 ] || return 1
+    assert_absent "$SHUTDOWN_STATE_FILE" || return 1
+
+    SHUTDOWN_STATE_FILE="$work/main-foreign"
+    write_shutdown_marker "$SHUTDOWN_STATE_FILE" trafficcop-lite-main-87654321
+    pending=true
+    wall_message='external maintenance shutdown'
+    if cancel_shutdown_interactive >/dev/null; then
+        return 1
+    fi
+    [ "$cancel_count" -eq 3 ] || return 1
+    [ -f "$SHUTDOWN_STATE_FILE" ]
+}
+
 mock_bc() {
     local expression
     expression=$(cat)
@@ -229,6 +327,36 @@ test_dependency_check_rejects_missing_tc_after_install() {
     assert_absent "$work/service" || return 1
     assert_absent "$work/vnstat" || return 1
     grep -Fq '安装后仍缺少命令：tc' "$LOG_FILE"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_cron_service_start_failure_propagates_to_dependency_check() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/cron-service-failure.XXXXXX") || return 1
+    LOG_FILE="$work/log"
+
+    load_function "$MONITOR_SCRIPT" ensure_service_running || return 1
+    command_exists() { [ "$1" = systemctl ]; }
+    systemctl() {
+        if [ "${1:-}" = list-unit-files ]; then
+            printf '%s\n' 'cron.service enabled'
+        fi
+    }
+    run_privileged() { return 42; }
+    if ensure_service_running cron cron > "$work/output"; then
+        return 1
+    fi
+    grep -Fq '无法自动确认 cron 服务状态' "$work/output" || return 1
+
+    load_function "$MONITOR_SCRIPT" check_and_install_packages || return 1
+    find_tc_bin() { printf '%s\n' /sbin/tc; }
+    required_command_available() { return 0; }
+    ensure_service_running() { return 1; }
+    ensure_vnstat_daemon_running() { printf '%s\n' unexpected > "$work/vnstat"; }
+    if check_and_install_packages >/dev/null; then
+        return 1
+    fi
+    assert_absent "$work/vnstat"
 }
 
 # initial_config 的文件事务由下方定向测试单独覆盖；这些旧用例只隔离验证配置文件回滚语义。
@@ -1242,7 +1370,7 @@ test_config_rollback_compensates_live_tc_and_shutdown() {
     printf '%s\n' old-config > "$config_backup"
     printf '%s\n' old-enforcement > "$enforcement_backup"
     printf '%s\n' old-tc-state > "$tc_backup"
-    printf '%s\n' old-shutdown-state > "$shutdown_backup"
+    printf '%s\n' 'TASK_TOKEN=trafficcop-lite-rollback-12345678' > "$shutdown_backup"
     printf '%s\n' new-config > "$CONFIG_FILE"
     printf '%s\n' new-enforcement > "$ENFORCEMENT_STATE_FILE"
 
@@ -1270,7 +1398,16 @@ test_config_rollback_compensates_live_tc_and_shutdown() {
         printf '%s\n' applied > "$work/tc-applied"
     }
     has_pending_shutdown() { [ "$pending" = true ]; }
-    shutdown() { pending=true; printf '%s\n' submitted > "$work/shutdown-submitted"; }
+    local submitted_message=''
+    shutdown_task_token_from_state() { printf '%s\n' trafficcop-lite-rollback-12345678; }
+    pending_shutdown_matches_owned_state() {
+        [ "$pending" = true ] && [[ "$submitted_message" == *trafficcop-lite-rollback-12345678* ]]
+    }
+    shutdown() {
+        submitted_message="$*"
+        pending=true
+        printf '%s\n' submitted > "$work/shutdown-submitted"
+    }
     rollback_initial_vnstat_transaction() { return 0; }
     read_config() { return 0; }
 
@@ -1280,6 +1417,7 @@ test_config_rollback_compensates_live_tc_and_shutdown() {
     assert_file_content old-enforcement "$ENFORCEMENT_STATE_FILE" || return 1
     assert_file_content applied "$work/tc-applied" || return 1
     assert_file_content submitted "$work/shutdown-submitted" || return 1
+    [[ "$submitted_message" == *trafficcop-lite-rollback-12345678* ]] || return 1
     [ "$MAIN_INTERFACE" = ens5 ] || return 1
     assert_absent "$config_backup" || return 1
     assert_absent "$tc_backup"
@@ -1470,6 +1608,95 @@ test_tc_clear_query_failure_preserves_rules_and_state() {
     fi
     assert_file_content state "$TC_STATE_FILE" || return 1
     assert_absent "$work/tc-called"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_tc_existing_htb_rollback_requires_default_class_delete() {
+    local work lock_held=false
+    work=$(mktemp -d "$TEST_ROOT/tc-rollback-delete.XXXXXX") || return 1
+    TC_STATE_FILE="$work/tc-state"
+    LOG_FILE="$work/log"
+    MAIN_INTERFACE=eth0
+    TC_BIN=mock_tc
+
+    load_function "$MONITOR_SCRIPT" apply_tc_limit || return 1
+    acquire_tc_hierarchy_lock() { lock_held=true; }
+    release_tc_hierarchy_lock() { lock_held=false; }
+    tc_state_interface() { return 1; }
+    tc_root_qdisc() { printf '%s\n' 'qdisc htb 1: root default 30'; }
+    tc_root_is_unified_compatible() { return 0; }
+    tc_state_is_unified_for_interface() { return 1; }
+    tc_class_value() {
+        case "$2:$3" in
+            1:1:rate|1:1:ceil) printf '%s\n' 100gbit ;;
+            *) return 1 ;;
+        esac
+    }
+    normalize_tc_rate_to_bps() { printf '%s\n' 100000000000; }
+    tc_class_line() { [ "$2" = 1:30 ] && return 1; return 2; }
+    write_tc_state() { printf '%s\n' prepared > "$4"; }
+    tc_replace_base_classes() { return 0; }
+    tc_verify_unified_hierarchy() { return 1; }
+    mock_tc() {
+        printf '%s\n' "$*" >> "$work/tc-calls"
+        case "$*" in
+            'class replace dev eth0 parent 1: classid 1:1 '*) return 0 ;;
+            'class del dev eth0 classid 1:30') return 55 ;;
+            *) return 0 ;;
+        esac
+    }
+
+    if apply_tc_limit 900 > "$work/output" 2>&1; then
+        return 1
+    fi
+    grep -Fxq 'class del dev eth0 classid 1:30' "$work/tc-calls" || return 1
+    grep -Fq '严重错误：统一 HTB 回滚失败' "$work/output" || return 1
+    if grep -Fq '已恢复修改前的 TC 状态' "$work/output"; then
+        return 1
+    fi
+    [ -f "${TC_STATE_FILE}.prepared.$$" ] || return 1
+    [ "$lock_held" = false ]
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_tc_default_qdisc_state_delete_failure_is_reported() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/tc-state-delete.XXXXXX") || return 1
+    TC_STATE_FILE="$work/tc-state"
+    LOG_FILE="$work/log"
+    TC_STATE_SCHEMA=traffic-tools-unified-htb-v1
+    TC_STATE_PROVIDER=trafficcop-lite
+    TC_BIN=mock_tc
+    printf '%s\n' state > "$TC_STATE_FILE"
+
+    load_function "$MONITOR_SCRIPT" clear_owned_tc_rules_locked || return 1
+    tc_state_interface() { printf '%s\n' eth0; }
+    tc_root_qdisc() { printf '%s\n' 'qdisc fq_codel 0: root'; }
+    tc_state_value() {
+        case "$1" in
+            LIMIT_SPEED) printf '%s\n' 900 ;;
+            SCHEMA) printf '%s\n' "$TC_STATE_SCHEMA" ;;
+            PROVIDER) printf '%s\n' "$TC_STATE_PROVIDER" ;;
+        esac
+    }
+    is_default_qdisc_line() { return 0; }
+    rm() {
+        local last_arg="${!#}"
+        if [ "$last_arg" = "$TC_STATE_FILE" ]; then
+            return 55
+        fi
+        command rm "$@"
+    }
+    mock_tc() { return 0; }
+
+    if clear_owned_tc_rules_locked audit > "$work/output" 2>&1; then
+        return 1
+    fi
+    assert_file_content state "$TC_STATE_FILE" || return 1
+    grep -Fq '状态文件删除失败' "$work/output" || return 1
+    if grep -Fq '仅清理本脚本状态' "$work/output"; then
+        return 1
+    fi
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
@@ -1729,8 +1956,8 @@ test_monitor_crontab_update_holds_project_lock() {
     }
     crontab() {
         [ "$lock_held" = "true" ] || return 1
-        [ "$1" = "-" ] || return 1
-        cat > "$work/crontab"
+        [ -f "$1" ] || return 1
+        cat "$1" > "$work/crontab"
     }
 
     setup_crontab >/dev/null || return 1
@@ -1744,6 +1971,54 @@ test_monitor_crontab_update_holds_project_lock() {
         [ "$(grep -c 'crontab -l' "$ROOT_DIR/$script")" -eq 1 ] || return 1
     done
     grep -Fq '/run/lock/traffic-tools-tc.lock' "$MONITOR_SCRIPT"
+}
+
+# shellcheck disable=SC2016,SC2034,SC2209,SC2317,SC2329
+test_all_crontab_writers_build_candidates_before_installing() {
+    local work lock_held=false
+    work=$(mktemp -d "$TEST_ROOT/root-cron-candidate.XXXXXX") || return 1
+    LOG_FILE="$work/log"
+    RED=''
+    NC=''
+
+    load_function "$MONITOR_SCRIPT" setup_crontab || return 1
+    load_function "$TELEGRAM_SCRIPT" setup_cron || return 1
+    load_function "$TELEGRAM_SCRIPT" remove_telegram_cron || return 1
+    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" add_cron_job || return 1
+    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" remove_cron_job || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" remove_lite_cron || return 1
+
+    SCRIPT_PATH=/etc/trafficcop-lite/component.sh
+    CRON_COMMENT='# TrafficCop-Lite Machine Limit'
+    WORK_DIR=/etc/trafficcop-lite
+    MONITOR_SCRIPT=trafficcop-lite-monitor.sh
+    TELEGRAM_SCRIPT=trafficcop-lite-telegram.sh
+    acquire_root_crontab_lock() { lock_held=true; }
+    release_root_crontab_lock() { lock_held=false; }
+    read_current_crontab() {
+        [ "$lock_held" = true ] || return 1
+        printf '%s\n' \
+            '17 3 * * * /usr/local/bin/unrelated-backup' \
+            '23 4 * * * /usr/local/bin/another-job'
+    }
+    awk() { return 55; }
+    crontab() { printf '%s\n' "$*" > "$work/crontab-called"; }
+    expect_candidate_failure_without_install() {
+        lock_held=false
+        rm -f "$work/crontab-called"
+        if "$1" >/dev/null 2>&1; then
+            return 1
+        fi
+        [ "$lock_held" = false ] || return 1
+        assert_absent "$work/crontab-called"
+    }
+
+    expect_candidate_failure_without_install setup_crontab || return 1
+    expect_candidate_failure_without_install setup_cron || return 1
+    expect_candidate_failure_without_install remove_telegram_cron || return 1
+    expect_candidate_failure_without_install add_cron_job || return 1
+    expect_candidate_failure_without_install remove_cron_job || return 1
+    expect_candidate_failure_without_install remove_lite_cron
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
@@ -2074,6 +2349,42 @@ test_invalid_limit_speed_is_rejected() {
     unset LIMIT_SPEED
     validate_config >/dev/null || return 1
     [ "$LIMIT_SPEED" = '20' ]
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_invalid_disabled_value_is_rejected() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/invalid-disabled.XXXXXX") || return 1
+    LOG_FILE="$work/log"
+    TRAFFIC_MODE=total
+    TRAFFIC_PERIOD=monthly
+    TRAFFIC_LIMIT=100
+    TRAFFIC_TOLERANCE=0
+    TRAFFIC_UNIT=decimal
+    PERIOD_START_DAY=1
+    PERIOD_START_MONTH=1
+    LIMIT_SPEED=20
+    TC_BOOT_GRACE_MINUTES=10
+    ALLOW_PARTIAL_HISTORY=false
+    MAIN_INTERFACE=eth0
+    LIMIT_MODE=tc
+    VNSTAT_MAX_BANDWIDTH=0
+
+    load_function "$MONITOR_SCRIPT" vnstat_max_bandwidth_valid || return 1
+    load_function "$MONITOR_SCRIPT" is_decimal || return 1
+    load_function "$MONITOR_SCRIPT" compare_decimal || return 1
+    load_function "$MONITOR_SCRIPT" validate_config || return 1
+    command_exists() { return 1; }
+
+    DISABLED=garbage
+    if validate_config >/dev/null; then
+        return 1
+    fi
+    [ "$DISABLED" = garbage ] || return 1
+    DISABLED=false
+    validate_config >/dev/null || return 1
+    DISABLED=true
+    validate_config >/dev/null
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
@@ -3292,8 +3603,10 @@ run_test 'period reset cancels owned shutdown' test_period_reset_cancels_owned_s
 run_test 'period reset aborts safely on cancellation failure' test_period_reset_stops_when_shutdown_cancel_fails
 run_test 'shutdown cleanup respects boot ownership' test_shutdown_cleanup_respects_boot_ownership
 run_test 'shutdown cleanup blocks unverifiable pending task' test_shutdown_cleanup_blocks_unverifiable_pending_task
+run_test 'shutdown cleanup requires exact task identity in every entrypoint' test_shutdown_cleanup_requires_exact_task_identity_in_all_entrypoints
 run_test 'tc dependency maps to the platform iproute package' test_tc_dependency_package_mapping
 run_test 'dependency check rejects tc still missing after install' test_dependency_check_rejects_missing_tc_after_install
+run_test 'cron service start failures propagate to dependency setup' test_cron_service_start_failure_propagates_to_dependency_check
 run_test 'monitor config restores previous state' test_monitor_config_restores_previous_state
 run_test 'monitor first config is removed after post-save failure' test_monitor_config_removes_failed_first_config
 run_test 'monitor config rolls back when writer reports failure' test_monitor_config_rolls_back_when_writer_reports_failure
@@ -3334,6 +3647,8 @@ run_test 'TC changes require a prepared ownership state' test_tc_change_requires
 run_test 'TC query helpers preserve command errors' test_tc_query_helpers_preserve_command_errors
 run_test 'TC apply query failure performs zero mutation' test_tc_apply_query_failure_is_zero_mutation
 run_test 'TC clear query failure preserves rules and state' test_tc_clear_query_failure_preserves_rules_and_state
+run_test 'TC rollback requires removal of a newly added default class' test_tc_existing_htb_rollback_requires_default_class_delete
+run_test 'TC state deletion failures are reported for a default qdisc' test_tc_default_qdisc_state_delete_failure_is_reported
 run_test 'TC recovery query failure performs zero mutation' test_tc_recovery_query_failure_is_zero_mutation
 run_test 'TC self-check reports query errors' test_tc_self_check_reports_query_error
 run_test 'TC builds the unified HTB directly without invoking Dog' test_tc_builds_unified_htb_directly
@@ -3356,6 +3671,7 @@ run_test 'legacy TBF adoption requires a matching numeric speed' test_legacy_tbf
 run_test 'invalid Dog config cannot authorize HTB adoption' test_invalid_dog_config_cannot_authorize_adoption
 run_test 'unified HTB verification requires the full root and class contract' test_unified_hierarchy_verification_requires_full_contract
 run_test 'root crontab updates hold the TrafficCop project lock' test_monitor_crontab_update_holds_project_lock
+run_test 'all root crontab writers validate candidates before installation' test_all_crontab_writers_build_candidates_before_installing
 run_test 'shutdown scheduling requires a prepared ownership state' test_shutdown_requires_prepared_state
 run_test 'Telegram config does not reuse stale secrets' test_telegram_config_does_not_reuse_stale_secret
 run_test 'Telegram legacy config is parsed without execution' test_telegram_legacy_config_is_parsed_without_execution
@@ -3367,6 +3683,7 @@ run_test 'local component copy failures are reported' test_local_component_copy_
 run_test 'period date boundaries remain correct' test_period_date_boundaries
 run_test 'traffic accounting modes remain correct' test_traffic_accounting_modes
 run_test 'invalid limit speed is rejected while missing values stay compatible' test_invalid_limit_speed_is_rejected
+run_test 'invalid disabled values are rejected' test_invalid_disabled_value_is_rejected
 run_test 'explicit invalid period start days are rejected while missing defaults to one' test_period_start_day_validation_rejects_explicit_invalid_values
 run_test 'dashboard rejects an invalid period start day before calculation' test_dashboard_rejects_invalid_period_start_day_before_calculation
 run_test 'main disabled enforcement status overrides stale transient state' test_main_disabled_enforcement_status_has_highest_priority

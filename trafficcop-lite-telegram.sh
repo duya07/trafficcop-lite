@@ -22,7 +22,7 @@ TG_LOCK_FILE="$WORK_DIR/tg_notifier.lock"
 ROOT_CRONTAB_LOCK_FILE="${TRAFFICCOP_ROOT_CRONTAB_LOCK_FILE:-$WORK_DIR/root-crontab.lock}"
 CRON_LOG_MAX_LINES="${CRON_LOG_MAX_LINES:-2000}"
 TG_DEBUG="${TG_DEBUG:-false}"
-SCRIPT_VERSION="1.1.3"
+SCRIPT_VERSION="1.1.4"
 
 # 此函数只由 EXIT trap 调用，ShellCheck 无法沿字符串形式的 trap 识别调用关系。
 # shellcheck disable=SC2317,SC2329
@@ -659,7 +659,7 @@ check_and_notify() {
 # 设置定时任务
 setup_cron() {
     local correct_entry="* * * * * $SCRIPT_PATH -cron >/dev/null 2>&1 # TrafficCop-Lite Telegram"
-    local current_crontab new_crontab
+    local current_crontab crontab_tmp
 
     if ! acquire_root_crontab_lock; then
         echo "无法取得 TrafficCop-Lite crontab 锁，未修改定时任务。"
@@ -670,13 +670,28 @@ setup_cron() {
         release_root_crontab_lock
         return 1
     fi
-    new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
-
-    if ! { printf '%s\n' "$new_crontab"; printf '%s\n' "$correct_entry"; } | sed '/^[[:space:]]*$/d' | crontab -; then
+    if ! crontab_tmp="$(mktemp)"; then
+        echo "无法创建 crontab 临时文件，未修改定时任务。"
+        release_root_crontab_lock
+        return 1
+    fi
+    chmod 600 "$crontab_tmp" 2>/dev/null || true
+    if ! awk -v script="$SCRIPT_PATH" '
+        index($0, script) == 0 && $0 !~ /^[[:space:]]*$/ { print }
+    ' <<< "$current_crontab" > "$crontab_tmp" \
+        || ! printf '%s\n' "$correct_entry" >> "$crontab_tmp"; then
+        rm -f "$crontab_tmp"
+        echo "生成 Telegram crontab 候选内容失败，未修改定时任务。"
+        release_root_crontab_lock
+        return 1
+    fi
+    if ! crontab "$crontab_tmp"; then
+        rm -f "$crontab_tmp"
         echo "更新 Telegram crontab 失败。"
         release_root_crontab_lock
         return 1
     fi
+    rm -f "$crontab_tmp"
     release_root_crontab_lock
     echo "已清理旧条目并设置唯一的 Telegram 每分钟任务。"
 
@@ -686,7 +701,7 @@ setup_cron() {
 }
 
 remove_telegram_cron() {
-    local current_crontab new_crontab
+    local current_crontab crontab_tmp
 
     if ! acquire_root_crontab_lock; then
         echo "无法取得 TrafficCop-Lite crontab 锁，未修改定时任务。"
@@ -697,12 +712,27 @@ remove_telegram_cron() {
         release_root_crontab_lock
         return 1
     fi
-    new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
-    if ! printf '%s\n' "$new_crontab" | sed '/^[[:space:]]*$/d' | crontab -; then
+    if ! crontab_tmp="$(mktemp)"; then
+        echo "无法创建 crontab 临时文件，未修改定时任务。"
+        release_root_crontab_lock
+        return 1
+    fi
+    chmod 600 "$crontab_tmp" 2>/dev/null || true
+    if ! awk -v script="$SCRIPT_PATH" '
+        index($0, script) == 0 && $0 !~ /^[[:space:]]*$/ { print }
+    ' <<< "$current_crontab" > "$crontab_tmp"; then
+        rm -f "$crontab_tmp"
+        echo "生成 Telegram crontab 候选内容失败，未修改定时任务。"
+        release_root_crontab_lock
+        return 1
+    fi
+    if ! crontab "$crontab_tmp"; then
+        rm -f "$crontab_tmp"
         echo "移除 Telegram crontab 失败。"
         release_root_crontab_lock
         return 1
     fi
+    rm -f "$crontab_tmp"
     release_root_crontab_lock
     echo "已移除 TrafficCop-Lite Telegram 自动通知任务。"
 }

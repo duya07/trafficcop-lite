@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.1.10"
-LAST_UPDATE="2026-08-29"
+SCRIPT_VERSION="1.1.11"
+LAST_UPDATE="2026-08-30"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
@@ -1623,7 +1623,7 @@ view_config() {
 }
 
 remove_lite_cron() {
-    local current_crontab filtered_crontab
+    local current_crontab crontab_tmp
     if ! acquire_root_crontab_lock; then
         echo -e "${RED}无法取得 TrafficCop-Lite crontab 锁，未作修改。${NC}"
         return 1
@@ -1633,14 +1633,27 @@ remove_lite_cron() {
         return 1
     fi
     if [ -n "$current_crontab" ]; then
-        filtered_crontab="$(printf '%s\n' "$current_crontab" \
-            | grep -v -F "$WORK_DIR/$MONITOR_SCRIPT" \
-            | grep -v -F "$WORK_DIR/$TELEGRAM_SCRIPT" || true)"
-        if ! printf '%s\n' "$filtered_crontab" | crontab - 2>/dev/null; then
+        if ! crontab_tmp="$(mktemp)"; then
+            echo -e "${RED}无法创建 crontab 临时文件，未作修改。${NC}"
+            release_root_crontab_lock
+            return 1
+        fi
+        chmod 600 "$crontab_tmp" 2>/dev/null || true
+        if ! awk -v monitor="$WORK_DIR/$MONITOR_SCRIPT" -v telegram="$WORK_DIR/$TELEGRAM_SCRIPT" '
+            index($0, monitor) == 0 && index($0, telegram) == 0 { print }
+        ' <<< "$current_crontab" > "$crontab_tmp"; then
+            rm -f "$crontab_tmp"
+            echo -e "${RED}生成 crontab 候选内容失败，未作修改。${NC}"
+            release_root_crontab_lock
+            return 1
+        fi
+        if ! crontab "$crontab_tmp" 2>/dev/null; then
+            rm -f "$crontab_tmp"
             echo -e "${RED}移除独立版 crontab 条目失败，已保留安装目录。${NC}"
             release_root_crontab_lock
             return 1
         fi
+        rm -f "$crontab_tmp"
     fi
     release_root_crontab_lock
     return 0
@@ -1700,6 +1713,32 @@ lite_has_pending_shutdown() {
     fi
 }
 
+lite_shutdown_task_token_from_state() {
+    local task_token
+    task_token=$(grep '^TASK_TOKEN=' "$SHUTDOWN_STATE_FILE" 2>/dev/null |
+        tail -n 1 | cut -d'=' -f2-)
+    [[ "$task_token" =~ ^trafficcop-lite-[0-9A-Za-z-]{8,80}$ ]] || return 1
+    printf '%s\n' "$task_token"
+}
+
+lite_pending_shutdown_matches_owned_state() {
+    local task_token wall_state
+    lite_has_pending_shutdown || return 1
+    task_token=$(lite_shutdown_task_token_from_state) || return 1
+    if command -v busctl >/dev/null 2>&1; then
+        wall_state=$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
+            org.freedesktop.login1.Manager WallMessage 2>/dev/null || true)
+        if [ -n "$wall_state" ] && grep -Fq "$task_token" <<< "$wall_state"; then
+            return 0
+        fi
+    fi
+    if [ -r /run/systemd/shutdown/scheduled ] &&
+       grep -Fq "$task_token" /run/systemd/shutdown/scheduled 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
 cancel_shutdown_interactive() {
     local config="$WORK_DIR/traffic_monitor_config.txt"
     local state_boot current_boot
@@ -1716,9 +1755,15 @@ cancel_shutdown_interactive() {
             echo -e "${RED}无法确认计划关机是否属于本脚本，已保留系统任务和状态文件。${NC}"
             return 1
         fi
-        if lite_has_pending_shutdown && ! shutdown -c 2>/dev/null; then
-            echo -e "${RED}无法取消本脚本记录的计划关机，已保留状态文件。${NC}"
-            return 1
+        if lite_has_pending_shutdown; then
+            if ! lite_pending_shutdown_matches_owned_state; then
+                echo -e "${RED}当前计划关机无法与本脚本任务标识匹配，已保留系统任务和状态文件。${NC}"
+                return 1
+            fi
+            if ! shutdown -c 2>/dev/null || lite_has_pending_shutdown; then
+                echo -e "${RED}无法取消本脚本记录的计划关机，已保留状态文件。${NC}"
+                return 1
+            fi
         fi
         rm -f "$SHUTDOWN_STATE_FILE" || return 1
         echo "✓ 已取消本脚本记录的计划关机"

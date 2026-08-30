@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# TrafficCop 机器限速管理脚本 v2.8
+# TrafficCop 机器限速管理脚本 v2.9
 # 提供完整的启用/禁用/恢复机器限速功能
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -115,6 +115,32 @@ has_pending_shutdown() {
     fi
 }
 
+shutdown_task_token_from_state() {
+    local task_token
+    task_token=$(grep '^TASK_TOKEN=' "$SHUTDOWN_STATE_FILE" 2>/dev/null |
+        tail -n 1 | cut -d'=' -f2-)
+    [[ "$task_token" =~ ^trafficcop-lite-[0-9A-Za-z-]{8,80}$ ]] || return 1
+    printf '%s\n' "$task_token"
+}
+
+pending_shutdown_matches_owned_state() {
+    local task_token wall_state
+    has_pending_shutdown || return 1
+    task_token=$(shutdown_task_token_from_state) || return 1
+    if command -v busctl >/dev/null 2>&1; then
+        wall_state=$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
+            org.freedesktop.login1.Manager WallMessage 2>/dev/null || true)
+        if [ -n "$wall_state" ] && grep -Fq "$task_token" <<< "$wall_state"; then
+            return 0
+        fi
+    fi
+    if [ -r /run/systemd/shutdown/scheduled ] &&
+       grep -Fq "$task_token" /run/systemd/shutdown/scheduled 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
 write_enforcement_state_file() {
     local mode="$1"
     local until_epoch="$2"
@@ -151,9 +177,15 @@ cancel_owned_shutdown() {
             echo "✗ 无法确认计划关机是否属于本脚本，已保留系统任务和状态文件"
             return 1
         fi
-        if has_pending_shutdown && ! shutdown -c 2>/dev/null; then
-            echo "✗ 无法取消本脚本记录的计划关机，已保留状态文件"
-            return 1
+        if has_pending_shutdown; then
+            if ! pending_shutdown_matches_owned_state; then
+                echo "✗ 当前计划关机无法与本脚本任务标识匹配，已保留系统任务和状态文件"
+                return 1
+            fi
+            if ! shutdown -c 2>/dev/null || has_pending_shutdown; then
+                echo "✗ 无法取消本脚本记录的计划关机，已保留状态文件"
+                return 1
+            fi
         fi
         rm -f "$SHUTDOWN_STATE_FILE" || return 1
         echo "✓ 已取消本脚本记录的计划关机"
@@ -270,7 +302,7 @@ clear_tc_rules_with_lock() {
 
 # 移除定时任务
 remove_cron_job() {
-    local current_crontab new_crontab
+    local current_crontab crontab_tmp
 
     echo "移除定时任务..."
 
@@ -283,12 +315,26 @@ remove_cron_job() {
         release_root_crontab_lock
         return 1
     fi
-    new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
-    if ! printf '%s\n' "$new_crontab" | crontab - 2>/dev/null; then
+    if ! crontab_tmp="$(mktemp)"; then
+        echo "✗ 无法创建 crontab 临时文件，未作修改"
+        release_root_crontab_lock
+        return 1
+    fi
+    chmod 600 "$crontab_tmp" 2>/dev/null || true
+    if ! awk -v script="$SCRIPT_PATH" 'index($0, script) == 0 { print }' \
+        <<< "$current_crontab" > "$crontab_tmp"; then
+        rm -f "$crontab_tmp"
+        echo "✗ 生成 crontab 候选内容失败，未作修改"
+        release_root_crontab_lock
+        return 1
+    fi
+    if ! crontab "$crontab_tmp" 2>/dev/null; then
+        rm -f "$crontab_tmp"
         echo "✗ 定时任务移除失败"
         release_root_crontab_lock
         return 1
     fi
+    rm -f "$crontab_tmp"
 
     release_root_crontab_lock
     echo "✓ 定时任务已移除"
@@ -296,7 +342,7 @@ remove_cron_job() {
 
 # 添加定时任务
 add_cron_job() {
-    local current_crontab new_crontab cron_entry
+    local current_crontab cron_entry crontab_tmp
 
     echo "添加定时任务..."
 
@@ -309,13 +355,29 @@ add_cron_job() {
         release_root_crontab_lock
         return 1
     fi
-    new_crontab="$(printf '%s\n' "$current_crontab" | grep -v -F "$SCRIPT_PATH" || true)"
     cron_entry="* * * * * $SCRIPT_PATH --run >/dev/null 2>&1 $CRON_COMMENT"
-    if ! { printf '%s\n' "$new_crontab"; printf '%s\n' "$cron_entry"; } | sed '/^[[:space:]]*$/d' | crontab -; then
+    if ! crontab_tmp="$(mktemp)"; then
+        echo "✗ 无法创建 crontab 临时文件，未作修改"
+        release_root_crontab_lock
+        return 1
+    fi
+    chmod 600 "$crontab_tmp" 2>/dev/null || true
+    if ! awk -v script="$SCRIPT_PATH" '
+        index($0, script) == 0 && $0 !~ /^[[:space:]]*$/ { print }
+    ' <<< "$current_crontab" > "$crontab_tmp" \
+        || ! printf '%s\n' "$cron_entry" >> "$crontab_tmp"; then
+        rm -f "$crontab_tmp"
+        echo "✗ 生成 crontab 候选内容失败，未作修改"
+        release_root_crontab_lock
+        return 1
+    fi
+    if ! crontab "$crontab_tmp"; then
+        rm -f "$crontab_tmp"
         echo "✗ 定时任务添加失败"
         release_root_crontab_lock
         return 1
     fi
+    rm -f "$crontab_tmp"
 
     release_root_crontab_lock
     echo "✓ 定时任务已添加"

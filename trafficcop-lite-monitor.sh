@@ -2861,13 +2861,21 @@ dog_configured_class_records() {
         tc_rate=$(dog_bandwidth_to_tc "$rate") || return 1
         if ! [[ "$class_id" =~ ^1:([0-9a-fA-F]+)$ ]]; then
             if [[ "$port" =~ ^[0-9]+$ ]]; then
-                class_id=$(printf '1:%x' "$((0x1000 + port))")
+                # 与 Dog generate_tc_minor_base 一致：0x1000+port 越界时使用散列回退。
+                minor=$((0x1000 + port))
+                if [ "$minor" -lt 2 ] || [ "$minor" -gt 65535 ]; then
+                    minor=$((2 + (((port * 1103515245 + 12345) & 0x7fffffff) % 65534)))
+                fi
+                class_id=$(printf '1:%x' "$minor")
             elif [[ "$port" =~ ^([0-9]+)-([0-9]+)$ ]]; then
                 start_port="${BASH_REMATCH[1]}"
                 end_port="${BASH_REMATCH[2]}"
                 generated_mark=$(((start_port * 1000 + end_port) % 65536))
                 minor=$((0x2000 + generated_mark))
-                [ "$minor" -le 65535 ] || return 1
+                if [ "$minor" -lt 2 ] || [ "$minor" -gt 65535 ]; then
+                    # 与 Dog generate_tc_minor_base 一致：越界时使用 0x8000+(mark%0x7fff)。
+                    minor=$((0x8000 + (generated_mark % 0x7fff)))
+                fi
                 class_id=$(printf '1:%x' "$minor")
             else
                 return 1

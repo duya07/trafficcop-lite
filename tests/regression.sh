@@ -1969,6 +1969,35 @@ JSON
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_dog_class_id_fallback_matches_dog_derivation() {
+    local work records
+    work=$(mktemp -d "$TEST_ROOT/dog-class-fallback.XXXXXX") || return 1
+    DOG_CONFIG_FILE="$work/config.json"
+    cat > "$DOG_CONFIG_FILE" <<'JSON'
+{"ports":{
+  "61439":{"enabled":true,"bandwidth_limit":{"enabled":true,"rate":"10Mbps","mark_id":1342177281}},
+  "61440":{"enabled":true,"bandwidth_limit":{"enabled":true,"rate":"10Mbps","mark_id":1342177282}},
+  "1-56343":{"enabled":true,"bandwidth_limit":{"enabled":true,"rate":"10Mbps","mark_id":1342177283}},
+  "1-56344":{"enabled":true,"bandwidth_limit":{"enabled":true,"rate":"10Mbps","mark_id":1342177284}}
+}}
+JSON
+
+    load_function "$MONITOR_SCRIPT" dog_configured_class_records || return 1
+    dog_bandwidth_to_tc() { printf '%s\n' '10mbit'; }
+    records=$(dog_configured_class_records) || return 1
+    # 单端口：0x1000+port 仍在 2..65535 时保持原值（61439 -> 0xffff）；
+    # 越界时必须回退到 Dog 的散列公式 2+((port*1103515245+12345)&0x7fffffff)%65534
+    # （61440 -> 13129 -> 0x3349），否则 NTC 会把合法的 Dog 类误报为漂移。
+    grep -q $'^61439\t1:ffff\t10mbit\t' <<< "$records" || return 1
+    grep -q $'^61440\t1:3349\t10mbit\t' <<< "$records" || return 1
+    # 端口段：0x2000+mark 越界时必须回退到 0x8000+(mark%0x7fff)；
+    # mark=(start*1000+end)%65536，57343 是最后一个仍可用的边界（-> 0xffff），
+    # 57344 起必须回退（1-56344 -> 57345 -> 0xe001）。
+    grep -q $'^1-56343\t1:ffff\t10mbit\t' <<< "$records" || return 1
+    grep -q $'^1-56344\t1:e001\t10mbit\t' <<< "$records" || return 1
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
 test_unified_hierarchy_verification_requires_full_contract() {
     TC_DEFAULT_CLASS_RATE='1kbit'
     DOG_CONFIG_FILE="$TEST_ROOT/nonexistent-dog-config"
@@ -4109,6 +4138,7 @@ run_test 'TC recovery unit ownership and disable failures are fail-closed' test_
 run_test 'legacy TBF adoption requires a matching numeric speed' test_legacy_tbf_requires_matching_numeric_speed
 run_test 'invalid Dog config cannot authorize HTB adoption' test_invalid_dog_config_cannot_authorize_adoption
 run_test 'Dog config parsing preserves empty runtime ID fields' test_dog_config_parser_preserves_empty_runtime_ids
+run_test 'Dog class id fallback matches the Dog derivation' test_dog_class_id_fallback_matches_dog_derivation
 run_test 'unified HTB verification requires the full root and class contract' test_unified_hierarchy_verification_requires_full_contract
 run_test 'new HTB base verification skips only pending Dog consumers' test_unified_hierarchy_base_verification_skips_pending_dog_consumers
 run_test 'root crontab updates hold the TrafficCop project lock' test_monitor_crontab_update_holds_project_lock

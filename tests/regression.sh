@@ -1998,6 +1998,36 @@ JSON
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_vnstat_showconfig_prefers_effective_value() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/vnstat-showconfig.XXXXXX") || return 1
+
+    load_function "$MONITOR_SCRIPT" vnstat_config_value_from_file || return 1
+    load_function "$MONITOR_SCRIPT" vnstat_config_value || return 1
+    load_function "$MONITOR_SCRIPT" vnstat_cmd || return 1
+
+    # 真机 vnstat 2.10/2.13 的 --showconfig 会先打印注释默认值，再打印配置文件里的
+    # 生效值（例如 "#MaxBWeth0 8" 在 "MaxBWeth0 100" 之前）。取首个匹配会把默认值
+    # 当成生效值，导致 MaxBW 候选校验在生产机上必然失败、初始配置事务无法提交。
+    vnstat() {
+        cat <<'OUT'
+#MaxBWeth0 8
+MaxBWeth0 100
+;UpdateInterval 20
+DailyDays      400
+OUT
+    }
+    [ "$(vnstat_config_value_from_file "$work/fake.conf" MaxBWeth0)" = "100" ] || return 1
+    [ "$(vnstat_config_value MaxBWeth0)" = "100" ] || return 1
+    [ "$(vnstat_config_value_from_file "$work/fake.conf" DailyDays)" = "400" ] || return 1
+
+    # 未配置的选项只有注释默认值：必须继续返回该默认值，不能变成空。
+    vnstat() { printf '%s\n' '#MaxBWeth0 8'; }
+    [ "$(vnstat_config_value MaxBWeth0)" = "8" ] || return 1
+    [ "$(vnstat_config_value_from_file "$work/fake.conf" MaxBWeth0)" = "8" ] || return 1
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
 test_unified_hierarchy_verification_requires_full_contract() {
     TC_DEFAULT_CLASS_RATE='1kbit'
     DOG_CONFIG_FILE="$TEST_ROOT/nonexistent-dog-config"
@@ -4139,6 +4169,7 @@ run_test 'legacy TBF adoption requires a matching numeric speed' test_legacy_tbf
 run_test 'invalid Dog config cannot authorize HTB adoption' test_invalid_dog_config_cannot_authorize_adoption
 run_test 'Dog config parsing preserves empty runtime ID fields' test_dog_config_parser_preserves_empty_runtime_ids
 run_test 'Dog class id fallback matches the Dog derivation' test_dog_class_id_fallback_matches_dog_derivation
+run_test 'vnStat showconfig prefers the effective value' test_vnstat_showconfig_prefers_effective_value
 run_test 'unified HTB verification requires the full root and class contract' test_unified_hierarchy_verification_requires_full_contract
 run_test 'new HTB base verification skips only pending Dog consumers' test_unified_hierarchy_base_verification_skips_pending_dog_consumers
 run_test 'root crontab updates hold the TrafficCop project lock' test_monitor_crontab_update_holds_project_lock

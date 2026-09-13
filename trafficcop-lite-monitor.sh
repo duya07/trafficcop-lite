@@ -288,28 +288,47 @@ vnstat_cmd() {
 vnstat_config_value_from_file() {
     local config_path="$1"
     local target="$2"
+    # vnstat 2.10+ 的 --showconfig 先打印注释默认值再打印生效值；
+    # 取首个匹配会把默认值当成生效值（例如 MaxBW 候选校验必然失败）。
     vnstat --config "$config_path" --showconfig 2>/dev/null | awk -v target="$target" '
         {
             key=$1
             sub(/^[;#]/, "", key)
             if (key == target) {
-                print $NF
-                exit
+                if ($1 ~ /^[;#]/) {
+                    if (!has_default) { default_value=$NF; has_default=1 }
+                } else {
+                    effective_value=$NF
+                    has_effective=1
+                }
             }
+        }
+        END {
+            if (has_effective) print effective_value
+            else if (has_default) print default_value
         }
     '
 }
 
 vnstat_config_value() {
     local target="$1"
+    # 与 vnstat_config_value_from_file 保持同一取值口径：生效值优先，注释默认值兜底。
     vnstat_cmd --showconfig 2>/dev/null | awk -v target="$target" '
         {
             key=$1
             sub(/^[;#]/, "", key)
             if (key == target) {
-                print $NF
-                exit
+                if ($1 ~ /^[;#]/) {
+                    if (!has_default) { default_value=$NF; has_default=1 }
+                } else {
+                    effective_value=$NF
+                    has_effective=1
+                }
             }
+        }
+        END {
+            if (has_effective) print effective_value
+            else if (has_default) print default_value
         }
     '
 }

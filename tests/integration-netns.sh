@@ -7,7 +7,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-for command_name in bash flock ip jq sed tc unshare; do
+for command_name in bash flock ip jq nft sed tc unshare; do
     command -v "$command_name" >/dev/null 2>&1 || {
         echo "missing integration dependency: $command_name" >&2
         exit 1
@@ -59,6 +59,13 @@ assert_fails() {
     fi
 }
 
+# tc qdisc show 会输出自增的 direct_packets_stat（veth 上 IPv6 链路本地报文即可触发），
+# 它与“外部 TC 是否被改动”无关；比较外部层级是否被改动前必须剔除，否则断言会随机失败。
+tc_state_snapshot() {
+    tc qdisc show dev eth0 | sed -E 's/ direct_packets_stat [0-9]+//'
+    tc class show dev eth0
+}
+
 mkdir -p "$DOG_TEST_CONFIG_DIR/logs" "$NTC_WORK_DIR"
 printf '%s\n' 'DISABLED=false' > "$NTC_WORK_DIR/traffic_monitor_config.txt"
 chmod 600 "$NTC_WORK_DIR/traffic_monitor_config.txt"
@@ -105,11 +112,16 @@ dog_action() {
             "$DOG_SCRIPT")
         get_default_interface() { printf "%s\n" eth0; }
         case "$action" in
+            init) init_nftables ;;
             apply) apply_tc_limit "$port" "$rate" ;;
             remove) remove_tc_limit "$port" ;;
             recover) recover_tc_runtime "$port" ;;
             nft-runtime) restore_runtime_state false ;;
             status) dog_tc_status ;;
+            mark-owner) mark_tc_root_owned eth0 ;;
+            clear-owner) remove_tc_root_owner_marker ;;
+            legacy-contract) tc_consumers_match_unified_contract eth0 --owned-legacy-dog "$port" ;;
+            strict-contract) tc_consumers_match_unified_contract eth0 "$port" ;;
             *) exit 2 ;;
         esac
     ' "$DOG_SCRIPT" "$action" "$port" "$rate"
@@ -130,6 +142,7 @@ export PERIOD_START_DAY=1
 export MAIN_INTERFACE=eth0
 
 # Dog 先安装：NTC 直接接管 1:1，保留 Dog 的端口类与过滤器。
+dog_action init unused || exit 1
 dog_action apply 3265 10mbit || exit 1
 dog_class_id=$(jq -r '.ports["3265"].bandwidth_limit.class_id' "$DOG_TEST_CONFIG_FILE")
 [ -n "$dog_class_id" ] && [ "$dog_class_id" != "null" ]
@@ -220,12 +233,12 @@ assert_fails tc_root_is_htb_handle_one eth0
 # 普通限速和自动恢复均拒绝外部层级；只有显式手动恢复才删除冲突并重建。
 tc qdisc replace dev eth0 root handle 1: htb default 10
 tc class replace dev eth0 parent 1: classid 1:10 htb rate 20mbit ceil 20mbit
-foreign_before="$(tc qdisc show dev eth0; tc class show dev eth0)"
+foreign_before="$(tc_state_snapshot)"
 assert_fails apply_tc_limit 2000 >/dev/null
-[ "$foreign_before" = "$(tc qdisc show dev eth0; tc class show dev eth0)" ]
+[ "$foreign_before" = "$(tc_state_snapshot)" ]
 assert_fails tc_self_check eth0 >/dev/null
 assert_fails dog_action recover --auto
-[ "$foreign_before" = "$(tc qdisc show dev eth0; tc class show dev eth0)" ]
+[ "$foreign_before" = "$(tc_state_snapshot)" ]
 dog_action recover --manual || exit 1
 tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
 
@@ -246,9 +259,9 @@ tc qdisc del dev eth0 root handle 1:
 tc qdisc add dev eth0 root handle 1: htb default 10
 tc class add dev eth0 parent 1: classid 1:10 htb rate 20mbit ceil 20mbit
 assert_fails tc_self_check eth0 >/dev/null
-ntc_dog_foreign_before="$(tc qdisc show dev eth0; tc class show dev eth0)"
+ntc_dog_foreign_before="$(tc_state_snapshot)"
 assert_fails dog_action recover --auto
-[ "$ntc_dog_foreign_before" = "$(tc qdisc show dev eth0; tc class show dev eth0)" ]
+[ "$ntc_dog_foreign_before" = "$(tc_state_snapshot)" ]
 dog_action recover --manual || exit 1
 tc_class_rate_matches eth0 1:1 2mbit 2mbit
 tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
@@ -295,11 +308,18 @@ tc qdisc del dev eth0 root handle 1:
 tc qdisc add dev eth0 root handle 1: htb default 10
 tc class add dev eth0 parent 1: classid 1:10 htb rate 20mbit ceil 20mbit
 assert_fails tc_self_check eth0 >/dev/null
-ntc_foreign_before="$(tc qdisc show dev eth0; tc class show dev eth0)"
+ntc_foreign_before="$(tc_state_snapshot)"
 assert_fails recover_owned_tc_hierarchy --auto >/dev/null
-[ "$ntc_foreign_before" = "$(tc qdisc show dev eth0; tc class show dev eth0)" ]
+[ "$ntc_foreign_before" = "$(tc_state_snapshot)" ]
 recover_owned_tc_hierarchy --manual >/dev/null || exit 1
 tc_class_rate_matches eth0 1:1 4500kbit 4500kbit
+tc_self_check eth0 >/dev/null || exit 1
+
+# 纯 NTC 层级出现额外消费者时必须报冲突；手动接管才能删除并重建。
+tc class add dev eth0 parent 1:1 classid 1:999 htb rate 1kbit ceil 1mbit
+assert_fails tc_self_check eth0 >/dev/null
+recover_owned_tc_hierarchy --manual >/dev/null || exit 1
+assert_fails tc_class_rate_matches eth0 1:999 1kbit 1mbit
 tc_self_check eth0 >/dev/null || exit 1
 clear_owned_tc_rules "integration clear" >/dev/null || exit 1
 assert_fails tc_root_is_htb_handle_one eth0
@@ -325,6 +345,45 @@ assert_fails tc_self_check eth0 >/dev/null
 assert_fails recover_owned_tc_hierarchy --manual >/dev/null
 dog_action recover --manual >/dev/null || exit 1
 tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
+tc_self_check eth0 >/dev/null || exit 1
+
+# Dog/NTC 对统一层级的 class/filter 消费者集合必须给出相同且精确的判定。
+tc class add dev eth0 parent 1:1 classid 1:999 htb rate 1kbit ceil 1mbit
+assert_fails tc_self_check eth0 >/dev/null
+assert_fails dog_action status unused >/dev/null
+tc class del dev eth0 classid 1:999
+tc_self_check eth0 >/dev/null || exit 1
+dog_action status unused >/dev/null || exit 1
+
+tc filter add dev eth0 protocol all parent 1:0 prio 500 matchall flowid 1:30
+assert_fails tc_self_check eth0 >/dev/null
+assert_fails dog_action status unused >/dev/null
+tc filter del dev eth0 protocol all parent 1:0 prio 500
+tc_self_check eth0 >/dev/null || exit 1
+dog_action status unused >/dev/null || exit 1
+
+# 缺失或额外的 nft mark 规则都不能只靠数量被误判为正常。
+dog_mark_id=$(jq -r '.ports["3267"].bandwidth_limit.mark_id' "$DOG_TEST_CONFIG_FILE")
+dog_mark_comment=ptd_tc_mark_3267
+mark_rule=$(nft -j -a list table inet port_traffic_monitor |
+    jq -r --arg comment "$dog_mark_comment" '
+        [.nftables[] | .rule? | select(.comment == $comment)][0] |
+        if . == null then empty else [.chain, .handle] | @tsv end
+    ')
+[ -n "$mark_rule" ]
+IFS=$'\t' read -r mark_chain mark_handle <<< "$mark_rule"
+nft delete rule inet port_traffic_monitor "$mark_chain" handle "$mark_handle"
+assert_fails tc_self_check eth0 >/dev/null
+assert_fails dog_action status unused >/dev/null
+assert_fails recover_owned_tc_hierarchy --manual >/dev/null
+dog_action recover --manual >/dev/null || exit 1
+tc_self_check eth0 >/dev/null || exit 1
+
+printf 'add rule inet port_traffic_monitor output tcp sport 3267 meta mark set meta mark & 0x00000fff | %s comment "%s"\n' \
+    "$dog_mark_id" "$dog_mark_comment" | nft -f -
+assert_fails tc_self_check eth0 >/dev/null
+assert_fails dog_action status unused >/dev/null
+dog_action recover --manual >/dev/null || exit 1
 tc_self_check eth0 >/dev/null || exit 1
 
 # 双方必须同样拒绝权限过宽或关键键重复的共享 NTC 状态。
@@ -372,10 +431,34 @@ DISABLED=false
 dog_action apply 3267 10mbit || exit 1
 apply_tc_limit 2500 >/dev/null || exit 1
 dog_action remove 3267 || exit 1
+jq '
+    .ports["3267"].bandwidth_limit.enabled = false |
+    .ports["3267"].bandwidth_limit.rate = "unlimited"
+' "$DOG_TEST_CONFIG_FILE" > "$DOG_TEST_CONFIG_FILE.tmp"
+mv "$DOG_TEST_CONFIG_FILE.tmp" "$DOG_TEST_CONFIG_FILE"
+chmod 600 "$DOG_TEST_CONFIG_FILE"
 tc_class_rate_matches eth0 1:1 2500kbit 2500kbit
 [ -f "$TC_STATE_FILE" ]
 assert_fails tc_class_rate_matches eth0 "$dog_class_id" 1kbit 10mbit
 clear_owned_tc_rules "integration clear" >/dev/null || exit 1
 assert_fails tc_root_is_htb_handle_one eth0
+
+# Debian 12 的 fw JSON 输出无效；文本契约还必须真实接受已归属的 v1.5.2 四条 u32。
+tc qdisc add dev eth0 root handle 1: htb
+tc class add dev eth0 parent 1: classid 1:1 htb rate 100mbit ceil 100mbit
+tc class add dev eth0 parent 1:1 classid 1:1001 htb rate 10mbit ceil 10mbit
+tc filter add dev eth0 protocol ip parent 1:0 prio 2 u32 \
+    match ip protocol 6 0xff match ip sport 3265 0xffff flowid 1:1001
+tc filter add dev eth0 protocol ip parent 1:0 prio 2 u32 \
+    match ip protocol 6 0xff match ip dport 3265 0xffff flowid 1:1001
+tc filter add dev eth0 protocol ip parent 1:0 prio 1002 u32 \
+    match ip protocol 17 0xff match ip sport 3265 0xffff flowid 1:1001
+tc filter add dev eth0 protocol ip parent 1:0 prio 1002 u32 \
+    match ip protocol 17 0xff match ip dport 3265 0xffff flowid 1:1001
+dog_action mark-owner unused || exit 1
+dog_action legacy-contract 1:1001 || exit 1
+assert_fails dog_action strict-contract 1:1001
+dog_action clear-owner unused || exit 1
+tc qdisc del dev eth0 root handle 1:
 
 echo "Dog/TrafficCop unified HTB integration tests passed"

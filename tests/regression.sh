@@ -4010,7 +4010,8 @@ test_tc_parser_and_consumer_errors_are_strict() {
 test_dog_mark_rule_read_failure_is_not_reported_ok() {
     local status
     load_function "$MONITOR_SCRIPT" dog_port_mark_rules_complete || return 1
-    TC_MARK_PRESERVE_MASK=0x00000fff
+    # 供 eval 加载的被测函数使用，shellcheck 无法跨 eval 看到引用。
+    export TC_MARK_PRESERVE_MASK=0x00000fff
     DOG_CONFIG_FILE="$TEST_ROOT/dog-mark-read-failure.json"
     jq -n '{nftables:{table_name:"port_traffic_monitor",family:"inet"}}' > "$DOG_CONFIG_FILE"
     dog_mark_id_valid() { return 0; }

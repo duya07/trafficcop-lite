@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# TrafficCop 机器限速管理脚本 v2.9
+# TrafficCop 机器限速管理脚本 v2.10
 # 提供完整的启用/禁用/恢复机器限速功能
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -106,13 +106,21 @@ enforcement_state_value() {
 }
 
 has_pending_shutdown() {
+    local status
     if shutdown --help 2>&1 | grep -q -- '--show'; then
         shutdown --show >/dev/null 2>&1
+        status=$?
     elif command -v pgrep >/dev/null 2>&1; then
         pgrep -x shutdown >/dev/null 2>&1
+        status=$?
     else
-        return 1
+        return 2
     fi
+    case "$status" in
+        0) return 0 ;;
+        1) return 1 ;;
+        *) return 2 ;;
+    esac
 }
 
 shutdown_task_token_from_state() {
@@ -124,8 +132,9 @@ shutdown_task_token_from_state() {
 }
 
 pending_shutdown_matches_owned_state() {
-    local task_token wall_state
-    has_pending_shutdown || return 1
+    local task_token wall_state pending_status=0
+    has_pending_shutdown || pending_status=$?
+    [ "$pending_status" -eq 0 ] || return "$pending_status"
     task_token=$(shutdown_task_token_from_state) || return 1
     if command -v busctl >/dev/null 2>&1; then
         wall_state=$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
@@ -163,7 +172,7 @@ write_enforcement_state() {
 }
 
 cancel_owned_shutdown() {
-    local state_boot current_boot
+    local state_boot current_boot pending_status=0 post_cancel_status=0
 
     if [ -f "$SHUTDOWN_STATE_FILE" ]; then
         state_boot=$(grep '^BOOT_ID=' "$SHUTDOWN_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-)
@@ -173,17 +182,27 @@ cancel_owned_shutdown() {
             echo "✓ 已清理上次开机遗留的关机状态，未触碰本次开机的计划关机"
             return 0
         fi
-        if { [ -z "$state_boot" ] || [ -z "$current_boot" ]; } && has_pending_shutdown; then
-            echo "✗ 无法确认计划关机是否属于本脚本，已保留系统任务和状态文件"
+        has_pending_shutdown || pending_status=$?
+        if [ "$pending_status" -gt 1 ]; then
+            echo "✗ 无法查询当前计划关机，已保留系统任务和状态文件"
             return 1
         fi
-        if has_pending_shutdown; then
+        if [ "$pending_status" -eq 0 ]; then
+            if [ -z "$state_boot" ] || [ -z "$current_boot" ]; then
+                echo "✗ 无法确认计划关机是否属于本脚本，已保留系统任务和状态文件"
+                return 1
+            fi
             if ! pending_shutdown_matches_owned_state; then
                 echo "✗ 当前计划关机无法与本脚本任务标识匹配，已保留系统任务和状态文件"
                 return 1
             fi
-            if ! shutdown -c 2>/dev/null || has_pending_shutdown; then
+            if ! shutdown -c 2>/dev/null; then
                 echo "✗ 无法取消本脚本记录的计划关机，已保留状态文件"
+                return 1
+            fi
+            has_pending_shutdown || post_cancel_status=$?
+            if [ "$post_cancel_status" -ne 1 ]; then
+                echo "✗ 无法确认本脚本的计划关机已取消，已保留状态文件"
                 return 1
             fi
         fi
@@ -435,18 +454,30 @@ disable_machine_limit() {
     if ! cancel_owned_shutdown; then
         has_error=true
     fi
-    rm -f "$ENFORCEMENT_STATE_FILE"
+    if ! rm -f "$ENFORCEMENT_STATE_FILE"; then
+        echo "✗ 执行控制状态清理失败"
+        has_error=true
+    fi
     if ! $had_owned_shutdown && grep -q "LIMIT_MODE=shutdown" "$CONFIG_FILE" 2>/dev/null; then
         read -r -p "检测到关机模式配置，是否取消当前系统计划关机？[y/N]: " cancel_shutdown
         if [[ $cancel_shutdown =~ ^[Yy]$ ]]; then
             if ! shutdown -c 2>/dev/null; then
                 echo "✗ 取消关机计划失败，请先手动确认系统关机任务"
                 has_error=true
-            elif has_pending_shutdown; then
-                echo "✗ 取消命令执行后仍检测到关机计划，请先手动处理"
-                has_error=true
             else
-                echo "✓ 已取消关机计划"
+                local post_cancel_status=0
+                has_pending_shutdown || post_cancel_status=$?
+                case "$post_cancel_status" in
+                    1) echo "✓ 已取消关机计划" ;;
+                    0)
+                        echo "✗ 取消命令执行后仍检测到关机计划，请先手动处理"
+                        has_error=true
+                        ;;
+                    *)
+                        echo "✗ 取消命令执行后无法查询关机计划，请先手动确认"
+                        has_error=true
+                        ;;
+                esac
             fi
         fi
     fi
@@ -675,7 +706,10 @@ manage_enforcement_control() {
     case "$control_choice" in
         1)
             cancel_owned_shutdown || return 1
-            rm -f "$ENFORCEMENT_STATE_FILE"
+            rm -f "$ENFORCEMENT_STATE_FILE" || {
+                echo "✗ 无法清理执行控制状态，未报告恢复成功"
+                return 1
+            }
             echo "✓ 已恢复限制执行；下次监控达到阈值时将按配置处理"
             ;;
         2|3)
@@ -889,12 +923,20 @@ show_status() {
 # 详细状态检查
 machine_vnstat_cmd() {
     local config_path=""
-    config_path=$(cat "$VNSTAT_CONFIG_PATH_FILE" 2>/dev/null || true)
-    if [ -n "$config_path" ] && [ "${config_path#/}" != "$config_path" ] && [ -f "$config_path" ]; then
-        vnstat --config "$config_path" "$@"
-    else
+
+    if [ ! -s "$CONFIG_FILE" ]; then
         vnstat "$@"
+        return $?
     fi
+    [ -f "$VNSTAT_CONFIG_PATH_FILE" ] && [ -r "$VNSTAT_CONFIG_PATH_FILE" ] || return 1
+    config_path=$(cat "$VNSTAT_CONFIG_PATH_FILE" 2>/dev/null) || return 1
+    config_path=${config_path%$'\r'}
+    [ -n "$config_path" ] && [ "${config_path#/}" != "$config_path" ] &&
+        [ -f "$config_path" ] || return 1
+    case "$config_path" in
+        *$'\n'*) return 1 ;;
+    esac
+    vnstat --config "$config_path" "$@"
 }
 
 machine_vnstat_config_value() {

@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.1.11"
-LAST_UPDATE="2026-08-30"
+SCRIPT_VERSION="1.1.12"
+LAST_UPDATE="2026-09-07"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
@@ -26,6 +26,7 @@ LEGACY_TC_SHORTCUT_PATH="/usr/local/bin/tc"
 REPO="${REPO:-duya07/trafficcop-lite}"
 BRANCH="${BRANCH:-main}"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/${REPO}/${BRANCH}}"
+SHORTCUT_COMMAND_AVAILABLE=true
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -110,7 +111,7 @@ install_tc_recovery_service_files() {
         return 1
     fi
     mkdir -p "$runner_dir" || return 1
-    cat > "$runner_tmp" <<'EOF'
+    if ! cat > "$runner_tmp" <<'EOF'
 #!/bin/bash
 # traffic-tools-tc-recovery-v1
 set -euo pipefail
@@ -128,18 +129,34 @@ ntc_config=/etc/trafficcop-lite/traffic_monitor_config.txt
 handled=false
 result=0
 
-if [ -r "$dog_script" ] && [ -r "$dog_config" ]; then
-    bash "$dog_script" --recover-tc "$mode" || result=1
+if [ -e "$dog_script" ] || [ -L "$dog_script" ] ||
+   [ -e "$dog_config" ] || [ -L "$dog_config" ]; then
     handled=true
+    if [ -r "$dog_script" ] && [ -r "$dog_config" ]; then
+        bash "$dog_script" --recover-tc "$mode" || result=1
+    else
+        echo "Dog installation is incomplete; TC recovery was not run for Dog." >&2
+        result=1
+    fi
 fi
-if [ -r "$ntc_monitor" ] && [ -r "$ntc_config" ]; then
-    bash "$ntc_monitor" --tc-recover-owned "$mode" || result=1
+if [ -e "$ntc_monitor" ] || [ -L "$ntc_monitor" ] ||
+   [ -e "$ntc_config" ] || [ -L "$ntc_config" ]; then
     handled=true
+    if [ -r "$ntc_monitor" ] && [ -r "$ntc_config" ]; then
+        bash "$ntc_monitor" --tc-recover-owned "$mode" || result=1
+    else
+        echo "TrafficCop Lite installation is incomplete; TC recovery was not run for NTC." >&2
+        result=1
+    fi
 fi
 
 $handled || exit 0
 exit "$result"
 EOF
+    then
+        rm -f "$runner_tmp"
+        return 1
+    fi
     chmod 755 "$runner_tmp" || { rm -f "$runner_tmp"; return 1; }
     if ! cmp -s "$runner_tmp" "$TC_RECOVERY_RUNNER"; then
         mv -f "$runner_tmp" "$TC_RECOVERY_RUNNER" || { rm -f "$runner_tmp"; return 1; }
@@ -149,7 +166,7 @@ EOF
 
     tc_recovery_systemd_available || return 0
     mkdir -p "$unit_dir" || return 1
-    cat > "$unit_tmp" <<EOF
+    if ! cat > "$unit_tmp" <<EOF
 # traffic-tools-tc-recovery-v1
 [Unit]
 Description=Recover Dog and TrafficCop Lite unified HTB
@@ -163,6 +180,10 @@ ExecStart=$TC_RECOVERY_RUNNER --auto
 [Install]
 WantedBy=multi-user.target
 EOF
+    then
+        rm -f "$unit_tmp"
+        return 1
+    fi
     chmod 644 "$unit_tmp" || { rm -f "$unit_tmp"; return 1; }
     if ! cmp -s "$unit_tmp" "$TC_RECOVERY_UNIT_FILE"; then
         mv -f "$unit_tmp" "$TC_RECOVERY_UNIT_FILE" || { rm -f "$unit_tmp"; return 1; }
@@ -519,11 +540,13 @@ install_all_components() {
 }
 
 install_shortcut_link() {
+    SHORTCUT_COMMAND_AVAILABLE=true
     if { [ -e "$SHORTCUT_PATH" ] || [ -L "$SHORTCUT_PATH" ]; } \
         && [ "$(readlink "$SHORTCUT_PATH" 2>/dev/null)" != "$WORK_DIR/trafficcop-lite.sh" ]; then
         echo -e "${YELLOW}! $SHORTCUT_PATH 已存在，未覆盖。${NC}"
         echo -e "${YELLOW}  你仍可使用：sudo bash $WORK_DIR/trafficcop-lite.sh${NC}"
-        return 1
+        SHORTCUT_COMMAND_AVAILABLE=false
+        return 0
     fi
 
     if ! mkdir -p "$(dirname "$SHORTCUT_PATH")" \
@@ -549,6 +572,14 @@ install_shortcut_link() {
 install_shortcut() {
     install_all_components || return 1
     install_shortcut_link
+}
+
+shortcut_command_hint() {
+    if [ "$(readlink "$SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
+        printf '%s\n' 'sudo ntc'
+    else
+        printf 'sudo bash %s/trafficcop-lite.sh\n' "$WORK_DIR"
+    fi
 }
 
 source_has_complete_bundle() {
@@ -662,6 +693,7 @@ update_scripts() {
     local temp_files=()
     local script_name tmp_file url backup_dir candidate_version
     local release_changed=false
+    local integration_failed=false
 
     UPDATE_PREVIOUS_VERSION=$(script_version_from_file "$WORK_DIR/trafficcop-lite.sh")
     UPDATE_NEW_VERSION=""
@@ -721,8 +753,8 @@ update_scripts() {
         echo -e "${GREEN}当前已是最新版本：${UPDATE_NEW_VERSION:-未知}${NC}"
         return 0
     fi
-    backup_dir="$WORK_DIR/backups/scripts-$(date +%Y%m%d-%H%M%S)-$$"
-    if ! mkdir -p "$WORK_DIR/backups" || ! mkdir "$backup_dir"; then
+    if ! mkdir -p "$WORK_DIR/backups" ||
+       ! backup_dir=$(mktemp -d "$WORK_DIR/backups/scripts-$(date +%Y%m%d-%H%M%S)-$$.XXXXXX"); then
         echo -e "${RED}无法创建脚本备份目录，已取消更新。${NC}"
         rm -f "${temp_files[@]}" 2>/dev/null || true
         return 1
@@ -762,17 +794,28 @@ update_scripts() {
         return 1
     fi
 
-    install_shortcut_link || return 1
-    install_tc_recovery_service_files || return 1
+    if ! install_shortcut_link; then
+        echo -e "${YELLOW}! 脚本已更新，但快捷命令后置步骤失败。${NC}"
+        integration_failed=true
+    fi
+    if ! install_tc_recovery_service_files; then
+        echo -e "${YELLOW}! 脚本已更新，但共享 TC 恢复入口后置步骤失败。${NC}"
+        integration_failed=true
+    fi
 
     echo ""
     echo -e "${GREEN}脚本更新完成：${UPDATE_PREVIOUS_VERSION:-未安装} → ${UPDATE_NEW_VERSION:-未知}${NC}"
     echo -e "${GREEN}旧脚本已备份到：$backup_dir${NC}"
     echo -e "${YELLOW}命令行更新后请重新执行 sudo ntc；交互更新将自动载入新版菜单。${NC}"
+    if $integration_failed; then
+        echo -e "${YELLOW}脚本主体已更新，但上述可选集成未完成。${NC}"
+        return 2
+    fi
 }
 
 update_scripts_interactive() {
     local selected_base
+    local update_status=0
 
     selected_base=$(choose_update_base) || {
         echo "已取消更新。"
@@ -780,7 +823,8 @@ update_scripts_interactive() {
         return
     }
 
-    if update_scripts "$selected_base"; then
+    update_scripts "$selected_base" || update_status=$?
+    if [ "$update_status" -eq 0 ] || [ "$update_status" -eq 2 ]; then
         echo -e "${GREEN}正在载入新版菜单...${NC}"
         exec bash "$WORK_DIR/trafficcop-lite.sh"
         echo -e "${RED}新版菜单载入失败，请重新执行 sudo ntc。${NC}"
@@ -1171,12 +1215,32 @@ lite_vnstat_config_value() {
 
 lite_vnstat_cmd() {
     local config_path=""
-    config_path=$(cat "$VNSTAT_CONFIG_PATH_FILE" 2>/dev/null || true)
-    if [ -n "$config_path" ] && [ "${config_path#/}" != "$config_path" ] && [ -f "$config_path" ]; then
-        vnstat --config "$config_path" "$@"
-    else
+
+    if [ ! -s "$WORK_DIR/traffic_monitor_config.txt" ]; then
         vnstat "$@"
+        return $?
     fi
+    [ -f "$VNSTAT_CONFIG_PATH_FILE" ] && [ -r "$VNSTAT_CONFIG_PATH_FILE" ] || return 1
+    config_path=$(cat "$VNSTAT_CONFIG_PATH_FILE" 2>/dev/null) || return 1
+    config_path=${config_path%$'\r'}
+    [ -n "$config_path" ] && [ "${config_path#/}" != "$config_path" ] &&
+        [ -f "$config_path" ] || return 1
+    case "$config_path" in
+        *$'\n'*) return 1 ;;
+    esac
+    vnstat --config "$config_path" "$@"
+}
+
+lite_retention_state_value() {
+    local retention_start=""
+
+    [ -e "$WORK_DIR/vnstat_daily_coverage_start" ] || return 0
+    [ -f "$WORK_DIR/vnstat_daily_coverage_start" ] &&
+        [ -r "$WORK_DIR/vnstat_daily_coverage_start" ] || return 1
+    retention_start=$(cat "$WORK_DIR/vnstat_daily_coverage_start" 2>/dev/null) || return 1
+    retention_start=${retention_start%$'\r'}
+    [[ "$retention_start" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    printf '%s\n' "$retention_start"
 }
 
 lite_vnstat_daemon_is_running() {
@@ -1325,7 +1389,7 @@ lite_current_usage_gb() {
     daily_days=$(lite_vnstat_config_value "DailyDays")
     trafficless_entries=$(lite_vnstat_config_value "TrafficlessEntries")
     trafficless_entries=${trafficless_entries:-1}
-    retention_start=$(cat "$WORK_DIR/vnstat_daily_coverage_start" 2>/dev/null || true)
+    retention_start=$(lite_retention_state_value) || return 1
     retention_num=${retention_start//-/}
     if [ -z "$retention_start" ] && [ -f "$WORK_DIR/vnstat.conf.before-trafficcop-lite" ] \
         && [[ "$earliest_num" =~ ^[0-9]{8}$ ]] && [ "$earliest_num" -ne 0 ]; then
@@ -1432,7 +1496,11 @@ show_traffic_overview() {
     echo -e "${CYAN}流量周期:${NC} ${WHITE}${period_label} · ${mode_label}${NC}  ${WHITE}${start_date} ~ ${end_date}${NC}"
     if [ "$ALLOW_PARTIAL_HISTORY" = "true" ]; then
         available_start=$(lite_vnstat_available_start 2>/dev/null || true)
-        retention_start=$(cat "$WORK_DIR/vnstat_daily_coverage_start" 2>/dev/null || true)
+        if ! retention_start=$(lite_retention_state_value); then
+            echo -e "${YELLOW}历史提示:${NC} ${YELLOW}保留期状态暂时无法读取${NC}"
+            echo -e "${CYAN}已用/总量:${NC} ${YELLOW}暂无法读取${NC} / ${WHITE}${TRAFFIC_LIMIT:-未知} $unit_label${NC}"
+            return
+        fi
         trafficless_entries=$(lite_vnstat_config_value "TrafficlessEntries")
         trafficless_entries=${trafficless_entries:-1}
         available_num=${available_start//-/}
@@ -1704,13 +1772,21 @@ clear_lite_tc_rules_interactive() {
 }
 
 lite_has_pending_shutdown() {
+    local status
     if shutdown --help 2>&1 | grep -q -- '--show'; then
         shutdown --show >/dev/null 2>&1
+        status=$?
     elif command -v pgrep >/dev/null 2>&1; then
         pgrep -x shutdown >/dev/null 2>&1
+        status=$?
     else
-        return 1
+        return 2
     fi
+    case "$status" in
+        0) return 0 ;;
+        1) return 1 ;;
+        *) return 2 ;;
+    esac
 }
 
 lite_shutdown_task_token_from_state() {
@@ -1722,8 +1798,9 @@ lite_shutdown_task_token_from_state() {
 }
 
 lite_pending_shutdown_matches_owned_state() {
-    local task_token wall_state
-    lite_has_pending_shutdown || return 1
+    local task_token wall_state pending_status=0
+    lite_has_pending_shutdown || pending_status=$?
+    [ "$pending_status" -eq 0 ] || return "$pending_status"
     task_token=$(lite_shutdown_task_token_from_state) || return 1
     if command -v busctl >/dev/null 2>&1; then
         wall_state=$(busctl get-property org.freedesktop.login1 /org/freedesktop/login1 \
@@ -1741,7 +1818,7 @@ lite_pending_shutdown_matches_owned_state() {
 
 cancel_shutdown_interactive() {
     local config="$WORK_DIR/traffic_monitor_config.txt"
-    local state_boot current_boot
+    local state_boot current_boot pending_status=0 post_cancel_status=0
 
     if [ -f "$SHUTDOWN_STATE_FILE" ]; then
         state_boot=$(grep '^BOOT_ID=' "$SHUTDOWN_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-)
@@ -1751,17 +1828,27 @@ cancel_shutdown_interactive() {
             echo "✓ 已清理上次开机遗留的关机状态，未触碰本次开机的计划关机"
             return 0
         fi
-        if { [ -z "$state_boot" ] || [ -z "$current_boot" ]; } && lite_has_pending_shutdown; then
-            echo -e "${RED}无法确认计划关机是否属于本脚本，已保留系统任务和状态文件。${NC}"
+        lite_has_pending_shutdown || pending_status=$?
+        if [ "$pending_status" -gt 1 ]; then
+            echo -e "${RED}无法查询当前计划关机，已保留系统任务和状态文件。${NC}"
             return 1
         fi
-        if lite_has_pending_shutdown; then
+        if [ "$pending_status" -eq 0 ]; then
+            if [ -z "$state_boot" ] || [ -z "$current_boot" ]; then
+                echo -e "${RED}无法确认计划关机是否属于本脚本，已保留系统任务和状态文件。${NC}"
+                return 1
+            fi
             if ! lite_pending_shutdown_matches_owned_state; then
                 echo -e "${RED}当前计划关机无法与本脚本任务标识匹配，已保留系统任务和状态文件。${NC}"
                 return 1
             fi
-            if ! shutdown -c 2>/dev/null || lite_has_pending_shutdown; then
+            if ! shutdown -c 2>/dev/null; then
                 echo -e "${RED}无法取消本脚本记录的计划关机，已保留状态文件。${NC}"
+                return 1
+            fi
+            lite_has_pending_shutdown || post_cancel_status=$?
+            if [ "$post_cancel_status" -ne 1 ]; then
+                echo -e "${RED}无法确认本脚本的计划关机已取消，已保留状态文件。${NC}"
                 return 1
             fi
         fi
@@ -1777,10 +1864,19 @@ cancel_shutdown_interactive() {
                 echo -e "${RED}取消计划关机失败，请先手动确认系统关机任务。${NC}"
                 return 1
             fi
-            if lite_has_pending_shutdown; then
-                echo -e "${RED}取消命令执行后仍检测到计划关机，请先手动处理。${NC}"
-                return 1
-            fi
+            post_cancel_status=0
+            lite_has_pending_shutdown || post_cancel_status=$?
+            case "$post_cancel_status" in
+                1) ;;
+                0)
+                    echo -e "${RED}取消命令执行后仍检测到计划关机，请先手动处理。${NC}"
+                    return 1
+                    ;;
+                *)
+                    echo -e "${RED}取消命令执行后无法查询计划关机，请先手动确认。${NC}"
+                    return 1
+                    ;;
+            esac
             echo "✓ 已取消计划关机"
         fi
     fi
@@ -1922,7 +2018,7 @@ show_main_menu() {
     echo -e "${PURPLE}版本: ${SCRIPT_VERSION}    更新: ${LAST_UPDATE}${NC}"
     echo ""
     show_status_line
-    echo -e "${CYAN}快捷命令:${NC} sudo ntc"
+    echo -e "${CYAN}快捷命令:${NC} $(shortcut_command_hint)"
     show_traffic_overview
     show_enforcement_overview
     echo ""
@@ -1948,7 +2044,11 @@ main() {
             install_from_entrypoint
             install_status=$?
             [ "$install_status" -eq 0 ] || exit "$install_status"
-            echo -e "${GREEN}安装完成。以后可执行：sudo ntc${NC}"
+            if [ "${SHORTCUT_COMMAND_AVAILABLE:-true}" = "true" ]; then
+                echo -e "${GREEN}安装完成。以后可执行：sudo ntc${NC}"
+            else
+                echo -e "${GREEN}安装完成。快捷路径被外部文件占用，请执行：sudo bash $WORK_DIR/trafficcop-lite.sh${NC}"
+            fi
             exit 0
             ;;
         --uninstall)

@@ -1,7 +1,5 @@
 #!/bin/bash
 
-umask 077
-
 if [ "$(id -u)" -ne 0 ]; then
     echo "请使用 root 权限运行此脚本。"
     exit 1
@@ -9,10 +7,8 @@ fi
 
 # 设置新的工作目录
 WORK_DIR="/etc/trafficcop-lite"
-if ! mkdir -p "$WORK_DIR" || ! chmod 700 "$WORK_DIR"; then
-    echo "无法创建或保护 Telegram 工作目录：$WORK_DIR" >&2
-    exit 1
-fi
+mkdir -p "$WORK_DIR"
+chmod 700 "$WORK_DIR" 2>/dev/null || true
 
 # 更新文件路径
 CONFIG_FILE="$WORK_DIR/tg_notifier_config.txt"
@@ -26,7 +22,7 @@ TG_LOCK_FILE="$WORK_DIR/tg_notifier.lock"
 ROOT_CRONTAB_LOCK_FILE="${TRAFFICCOP_ROOT_CRONTAB_LOCK_FILE:-$WORK_DIR/root-crontab.lock}"
 CRON_LOG_MAX_LINES="${CRON_LOG_MAX_LINES:-2000}"
 TG_DEBUG="${TG_DEBUG:-false}"
-SCRIPT_VERSION="1.1.5"
+SCRIPT_VERSION="1.1.4"
 
 # 此函数只由 EXIT trap 调用，ShellCheck 无法沿字符串形式的 trap 识别调用关系。
 # shellcheck disable=SC2317,SC2329
@@ -214,17 +210,14 @@ read_config() {
     local key raw_value value
     local config_format="legacy"
 
-    unset BOT_TOKEN CHAT_ID DAILY_REPORT_TIME REPORT_TIMEZONE MACHINE_NAME TG_DISABLED
     if [ ! -f "$CONFIG_FILE" ] || [ ! -s "$CONFIG_FILE" ]; then
         echo "配置文件不存在或为空，需要进行初始化配置。"
         return 1
     fi
 
-    if ! chmod 600 "$CONFIG_FILE"; then
-        echo "无法将 Telegram 配置权限收紧为 0600。"
-        return 1
-    fi
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 
+    unset BOT_TOKEN CHAT_ID DAILY_REPORT_TIME REPORT_TIMEZONE MACHINE_NAME TG_DISABLED
     # 旧配置没有开关字段时保持原行为：自动通知默认开启。
     while IFS='=' read -r key raw_value || [ -n "$key$raw_value" ]; do
         raw_value=${raw_value%$'\r'}
@@ -302,7 +295,7 @@ write_config() {
         rm -f "$tmp_file"
         return 1
     fi
-    chmod 600 "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    chmod 600 "$tmp_file" 2>/dev/null || true
     mv -f "$tmp_file" "$CONFIG_FILE" || { rm -f "$tmp_file"; return 1; }
     echo "配置已保存到 $CONFIG_FILE"
 }
@@ -476,52 +469,16 @@ test_telegram_notification() {
 }
 
 read_notification_state() {
-    local content line key value last_line=""
-    local status_seen=false cycle_seen=false
-
     LAST_STATUS=""
     LAST_CYCLE_EVENT=""
-    NOTIFICATION_STATE_MODERN=false
 
-    [ -e "$LAST_NOTIFICATION_FILE" ] || return 0
-    [ -f "$LAST_NOTIFICATION_FILE" ] && [ -r "$LAST_NOTIFICATION_FILE" ] || return 1
-    content=$(cat "$LAST_NOTIFICATION_FILE" 2>/dev/null) || return 1
-    [ -n "$content" ] || return 1
-    while IFS= read -r line || [ -n "$line" ]; do
-        line=${line%$'\r'}
-        last_line="$line"
-        case "$line" in
-            STATUS=*)
-                [ "$status_seen" = "false" ] || return 1
-                status_seen=true
-                LAST_STATUS=${line#STATUS=}
-                ;;
-            CYCLE_EVENT=*)
-                [ "$cycle_seen" = "false" ] || return 1
-                cycle_seen=true
-                LAST_CYCLE_EVENT=${line#CYCLE_EVENT=}
-                ;;
-        esac
-    done <<< "$content"
-    if [ "$status_seen" = "true" ]; then
-        NOTIFICATION_STATE_MODERN=true
-    elif [ -n "$last_line" ]; then
-        IFS=' ' read -r key value LAST_STATUS <<< "$last_line"
-        [ -n "$LAST_STATUS" ] || return 1
+    [ -f "$LAST_NOTIFICATION_FILE" ] || return 0
+    if grep -q '^STATUS=' "$LAST_NOTIFICATION_FILE" 2>/dev/null; then
+        LAST_STATUS=$(grep '^STATUS=' "$LAST_NOTIFICATION_FILE" | tail -n 1 | cut -d'=' -f2-)
+        LAST_CYCLE_EVENT=$(grep '^CYCLE_EVENT=' "$LAST_NOTIFICATION_FILE" | tail -n 1 | cut -d'=' -f2-)
+    else
+        LAST_STATUS=$(tail -n 1 "$LAST_NOTIFICATION_FILE" | cut -d' ' -f3-)
     fi
-}
-
-write_notification_state_file() {
-    local status="$1"
-    local cycle_event="$2"
-    local target_file="$3"
-
-    {
-        printf 'STATUS=%s\n' "$status"
-        printf 'CYCLE_EVENT=%s\n' "$cycle_event"
-        printf 'UPDATED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
-    } > "$target_file" || { rm -f "$target_file"; return 1; }
-    chmod 600 "$target_file" || { rm -f "$target_file"; return 1; }
 }
 
 write_notification_state() {
@@ -529,23 +486,21 @@ write_notification_state() {
     local cycle_event="$2"
     local tmp_file="${LAST_NOTIFICATION_FILE}.tmp.$$"
 
-    write_notification_state_file "$status" "$cycle_event" "$tmp_file" || return 1
+    {
+        printf 'STATUS=%s\n' "$status"
+        printf 'CYCLE_EVENT=%s\n' "$cycle_event"
+        printf 'UPDATED_AT=%s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+    } > "$tmp_file" || return 1
+    chmod 600 "$tmp_file" 2>/dev/null || true
     mv -f "$tmp_file" "$LAST_NOTIFICATION_FILE"
-}
-
-write_daily_report_state_file() {
-    local report_date="$1"
-    local target_file="$2"
-
-    printf '%s\n' "$report_date" > "$target_file" || { rm -f "$target_file"; return 1; }
-    chmod 600 "$target_file" || { rm -f "$target_file"; return 1; }
 }
 
 write_daily_report_state() {
     local report_date="$1"
     local tmp_file="${LAST_DAILY_REPORT_FILE}.tmp.$$"
 
-    write_daily_report_state_file "$report_date" "$tmp_file" || return 1
+    printf '%s\n' "$report_date" > "$tmp_file" || return 1
+    chmod 600 "$tmp_file" 2>/dev/null || true
     mv -f "$tmp_file" "$LAST_DAILY_REPORT_FILE"
 }
 
@@ -594,11 +549,7 @@ read_current_traffic_state() {
     now=$(date +%s) || return 1
     age=$((now - CURRENT_TRAFFIC_UPDATED_EPOCH))
     [ "$age" -ge -60 ] && [ "$age" -le 300 ] || return 1
-    period_state=""
-    if [ -e "$PERIOD_STATE_FILE" ]; then
-        [ -f "$PERIOD_STATE_FILE" ] && [ -r "$PERIOD_STATE_FILE" ] || return 1
-        period_state=$(cat "$PERIOD_STATE_FILE" 2>/dev/null) || return 1
-    fi
+    period_state=$(cat "$PERIOD_STATE_FILE" 2>/dev/null || true)
     [ -z "$period_state" ] || [ "$period_state" = "$CURRENT_TRAFFIC_PERIOD_START" ]
 }
 
@@ -608,17 +559,10 @@ check_and_notify() {
     local next_status next_cycle effective_last_status
     local cycle_failed=false
     local had_notification_state=false
-    local notification_candidate="${LAST_NOTIFICATION_FILE}.candidate.$$"
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 开始检查流量状态..."| tee -a "$CRON_LOG"
 
-    if [ -e "$PERIOD_STATE_FILE" ]; then
-        if [ ! -f "$PERIOD_STATE_FILE" ] || [ ! -r "$PERIOD_STATE_FILE" ] ||
-           ! cycle_event=$(cat "$PERIOD_STATE_FILE" 2>/dev/null); then
-            log_cron "流量周期状态读取失败，本轮不发送也不覆写通知状态"
-            return 1
-        fi
-    fi
+    cycle_event=$(cat "$PERIOD_STATE_FILE" 2>/dev/null || true)
 
     if read_current_traffic_state; then
         case "$CURRENT_TRAFFIC_STATUS" in
@@ -633,18 +577,10 @@ check_and_notify() {
     fi
 
     [ -f "$LAST_NOTIFICATION_FILE" ] && had_notification_state=true
-    if ! read_notification_state; then
-        log_cron "通知状态读取失败，本轮不发送也不覆写状态"
-        return 1
-    fi
+    read_notification_state
     next_status="$LAST_STATUS"
     next_cycle="$LAST_CYCLE_EVENT"
     effective_last_status="$LAST_STATUS"
-
-    if ! write_notification_state_file "$LAST_STATUS" "$LAST_CYCLE_EVENT" "$notification_candidate"; then
-        log_cron "通知状态候选文件无法写入，本轮不发送消息"
-        return 1
-    fi
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 当前状态=$current_status，上次状态=${LAST_STATUS:-空}" | tee -a "$CRON_LOG"
 
@@ -707,16 +643,12 @@ check_and_notify() {
         esac
     fi
 
-    if ! $had_notification_state || [ "$NOTIFICATION_STATE_MODERN" != "true" ] \
+    if ! $had_notification_state || ! grep -q '^STATUS=' "$LAST_NOTIFICATION_FILE" 2>/dev/null \
         || [ "$next_status" != "$LAST_STATUS" ] || [ "$next_cycle" != "$LAST_CYCLE_EVENT" ]; then
-        if ! write_notification_state_file "$next_status" "$next_cycle" "$notification_candidate" ||
-           ! mv -f "$notification_candidate" "$LAST_NOTIFICATION_FILE"; then
-            rm -f "$notification_candidate"
+        if ! write_notification_state "$next_status" "$next_cycle"; then
             log_cron "通知状态文件写入失败"
             return 1
         fi
-    else
-        rm -f "$notification_candidate" || return 1
     fi
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 流量检查完成。"| tee -a "$CRON_LOG"
 }
@@ -889,8 +821,6 @@ daily_report() {
 
 # 主任务
 main() {
-    local current_time current_date last_report_date daily_state_candidate
-
     debug_log "进入主任务，参数数量=$#，参数=$*"
     
     check_runtime_dependencies || return 1
@@ -908,40 +838,20 @@ if [[ "$*" == *"-cron"* ]]; then
         check_and_notify || log_cron "状态检查未完整成功"
         
     # 检查是否需要发送每日报告
-        current_time=$(TZ="$REPORT_TIMEZONE" date +%H:%M) || return 1
-        current_date=$(TZ="$REPORT_TIMEZONE" date +%Y-%m-%d) || return 1
-        last_report_date=""
-        if [ -e "$LAST_DAILY_REPORT_FILE" ]; then
-            if [ ! -f "$LAST_DAILY_REPORT_FILE" ] || [ ! -r "$LAST_DAILY_REPORT_FILE" ] ||
-               ! last_report_date=$(cat "$LAST_DAILY_REPORT_FILE" 2>/dev/null); then
-                log_cron "每日报告状态读取失败，本轮不发送"
-                return 1
-            fi
-            if [[ ! "$last_report_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
-                log_cron "每日报告状态无效，本轮不发送"
-                return 1
-            fi
-        fi
+        current_time=$(TZ="$REPORT_TIMEZONE" date +%H:%M)
+        current_date=$(TZ="$REPORT_TIMEZONE" date +%Y-%m-%d)
+        last_report_date=$(cat "$LAST_DAILY_REPORT_FILE" 2>/dev/null || true)
         debug_log "当前时间: $current_time, 设定的报告时间: $DAILY_REPORT_TIME, 时区: $REPORT_TIMEZONE"
         if [[ "$current_time" > "$DAILY_REPORT_TIME" || "$current_time" == "$DAILY_REPORT_TIME" ]] && [ "$last_report_date" != "$current_date" ]; then
             log_cron "已到报告时间且今日尚未发送，准备发送每日报告"
-            daily_state_candidate="${LAST_DAILY_REPORT_FILE}.candidate.$$"
-            if ! write_daily_report_state_file "$current_date" "$daily_state_candidate"; then
-                log_cron "每日报告状态候选文件无法写入，本轮不发送"
-                return 1
-            fi
             if daily_report; then
-                if mv -f "$daily_state_candidate" "$LAST_DAILY_REPORT_FILE"; then
+                if write_daily_report_state "$current_date"; then
                     log_cron "每日报告发送成功"
                 else
-                    rm -f "$daily_state_candidate"
                     log_cron "每日报告已发送，但状态文件写入失败；请检查目录权限以避免重复发送"
-                    return 1
                 fi
             else
-                rm -f "$daily_state_candidate" || true
                 log_cron "每日报告发送失败"
-                return 1
             fi
         else
             debug_log "尚未到报告时间或今日已经发送，不发送报告"

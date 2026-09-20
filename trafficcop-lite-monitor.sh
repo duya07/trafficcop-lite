@@ -27,7 +27,6 @@ TC_STATE_PROVIDER="trafficcop-lite"
 TC_PARENT_RATE="100gbit"
 TC_DEFAULT_CLASS_RATE="1kbit"
 TC_MARK_MASK=0xfffff000
-TC_MARK_PRESERVE_MASK=0x00000fff
 VNSTAT_MAX_BANDWIDTH="${VNSTAT_MAX_BANDWIDTH:-0}"
 VNSTAT_SAVE_INTERVAL=1
 VNSTAT_CONFIG_TRANSACTION_ACTIVE=false
@@ -43,7 +42,7 @@ VNSTAT_TRANSACTION_HAD_CONFIG_PATH_FILE=false
 DOG_CONFIG_FILE="/etc/port-traffic-dog/config.json"
 DOG_TC_OWNER_FILE="/etc/port-traffic-dog/tc-root-qdisc.owner"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.1.10"
+SCRIPT_VERSION="1.1.9"
 mkdir -p "$WORK_DIR"
 chmod 700 "$WORK_DIR" 2>/dev/null || true
 
@@ -118,7 +117,6 @@ vnstat_version_parts() {
 
 vnstat_daemon_config_path() {
     local comm_file pid cmdline_path="" detected_path="" argument expect_path=false
-    local cmdline_content
     local daemon_count=0
 
     for comm_file in /proc/[0-9]*/comm; do
@@ -129,8 +127,7 @@ vnstat_daemon_config_path() {
         expect_path=false
         pid=${comm_file#/proc/}
         pid=${pid%/comm}
-        [ -r "/proc/$pid/cmdline" ] || return 2
-        cmdline_content=$(tr '\0' '\n' < "/proc/$pid/cmdline") || return 2
+        [ -r "/proc/$pid/cmdline" ] || continue
         while IFS= read -r argument; do
             if $expect_path; then
                 cmdline_path="$argument"
@@ -141,8 +138,7 @@ vnstat_daemon_config_path() {
                 --config) expect_path=true ;;
                 --config=*) cmdline_path=${argument#--config=} ;;
             esac
-        done <<< "$cmdline_content"
-        $expect_path && return 2
+        done < <(tr '\0' '\n' < "/proc/$pid/cmdline")
         [ -n "$cmdline_path" ] || continue
         if [ -n "$detected_path" ] && [ "$detected_path" != "$cmdline_path" ]; then
             return 2
@@ -208,8 +204,7 @@ canonical_config_path() {
 
 resolve_vnstat_config_path() {
     local daemon_path="" daemon_status daemon_prefix cli_prefix
-    local debug_output cli_path="" candidate resolved line parsed_path marker_value
-    local marker_tmp="${VNSTAT_CONFIG_PATH_FILE}.tmp.$$"
+    local debug_output cli_path="" candidate resolved
 
     daemon_path=$(vnstat_daemon_config_path 2>/dev/null)
     daemon_status=$?
@@ -225,25 +220,8 @@ resolve_vnstat_config_path() {
         cli_prefix=$(vnstat_cli_install_prefix) || return 1
         [ "$daemon_prefix" = "$cli_prefix" ] || return 1
         debug_output=$(LC_ALL=C vnstat --debug --showconfig 2>&1) || return 1
-        while IFS= read -r line || [ -n "$line" ]; do
-            line=${line%$'\r'}
-            case "$line" in
-                'Config file:'*)
-                    parsed_path=${line#Config file:}
-                    while [ "${parsed_path# }" != "$parsed_path" ]; do
-                        parsed_path=${parsed_path# }
-                    done
-                    while [ "${parsed_path#$'\t'}" != "$parsed_path" ]; do
-                        parsed_path=${parsed_path#$'\t'}
-                    done
-                    [ -n "$parsed_path" ] || return 1
-                    if [ -n "$cli_path" ] && [ "$cli_path" != "$parsed_path" ]; then
-                        return 1
-                    fi
-                    cli_path="$parsed_path"
-                    ;;
-            esac
-        done <<< "$debug_output"
+        cli_path=$(printf '%s\n' "$debug_output" |
+            sed -n 's/^Config file:[[:space:]]*//p' | tail -n 1)
         if [ -n "$cli_path" ]; then
             resolved=$(canonical_config_path "$cli_path") || return 1
             VNSTAT_CONFIG_PATH="$resolved"
@@ -257,22 +235,14 @@ resolve_vnstat_config_path() {
         fi
     fi
     [ -n "${VNSTAT_CONFIG_PATH:-}" ] || return 1
-    if [ -e "$VNSTAT_CONFIG_PATH_FILE" ] || [ -L "$VNSTAT_CONFIG_PATH_FILE" ]; then
-        [ -f "$VNSTAT_CONFIG_PATH_FILE" ] && [ -r "$VNSTAT_CONFIG_PATH_FILE" ] || return 1
-        marker_value=$(cat "$VNSTAT_CONFIG_PATH_FILE" 2>/dev/null) || return 1
-        marker_value=${marker_value%$'\r'}
-        [ -n "$marker_value" ] && [ "${marker_value#/}" != "$marker_value" ] || return 1
-        case "$marker_value" in
-            *$'\n'*) return 1 ;;
-        esac
-        if [ "$marker_value" = "$VNSTAT_CONFIG_PATH" ]; then
-            return 0
-        fi
+    if [ -f "$VNSTAT_CONFIG_PATH_FILE" ] &&
+       [ "$(cat "$VNSTAT_CONFIG_PATH_FILE" 2>/dev/null)" = "$VNSTAT_CONFIG_PATH" ]; then
+        return 0
     fi
-    printf '%s\n' "$VNSTAT_CONFIG_PATH" > "$marker_tmp" || return 1
-    chmod 600 "$marker_tmp" || { rm -f "$marker_tmp"; return 1; }
-    mv -f "$marker_tmp" "$VNSTAT_CONFIG_PATH_FILE" || {
-        rm -f "$marker_tmp"
+    printf '%s\n' "$VNSTAT_CONFIG_PATH" > "${VNSTAT_CONFIG_PATH_FILE}.tmp.$$" || return 1
+    chmod 600 "${VNSTAT_CONFIG_PATH_FILE}.tmp.$$" 2>/dev/null || true
+    mv -f "${VNSTAT_CONFIG_PATH_FILE}.tmp.$$" "$VNSTAT_CONFIG_PATH_FILE" || {
+        rm -f "${VNSTAT_CONFIG_PATH_FILE}.tmp.$$"
         return 1
     }
 }
@@ -962,10 +932,7 @@ rollback_initial_vnstat_transaction() {
     fi
 
     if [ "$VNSTAT_TRANSACTION_HAD_CONFIG_PATH_FILE" = "true" ]; then
-        if ! VNSTAT_CONFIG_PATH=$(cat "$VNSTAT_CONFIG_PATH_FILE" 2>/dev/null); then
-            rollback_failed=true
-            unset VNSTAT_CONFIG_PATH
-        fi
+        VNSTAT_CONFIG_PATH=$(cat "$VNSTAT_CONFIG_PATH_FILE" 2>/dev/null || true)
     else
         unset VNSTAT_CONFIG_PATH
     fi
@@ -996,22 +963,14 @@ begin_initial_vnstat_transaction() {
     if vnstat_daemon_is_running; then
         VNSTAT_TRANSACTION_DAEMON_WAS_RUNNING=true
     fi
-    if [ -e "$RETENTION_STATE_FILE" ] || [ -L "$RETENTION_STATE_FILE" ]; then
-        [ -f "$RETENTION_STATE_FILE" ] && [ -r "$RETENTION_STATE_FILE" ] || {
-            cleanup_initial_vnstat_transaction_files
-            return 1
-        }
+    if [ -f "$RETENTION_STATE_FILE" ]; then
         cp -p "$RETENTION_STATE_FILE" "$VNSTAT_TRANSACTION_DIR/retention-state" || {
             cleanup_initial_vnstat_transaction_files
             return 1
         }
         VNSTAT_TRANSACTION_HAD_RETENTION=true
     fi
-    if [ -e "$VNSTAT_CONFIG_PATH_FILE" ] || [ -L "$VNSTAT_CONFIG_PATH_FILE" ]; then
-        [ -f "$VNSTAT_CONFIG_PATH_FILE" ] && [ -r "$VNSTAT_CONFIG_PATH_FILE" ] || {
-            cleanup_initial_vnstat_transaction_files
-            return 1
-        }
+    if [ -f "$VNSTAT_CONFIG_PATH_FILE" ]; then
         cp -p "$VNSTAT_CONFIG_PATH_FILE" "$VNSTAT_TRANSACTION_DIR/config-path-file" || {
             cleanup_initial_vnstat_transaction_files
             return 1
@@ -1150,8 +1109,7 @@ ensure_service_running() {
     if command_exists systemctl; then
         for service_name in "$@"; do
             if systemctl list-unit-files "${service_name}.service" --no-legend 2>/dev/null | grep -q "^${service_name}\.service"; then
-                run_privileged systemctl enable --now "${service_name}.service" >/dev/null 2>&1 || true
-                if systemctl is-active --quiet "${service_name}.service" >/dev/null 2>&1; then
+                if run_privileged systemctl enable --now "${service_name}.service" >/dev/null 2>&1; then
                     return 0
                 fi
             fi
@@ -1163,8 +1121,7 @@ ensure_service_running() {
                 if command_exists rc-update; then
                     run_privileged rc-update add "$service_name" default >/dev/null 2>&1 || true
                 fi
-                run_privileged rc-service "$service_name" start >/dev/null 2>&1 || true
-                if rc-service "$service_name" status >/dev/null 2>&1; then
+                if run_privileged rc-service "$service_name" start >/dev/null 2>&1 || rc-service "$service_name" status >/dev/null 2>&1; then
                     return 0
                 fi
             fi
@@ -1172,11 +1129,8 @@ ensure_service_running() {
     fi
     if command_exists service; then
         for service_name in "$@"; do
-            if [ -x "/etc/init.d/$service_name" ]; then
-                run_privileged service "$service_name" start >/dev/null 2>&1 || true
-                if service "$service_name" status >/dev/null 2>&1; then
-                    return 0
-                fi
+            if [ -x "/etc/init.d/$service_name" ] && { run_privileged service "$service_name" start >/dev/null 2>&1 || service "$service_name" status >/dev/null 2>&1; }; then
+                return 0
             fi
         done
     fi
@@ -1538,7 +1492,6 @@ snapshot_monitor_config_state() {
     local tc_backup="$3"
     local shutdown_backup="$4"
     local saved_interface state_interface state_boot current_boot runtime_status
-    local pending_status=0
 
     CONFIG_SNAPSHOT_HAD_CONFIG=false
     CONFIG_SNAPSHOT_HAD_ENFORCEMENT=false
@@ -1588,18 +1541,15 @@ snapshot_monitor_config_state() {
         CONFIG_SNAPSHOT_HAD_SHUTDOWN=true
         state_boot=$(shutdown_state_value BOOT_ID)
         current_boot=$(current_boot_id)
-        if ! { [ -n "$state_boot" ] && [ -n "$current_boot" ] && [ "$state_boot" != "$current_boot" ]; }; then
-            pending_status=0
-            has_pending_shutdown || pending_status=$?
-            case "$pending_status" in
-                0)
-                    [ -n "$state_boot" ] && [ -n "$current_boot" ] && [ "$state_boot" = "$current_boot" ] || return 1
-                    pending_shutdown_matches_owned_state || return 1
-                    CONFIG_SNAPSHOT_OLD_SHUTDOWN_PENDING=true
-                    ;;
-                1) ;;
-                *) return 1 ;;
-            esac
+        if [ -n "$state_boot" ] && [ -n "$current_boot" ] && [ "$state_boot" = "$current_boot" ] &&
+           has_pending_shutdown; then
+            if pending_shutdown_matches_owned_state; then
+                CONFIG_SNAPSHOT_OLD_SHUTDOWN_PENDING=true
+            else
+                return 1
+            fi
+        elif { [ -z "$state_boot" ] || [ -z "$current_boot" ]; } && has_pending_shutdown; then
+            return 1
         fi
     fi
 }
@@ -1632,18 +1582,13 @@ restore_owned_tc_after_config_failure() {
 
 restore_owned_shutdown_after_config_failure() {
     local shutdown_backup="$1"
-    local task_token pending_status=0
+    local task_token
 
     [ "${CONFIG_SNAPSHOT_OLD_SHUTDOWN_PENDING:-false}" = "true" ] || return 0
-    has_pending_shutdown || pending_status=$?
-    case "$pending_status" in
-        0)
-            pending_shutdown_matches_owned_state
-            return $?
-            ;;
-        1) ;;
-        *) return 1 ;;
-    esac
+    if has_pending_shutdown; then
+        pending_shutdown_matches_owned_state
+        return $?
+    fi
     restore_file_snapshot "$shutdown_backup" true "$SHUTDOWN_STATE_FILE" || return 1
     task_token=$(shutdown_task_token_from_state) || return 1
     shutdown -h +1 "TrafficCop-Lite[$task_token] 配置回滚：恢复原计划关机" >/dev/null 2>&1 || true
@@ -1761,17 +1706,6 @@ date_num_to_iso() {
     printf '%s-%s-%s\n' "${date_num:0:4}" "${date_num:4:2}" "${date_num:6:2}"
 }
 
-retention_state_value() {
-    local retention_start=""
-
-    [ -e "$RETENTION_STATE_FILE" ] || return 0
-    [ -f "$RETENTION_STATE_FILE" ] && [ -r "$RETENTION_STATE_FILE" ] || return 1
-    retention_start=$(cat "$RETENTION_STATE_FILE" 2>/dev/null) || return 1
-    retention_start=${retention_start%$'\r'}
-    [[ "$retention_start" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
-    printf '%s\n' "$retention_start"
-}
-
 get_vnstat_available_start() {
     local vnstat_json created_num earliest_num available_num trafficless_entries
 
@@ -1800,7 +1734,7 @@ history_incomplete_for_current_period() {
 
     period_start=$(get_period_start_date) || return 2
     available_start=$(get_vnstat_available_start) || return 2
-    retention_start=$(retention_state_value) || return 2
+    retention_start=$(cat "$RETENTION_STATE_FILE" 2>/dev/null || true)
     trafficless_entries=$(vnstat_config_value "TrafficlessEntries")
     trafficless_entries=${trafficless_entries:-1}
     period_num=${period_start//-/}
@@ -1833,7 +1767,7 @@ configure_history_policy() {
 
     period_start=$(get_period_start_date)
     available_start=$(get_vnstat_available_start 2>/dev/null || echo "未知")
-    retention_start=$(retention_state_value) || return 1
+    retention_start=$(cat "$RETENTION_STATE_FILE" 2>/dev/null || true)
     trafficless_entries=$(vnstat_config_value "TrafficlessEntries")
     trafficless_entries=${trafficless_entries:-1}
     available_num=${available_start//-/}
@@ -1858,42 +1792,11 @@ configure_history_policy() {
     ALLOW_PARTIAL_HISTORY=true
 }
 
-ENFORCEMENT_STATE_MODE_VALUE=""
-ENFORCEMENT_STATE_UNTIL_VALUE=""
-ENFORCEMENT_STATE_REASON_VALUE=""
-
-# 返回 0=读取成功，1=文件不存在，2=读取失败，3=内容无效。
-read_enforcement_state() {
-    local content key value
-    local mode_seen=false until_seen=false reason_seen=false
-
-    ENFORCEMENT_STATE_MODE_VALUE=""
-    ENFORCEMENT_STATE_UNTIL_VALUE=""
-    ENFORCEMENT_STATE_REASON_VALUE=""
-    [ -e "$ENFORCEMENT_STATE_FILE" ] || return 1
-    [ -f "$ENFORCEMENT_STATE_FILE" ] && [ -r "$ENFORCEMENT_STATE_FILE" ] || return 2
-    content=$(cat "$ENFORCEMENT_STATE_FILE" 2>/dev/null) || return 2
-    while IFS='=' read -r key value; do
-        value=${value%$'\r'}
-        case "$key" in
-            MODE)
-                [ "$mode_seen" = "false" ] || return 3
-                mode_seen=true
-                ENFORCEMENT_STATE_MODE_VALUE="$value"
-                ;;
-            UNTIL_EPOCH)
-                [ "$until_seen" = "false" ] || return 3
-                until_seen=true
-                ENFORCEMENT_STATE_UNTIL_VALUE="$value"
-                ;;
-            REASON)
-                [ "$reason_seen" = "false" ] || return 3
-                reason_seen=true
-                ENFORCEMENT_STATE_REASON_VALUE="$value"
-                ;;
-        esac
-    done <<< "$content"
-    [ "$mode_seen" = "true" ] || return 3
+enforcement_state_value() {
+    local key="$1"
+    if [ -f "$ENFORCEMENT_STATE_FILE" ]; then
+        grep "^${key}=" "$ENFORCEMENT_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-
+    fi
 }
 
 shutdown_state_value() {
@@ -1925,7 +1828,7 @@ write_enforcement_state() {
 }
 
 clear_owned_shutdown_schedule() {
-    local state_boot current_boot pending_status=0 post_cancel_status=0
+    local state_boot current_boot
 
     if [ -f "$SHUTDOWN_STATE_FILE" ]; then
         state_boot=$(grep '^BOOT_ID=' "$SHUTDOWN_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-)
@@ -1935,27 +1838,17 @@ clear_owned_shutdown_schedule() {
             echo "$(date '+%Y-%m-%d %H:%M:%S') 已清理上次开机遗留的关机状态；未触碰本次开机的计划关机。" | tee -a "$LOG_FILE"
             return 0
         fi
-        has_pending_shutdown || pending_status=$?
-        if [ "$pending_status" -gt 1 ]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 无法查询当前计划关机，已保留系统任务和状态文件。" | tee -a "$LOG_FILE"
+        if { [ -z "$state_boot" ] || [ -z "$current_boot" ]; } && has_pending_shutdown; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 无法确认计划关机是否属于本脚本，已保留系统任务和状态文件。" | tee -a "$LOG_FILE"
             return 1
         fi
-        if [ "$pending_status" -eq 0 ]; then
-            if [ -z "$state_boot" ] || [ -z "$current_boot" ]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') 无法确认计划关机是否属于本脚本，已保留系统任务和状态文件。" | tee -a "$LOG_FILE"
-                return 1
-            fi
+        if has_pending_shutdown; then
             if ! pending_shutdown_matches_owned_state; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') 当前计划关机无法与本脚本任务标识匹配，已保留系统任务和状态文件。" | tee -a "$LOG_FILE"
                 return 1
             fi
-            if ! shutdown -c 2>/dev/null; then
+            if ! shutdown -c 2>/dev/null || has_pending_shutdown; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') 无法取消本脚本记录的计划关机，已保留状态文件。" | tee -a "$LOG_FILE"
-                return 1
-            fi
-            has_pending_shutdown || post_cancel_status=$?
-            if [ "$post_cancel_status" -ne 1 ]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') 无法确认本脚本的计划关机已取消，已保留状态文件。" | tee -a "$LOG_FILE"
                 return 1
             fi
         fi
@@ -2507,10 +2400,7 @@ get_traffic_usage() {
     fi
     trafficless_entries=$(vnstat_config_value "TrafficlessEntries")
     trafficless_entries=${trafficless_entries:-1}
-    retention_start=$(retention_state_value) || {
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 错误: vnStat 日历史覆盖状态读取失败" >&2
-        return 1
-    }
+    retention_start=$(cat "$RETENTION_STATE_FILE" 2>/dev/null || true)
     retention_num=${retention_start//-/}
     if [ -z "$retention_start" ] && [ -f "$WORK_DIR/vnstat.conf.before-trafficcop-lite" ] \
         && [[ "$earliest_num" =~ ^[0-9]{8}$ ]] && [ "$earliest_num" -ne 0 ]; then
@@ -2581,22 +2471,18 @@ get_traffic_usage() {
 tc_root_qdisc() {
     local qdisc_state qdisc_line
     qdisc_state=$("$TC_BIN" qdisc show dev "$1" root 2>/dev/null) || return 2
-    qdisc_line=$(awk 'NR == 1 { print; exit }' <<< "$qdisc_state") || return 2
+    qdisc_line=$(awk 'NR == 1 { print; exit }' <<< "$qdisc_state")
     [ -n "$qdisc_line" ] || return 1
     printf '%s\n' "$qdisc_line"
 }
 
 is_default_qdisc_line() {
     local qdisc_line="$1"
-    local qdisc_keyword qdisc_type qdisc_handle qdisc_scope
+    local qdisc_type
 
-    [ -z "$qdisc_line" ] && return 0
-    read -r qdisc_keyword qdisc_type qdisc_handle qdisc_scope _ <<< "$qdisc_line"
-    [ "$qdisc_keyword" = "qdisc" ] || return 2
+    qdisc_type=$(printf '%s\n' "$qdisc_line" | awk '{print $2}')
     case "$qdisc_type" in
-        noqueue|fq_codel|pfifo_fast|mq|fq)
-            [ "$qdisc_handle" = "0:" ] && [ "$qdisc_scope" = "root" ]
-            ;;
+        ""|noqueue|fq_codel|pfifo_fast|mq|fq) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -2718,7 +2604,7 @@ tc_class_line() {
     local class_state class_line
     class_state=$("$TC_BIN" class show dev "$interface" 2>/dev/null) || return 2
     class_line=$(awk -v class_id="$class_id" \
-        '$1 == "class" && $3 == class_id { print; exit }' <<< "$class_state") || return 2
+        '$1 == "class" && $3 == class_id { print; exit }' <<< "$class_state")
     [ -n "$class_line" ] || return 1
     printf '%s\n' "$class_line"
 }
@@ -2744,7 +2630,7 @@ tc_class_value() {
     [ "$status" -eq 0 ] || return "$status"
     value=$(awk -v key="$key" \
         '{ for (i = 1; i < NF; i++) if ($i == key) { print $(i + 1); exit } }' \
-        <<< "$class_line") || return 2
+        <<< "$class_line")
     [ -n "$value" ] || return 1
     printf '%s\n' "$value"
 }
@@ -2837,16 +2723,12 @@ dog_configured_class_records() {
         select((.value.enabled // true) == true) |
         select((.value.bandwidth_limit.enabled // false) == true) |
         select((.value.bandwidth_limit.rate // "unlimited") != "unlimited") |
-        [("x" + .key), ("x" + (.value.bandwidth_limit.class_id // "")),
-         ("x" + (.value.bandwidth_limit.rate // "")),
-         ("x" + ((.value.bandwidth_limit.mark_id // "") | tostring))] | @tsv
+        [.key, (.value.bandwidth_limit.class_id // ""),
+         (.value.bandwidth_limit.rate // ""),
+         ((.value.bandwidth_limit.mark_id // "") | tostring)] | @tsv
     ' "$DOG_CONFIG_FILE" 2>/dev/null) || return 1
     [ -n "$raw_records" ] || return 0
     while IFS=$'\t' read -r port class_id rate mark_id; do
-        port=${port#x}
-        class_id=${class_id#x}
-        rate=${rate#x}
-        mark_id=${mark_id#x}
         tc_rate=$(dog_bandwidth_to_tc "$rate") || return 1
         if ! [[ "$class_id" =~ ^1:([0-9a-fA-F]+)$ ]]; then
             if [[ "$port" =~ ^[0-9]+$ ]]; then
@@ -2865,280 +2747,130 @@ dog_configured_class_records() {
         if [[ "$port" =~ ^([0-9]+)-([0-9]+)$ ]]; then
             start_port="${BASH_REMATCH[1]}"
             end_port="${BASH_REMATCH[2]}"
+            [[ "$mark_id" =~ ^[0-9]+$ ]] || return 1
         elif ! [[ "$port" =~ ^[0-9]+$ ]]; then
             return 1
         fi
-        [[ "$mark_id" =~ ^[0-9]+$ ]] || return 1
         printf '%s\t%s\t%s\t%s\n' "$port" "$class_id" "$tc_rate" "$mark_id"
     done <<< "$raw_records"
 }
 
 dog_configured_class_ids() {
-    local records port class_id expected_rate mark_id
-    local -A seen_ids=()
+    local records
     records=$(dog_configured_class_records) || return 1
-    while IFS=$'\t' read -r port class_id expected_rate mark_id; do
-        [ -n "$port" ] || continue
-        [ -z "${seen_ids[$class_id]+x}" ] || return 1
-        seen_ids["$class_id"]=1
-        printf '%s\n' "$class_id"
-    done <<< "$records"
+    printf '%s\n' "$records" | awk -F '\t' 'NF >= 2 { print $2 }' | sort -u
 }
 
-dog_mark_id_valid() {
-    local mark_id="${1:-}"
-    [[ "$mark_id" =~ ^[0-9]{1,10}$ ]] && [ "$((10#$mark_id))" -le 4294967295 ]
+dog_single_port_filters_complete() {
+    local interface="$1"
+    local port="$2"
+    local class_id="$3"
+    local filter_prio=$((port % 1000 + 1))
+    local sport_hex dport_hex filter_json
+
+    sport_hex=$(printf '%x' "$((port << 16))")
+    dport_hex=$(printf '%x' "$port")
+    filter_json=$("$TC_BIN" -j filter show dev "$interface" parent 1:0 2>/dev/null) || return 2
+    jq -e \
+        --arg class_id "$class_id" \
+        --arg sport_hex "$sport_hex" \
+        --arg dport_hex "$dport_hex" \
+        --argjson port "$port" \
+        --argjson tcp_pref "$filter_prio" \
+        --argjson udp_pref "$((filter_prio + 1000))" '
+        def normhex:
+            tostring | ascii_downcase | sub("^0x"; "") | sub("^0+"; "") |
+            if . == "" then "0" else . end;
+        def u32_count($pref; $value; $mask):
+            [.[] | select(
+                .protocol == "ip" and .kind == "u32" and .pref == $pref and
+                .options.flowid == $class_id and
+                ((.options.match.value // "") | normhex) == ($value | normhex) and
+                ((.options.match.mask // "") | normhex) == ($mask | normhex) and
+                (.options.match.off // -1) == 20
+            )] | length;
+        def flower_count($proto; $key):
+            [.[] | select(
+                .protocol == "ipv6" and .kind == "flower" and
+                .options.classid == $class_id and
+                .options.keys.ip_proto == $proto and
+                .options.keys[$key] == $port
+            )] | length;
+        u32_count($tcp_pref; $sport_hex; "ffff0000") == 1 and
+        u32_count($tcp_pref; $dport_hex; "ffff") == 1 and
+        u32_count($udp_pref; $sport_hex; "ffff0000") == 1 and
+        u32_count($udp_pref; $dport_hex; "ffff") == 1 and
+        flower_count("tcp"; "src_port") == 1 and
+        flower_count("tcp"; "dst_port") == 1 and
+        flower_count("udp"; "src_port") == 1 and
+        flower_count("udp"; "dst_port") == 1
+    ' <<< "$filter_json" >/dev/null
 }
 
-dog_port_spec_bounds() {
-    local port="$1"
-
-    if [[ "$port" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-        [ "${BASH_REMATCH[1]}" -ge 1 ] && [ "${BASH_REMATCH[2]}" -le 65535 ] &&
-            [ "${BASH_REMATCH[1]}" -le "${BASH_REMATCH[2]}" ] || return 1
-        printf '%s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
-    elif [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
-        printf '%s %s\n' "$port" "$port"
-    else
-        return 1
-    fi
-}
-
-dog_port_mark_comment() {
-    printf 'ptd_tc_mark_%s\n' "${1//-/_}"
-}
-
-dog_port_mark_filter_complete() {
+dog_port_range_filter_complete() {
     local interface="$1"
     local class_id="$2"
     local mark_id="$3"
-    local mark_handle filter_state match_count
+    local mark_handle filter_state
 
-    dog_mark_id_valid "$mark_id" || return 1
     mark_handle=$(printf '0x%x/0x%x' "$mark_id" "$TC_MARK_MASK")
     filter_state=$("$TC_BIN" filter show dev "$interface" parent 1:0 2>/dev/null) || return 2
-    match_count=$(printf '%s\n' "$filter_state" | awk -v handle="$mark_handle" -v class_id="$class_id" '
-        index($0, "handle " handle) && index($0, "classid " class_id) { count++ }
-        END { print count + 0 }
-    ') || return 2
-    [ "$match_count" -eq 1 ]
-}
-
-dog_port_mark_rules_complete() {
-    local port="$1"
-    local mark_id="$2"
-    local table_name family comment combined_mask bounds_output table_json jq_status
-    local bounds=()
-
-    dog_mark_id_valid "$mark_id" || return 1
-    table_name=$(jq -er '.nftables.table_name | strings | select(length > 0)' "$DOG_CONFIG_FILE" 2>/dev/null) || return 1
-    family=$(jq -er '.nftables.family | strings | select(length > 0)' "$DOG_CONFIG_FILE" 2>/dev/null) || return 1
-    comment=$(dog_port_mark_comment "$port")
-    combined_mask=$((mark_id | TC_MARK_PRESERVE_MASK))
-    bounds_output=$(dog_port_spec_bounds "$port") || return 1
-    read -r -a bounds <<< "$bounds_output"
-    [ "${#bounds[@]}" -eq 2 ] || return 1
-    table_json=$(nft -j list table "$family" "$table_name" 2>/dev/null) || return 2
-
-    jq -e \
-        --arg comment "$comment" \
-        --argjson mark "$mark_id" \
-        --argjson mask "$combined_mask" \
-        --argjson start "${bounds[0]}" \
-        --argjson finish "${bounds[1]}" '
-        def port_match($right):
-            if $start == $finish then $right == $start
-            else ($right.range? == [$start, $finish]) end;
-        def exact_match($rule; $protocol; $field):
-            [.rule.expr[]? | select(
-                (.match?.op? // "==") == "==" and
-                .match?.left?.payload?.protocol? == $protocol and
-                .match?.left?.payload?.field? == $field and
-                port_match(.match.right)
-            )] | length == 1;
-        def exact_mark($rule):
-            [.rule.expr[]? | select(
-                .mangle?.key?.meta?.key? == "mark" and
-                .mangle?.value["|"][1]? == $mark and
-                .mangle?.value["|"][0]["&"][0]?.meta?.key? == "mark" and
-                .mangle?.value["|"][0]["&"][1]? == $mask
-            )] | length == 1;
-        def signature_count($rules; $chain; $protocol; $field):
-            [$rules[] | select(.rule.chain == $chain) |
-                select(exact_match(.; $protocol; $field)) |
-                select(exact_mark(.))] | length;
-        [.nftables[] | select(.rule?.comment? == $comment)] as $rules |
-        ($rules | length) == 6 and
-        signature_count($rules; "output"; "tcp"; "sport") == 1 and
-        signature_count($rules; "output"; "udp"; "sport") == 1 and
-        signature_count($rules; "forward"; "tcp"; "dport") == 1 and
-        signature_count($rules; "forward"; "udp"; "dport") == 1 and
-        signature_count($rules; "forward"; "tcp"; "sport") == 1 and
-        signature_count($rules; "forward"; "udp"; "sport") == 1
-    ' <<< "$table_json" >/dev/null 2>&1
-    jq_status=$?
-    case "$jq_status" in
-        0) return 0 ;;
-        1) return 1 ;;
-        *) return 2 ;;
-    esac
-}
-
-tc_consumers_match_unified_contract() {
-    local interface="$1"
-    shift
-    local configured_class_ids=("$@")
-    local allowed_class_ids=("1:1" "1:30" "${configured_class_ids[@]}")
-    local class_output class_records filter_output configured_lines record class_id parent allowed_id
-    local status filter_status
-
-    class_output=$(tc_class_output "$interface")
-    status=$?
-    [ "$status" -eq 0 ] || return "$status"
-    class_records=$(printf '%s\n' "$class_output" | awk '
-        $1 == "class" {
-            if ($2 != "htb" || $3 !~ /^1:[0-9a-fA-F]+$/) exit 2
-            parent=""
-            if ($4 == "root") parent="root"
-            for (i=4; i<=NF; i++) if ($i == "parent" && i < NF) parent=$(i+1)
-            if (parent == "") exit 2
-            print $3 "|" parent
-        }
-    ') || return 2
-    [ -n "$class_records" ] || return 1
-
-    local actual_records=()
-    mapfile -t actual_records <<< "$class_records"
-    [ "${#actual_records[@]}" -eq "${#allowed_class_ids[@]}" ] || return 1
-    for record in "${actual_records[@]}"; do
-        IFS='|' read -r class_id parent <<< "$record"
-        if [ "$class_id" = "1:1" ]; then
-            [ "$parent" = "root" ] || return 1
-        else
-            [ "$parent" = "1:1" ] || return 1
-        fi
-        local allowed=false
-        for allowed_id in "${allowed_class_ids[@]}"; do
-            if [ "$class_id" = "$allowed_id" ]; then
-                [ "$allowed" = "false" ] || return 1
-                allowed=true
-            fi
-        done
-        [ "$allowed" = "true" ] || return 1
-    done
-    for allowed_id in "${allowed_class_ids[@]}"; do
-        local seen=0
-        for record in "${actual_records[@]}"; do
-            [ "${record%%|*}" = "$allowed_id" ] && seen=$((seen + 1))
-        done
-        [ "$seen" -eq 1 ] || return 1
-    done
-
-    filter_output=$(tc_filter_output "$interface")
-    status=$?
-    [ "$status" -eq 0 ] || return "$status"
-    configured_lines=$(printf '%s\n' "${configured_class_ids[@]}") || return 2
-    printf '%s\n' "$filter_output" | awk -v configured="$configured_lines" '
-        BEGIN {
-            count = split(configured, ids, "\n")
-            for (i = 1; i <= count; i++) {
-                if (ids[i] == "") continue
-                if (ids[i] in expected && result == 0) result = 1
-                expected[ids[i]] = 1
-                expected_count++
-            }
-        }
-        NF {
-            nonblank++
-            if ($1 != "filter") {
-                if ($0 !~ /^[[:space:]]/) result = 2
-                next
-            }
-            filters++
-            protocol = pref = kind = chain = target = ""
-            protocol_count = pref_count = chain_count = target_count = 0
-            for (i = 1; i <= NF; i++) {
-                if ($i == "protocol" && i < NF) {
-                    protocol = $(i + 1); protocol_count++
-                } else if ($i == "pref" && i + 2 <= NF) {
-                    pref = $(i + 1); kind = $(i + 2); pref_count++
-                } else if ($i == "chain" && i < NF) {
-                    chain = $(i + 1); chain_count++
-                } else if (($i == "flowid" || $i == "*flowid" || $i == "classid") && i < NF) {
-                    target = $(i + 1); target_count++
-                }
-            }
-            if (protocol_count != 1 || pref_count != 1 || chain_count > 1 ||
-                target_count > 1 || protocol == "" || pref == "" || kind == "") {
-                result = 2
-                next
-            }
-            if (chain == "") chain = "-"
-            metadata = protocol SUBSEP pref SUBSEP kind SUBSEP chain
-            if (target == "") {
-                headers[metadata]++
-                next
-            }
-            if (target !~ /^1:[0-9a-fA-F]+$/) {
-                result = 2
-                next
-            }
-            details[metadata]++
-            detail_count++
-            if (!(target in expected) && result == 0) result = 1
-            target_count_by_id[target]++
-            kind_count[target SUBSEP kind]++
-        }
-        END {
-            if (result != 0) exit result
-            if (nonblank > 0 && filters == 0) exit 2
-            for (metadata in headers) {
-                if (!(metadata in details)) exit 1
-            }
-            for (id in expected) {
-                if (target_count_by_id[id] != 1 || kind_count[id SUBSEP "fw"] != 1) exit 1
-            }
-            if (detail_count != expected_count) exit 1
-        }
-    ' >/dev/null 2>&1
-    filter_status=$?
-    case "$filter_status" in
-        0) return 0 ;;
-        1) return 1 ;;
-        *) return 2 ;;
-    esac
+    [ "$(printf '%s\n' "$filter_state" |
+        grep -F "handle $mark_handle" |
+        grep -Fc "classid $class_id")" -eq 1 ]
 }
 
 dog_live_objects_match_config() {
     local interface="$1"
-    local configured_records configured_ids_output
-    local configured_ids=()
+    local configured_records configured_ids class_output filter_output actual_ids filter_ids
     local port class_id expected_rate mark_id minor_hex minor expected_mark status
 
     configured_records=$(dog_configured_class_records) || return 1
-    configured_ids_output=$(dog_configured_class_ids) || return 1
-    if [ -n "$configured_ids_output" ]; then
-        mapfile -t configured_ids <<< "$configured_ids_output"
-    fi
-    tc_consumers_match_unified_contract "$interface" "${configured_ids[@]}"
+    configured_ids=$(printf '%s\n' "$configured_records" | awk -F '\t' 'NF >= 2 { print $2 }' | sort -u)
+    class_output=$(tc_class_output "$interface")
     status=$?
     [ "$status" -eq 0 ] || return "$status"
+    filter_output=$(tc_filter_output "$interface")
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    actual_ids=$(printf '%s\n' "$class_output" |
+        awk '$1 == "class" && $2 == "htb" && $3 != "1:1" && $3 != "1:30" { print $3 }' |
+        sort -u)
+    filter_ids=$(printf '%s\n' "$filter_output" |
+        grep -Eo '(flowid|classid)[[:space:]]+1:[0-9a-fA-F]+' |
+        awk '{ print $2 }' | sort -u)
+
+    while IFS= read -r class_id; do
+        [ -z "$class_id" ] && continue
+        printf '%s\n' "$configured_ids" | grep -Fqx "$class_id" || return 1
+    done <<< "$actual_ids"
+    while IFS= read -r class_id; do
+        [ -z "$class_id" ] && continue
+        printf '%s\n' "$configured_ids" | grep -Fqx "$class_id" || return 1
+    done <<< "$filter_ids"
+    while IFS= read -r class_id; do
+        [ -z "$class_id" ] && continue
+        printf '%s\n' "$actual_ids" | grep -Fqx "$class_id" || return 1
+        printf '%s\n' "$filter_ids" | grep -Fqx "$class_id" || return 1
+    done <<< "$configured_ids"
 
     while IFS=$'\t' read -r port class_id expected_rate mark_id; do
         [ -n "$port" ] || continue
         tc_class_rate_matches "$interface" "$class_id" "$TC_DEFAULT_CLASS_RATE" "$expected_rate"
         status=$?
         [ "$status" -eq 0 ] || return "$status"
-        minor_hex=${class_id#1:}
-        [[ "$minor_hex" =~ ^[0-9a-fA-F]+$ ]] || return 1
-        minor=$((16#$minor_hex))
-        expected_mark=$((0x50000000 | (minor << 12)))
-        [[ "$mark_id" =~ ^[0-9]+$ ]] && [ "$mark_id" -eq "$expected_mark" ] || return 1
-        dog_port_mark_filter_complete "$interface" "$class_id" "$mark_id"
-        status=$?
-        [ "$status" -eq 0 ] || return "$status"
-        dog_port_mark_rules_complete "$port" "$mark_id"
-        status=$?
+        if [[ "$port" =~ ^[0-9]+$ ]]; then
+            dog_single_port_filters_complete "$interface" "$port" "$class_id"
+            status=$?
+        else
+            minor_hex=${class_id#1:}
+            [[ "$minor_hex" =~ ^[0-9a-fA-F]+$ ]] || return 1
+            minor=$((16#$minor_hex))
+            expected_mark=$((0x50000000 | (minor << 12)))
+            [[ "$mark_id" =~ ^[0-9]+$ ]] && [ "$mark_id" -eq "$expected_mark" ] || return 1
+            dog_port_range_filter_complete "$interface" "$class_id" "$mark_id"
+            status=$?
+        fi
         [ "$status" -eq 0 ] || return "$status"
     done <<< "$configured_records"
 }
@@ -3162,8 +2894,7 @@ tc_root_is_recognized_dog_htb() {
 
 tc_root_is_unified_compatible() {
     local interface="$1"
-    local status dog_ids_output
-    local dog_ids=()
+    local status
 
     tc_root_is_htb_handle_one "$interface"
     status=$?
@@ -3172,15 +2903,6 @@ tc_root_is_unified_compatible() {
     status=$?
     [ "$status" -eq 0 ] || return "$status"
     tc_root_has_parent_class "$interface"
-    status=$?
-    [ "$status" -eq 0 ] || return "$status"
-    if [ -e "$DOG_CONFIG_FILE" ] || [ -L "$DOG_CONFIG_FILE" ]; then
-        dog_ids_output=$(dog_configured_class_ids) || return 1
-        if [ -n "$dog_ids_output" ]; then
-            mapfile -t dog_ids <<< "$dog_ids_output"
-        fi
-    fi
-    tc_consumers_match_unified_contract "$interface" "${dog_ids[@]}"
     status=$?
     [ "$status" -eq 0 ] || return "$status"
     tc_state_is_unified_for_interface "$interface" && return 0
@@ -3212,19 +2934,15 @@ tc_default_class_is_safe() {
 
 tc_has_other_consumers() {
     local interface="$1"
-    local class_output filter_output status other_class_status=0
+    local class_output filter_output status
 
     class_output=$(tc_class_output "$interface")
     status=$?
     [ "$status" -eq 0 ] || return "$status"
-    printf '%s\n' "$class_output" |
-        awk '$1 == "class" && $3 != "1:1" && $3 != "1:30" { found=1 } END { exit found ? 0 : 1 }' ||
-        other_class_status=$?
-    case "$other_class_status" in
-        0) return 0 ;;
-        1) ;;
-        *) return 2 ;;
-    esac
+    if printf '%s\n' "$class_output" |
+        awk '$1 == "class" && $3 != "1:1" && $3 != "1:30" { found=1 } END { exit found ? 0 : 1 }'; then
+        return 0
+    fi
     filter_output=$(tc_filter_output "$interface")
     status=$?
     [ "$status" -eq 0 ] || return "$status"
@@ -3284,9 +3002,7 @@ write_tc_state() {
 tc_verify_unified_hierarchy() {
     local interface="$1"
     local parent_rate="$2"
-    local consumer_scope="${3:-full}"
-    local class_line status dog_ids_output
-    local dog_ids=()
+    local class_line status
 
     tc_root_is_htb_handle_one "$interface"
     status=$?
@@ -3306,21 +3022,6 @@ tc_verify_unified_hierarchy() {
     status=$?
     [ "$status" -eq 0 ] || return "$status"
     tc_class_rate_matches "$interface" "1:30" "$TC_DEFAULT_CLASS_RATE" "$parent_rate"
-    status=$?
-    [ "$status" -eq 0 ] || return "$status"
-    case "$consumer_scope" in
-        full)
-            if [ -e "$DOG_CONFIG_FILE" ] || [ -L "$DOG_CONFIG_FILE" ]; then
-                dog_ids_output=$(dog_configured_class_ids) || return 1
-                if [ -n "$dog_ids_output" ]; then
-                    mapfile -t dog_ids <<< "$dog_ids_output"
-                fi
-            fi
-            ;;
-        base) ;;
-        *) return 1 ;;
-    esac
-    tc_consumers_match_unified_contract "$interface" "${dog_ids[@]}"
 }
 
 tc_replace_base_classes() {
@@ -3365,7 +3066,7 @@ apply_tc_limit() {
     local old_parent_rate="" old_parent_ceil=""
     local old_default_line="" old_default_rate="" old_default_ceil=""
     local legacy_speed="" rollback_ok=false
-    local query_status verify_status verify_scope="full"
+    local query_status verify_status
 
     if [ -z "$TC_BIN" ] || ! [[ "$speed" =~ ^[1-9][0-9]*$ ]]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 未找到系统 tc 命令，无法执行限速" | tee -a "$LOG_FILE"
@@ -3461,10 +3162,6 @@ apply_tc_limit() {
         return 1
     fi
 
-    # 新 root 尚不可能包含未运行的 Dog 子类；提交前只核验 NTC 基础层。
-    # 已有统一层级仍必须完整核验 Dog 消费者，不能借此接管异常规则。
-    [ "$mode" = "existing" ] || verify_scope="base"
-
     if ! write_tc_state "$MAIN_INTERFACE" "$speed" "" "$prepared_state"; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 无法预写统一 HTB 状态，已拒绝修改系统 qdisc。" | tee -a "$LOG_FILE"
         release_tc_hierarchy_lock
@@ -3480,7 +3177,7 @@ apply_tc_limit() {
     fi
 
     if tc_replace_base_classes "$MAIN_INTERFACE" "${speed}kbit" &&
-       tc_verify_unified_hierarchy "$MAIN_INTERFACE" "${speed}kbit" "$verify_scope" &&
+       tc_verify_unified_hierarchy "$MAIN_INTERFACE" "${speed}kbit" &&
        mv -f "$prepared_state" "$TC_STATE_FILE"; then
         release_tc_hierarchy_lock
         echo "$(date '+%Y-%m-%d %H:%M:%S') 统一 HTB 整机限速已应用，现有端口子类保持不变。" | tee -a "$LOG_FILE"
@@ -3735,21 +3432,13 @@ write_usage_state() {
 }
 
 has_pending_shutdown() {
-    local status
     if shutdown --help 2>&1 | grep -q -- '--show'; then
         shutdown --show >/dev/null 2>&1
-        status=$?
     elif command_exists pgrep; then
         pgrep -x shutdown >/dev/null 2>&1
-        status=$?
     else
-        return 2
+        return 1
     fi
-    case "$status" in
-        0) return 0 ;;
-        1) return 1 ;;
-        *) return 2 ;;
-    esac
 }
 
 shutdown_task_token_from_state() {
@@ -3760,9 +3449,8 @@ shutdown_task_token_from_state() {
 }
 
 pending_shutdown_matches_owned_state() {
-    local task_token wall_state pending_status=0
-    has_pending_shutdown || pending_status=$?
-    [ "$pending_status" -eq 0 ] || return "$pending_status"
+    local task_token wall_state
+    has_pending_shutdown || return 1
     task_token=$(shutdown_task_token_from_state) || return 1
 
     if command_exists busctl; then
@@ -3821,7 +3509,7 @@ shutdown_reboot_guard_active() {
         return 2
     fi
     if [ "$state_period" != "$current_period" ]; then
-        rm -f "$SHUTDOWN_STATE_FILE" || return 2
+        rm -f "$SHUTDOWN_STATE_FILE"
         return 1
     fi
     if [ -n "$state_boot" ] && [ -n "$boot_id" ] && [ "$state_boot" != "$boot_id" ]; then
@@ -3839,25 +3527,15 @@ ENFORCEMENT_GUARD_REASON=""
 ENFORCEMENT_GUARD_REMAINING=0
 
 enforcement_guard_active() {
-    local mode until_epoch reason now state_status=0
+    local mode until_epoch reason now
 
     ENFORCEMENT_GUARD_MODE=""
     ENFORCEMENT_GUARD_REASON=""
     ENFORCEMENT_GUARD_REMAINING=0
-    read_enforcement_state || state_status=$?
-    case "$state_status" in
-        0)
-            mode="$ENFORCEMENT_STATE_MODE_VALUE"
-            until_epoch="$ENFORCEMENT_STATE_UNTIL_VALUE"
-            reason="$ENFORCEMENT_STATE_REASON_VALUE"
-            ;;
-        1) return 1 ;;
-        2) return 2 ;;
-        3)
-            rm -f "$ENFORCEMENT_STATE_FILE" || return 2
-            return 1
-            ;;
-    esac
+    [ -f "$ENFORCEMENT_STATE_FILE" ] || return 1
+    mode=$(enforcement_state_value "MODE")
+    until_epoch=$(enforcement_state_value "UNTIL_EPOCH")
+    reason=$(enforcement_state_value "REASON")
     case "$mode" in
         paused)
             ENFORCEMENT_GUARD_MODE="paused"
@@ -3866,12 +3544,12 @@ enforcement_guard_active() {
             ;;
         grace)
             if ! [[ "$until_epoch" =~ ^[0-9]+$ ]]; then
-                rm -f "$ENFORCEMENT_STATE_FILE" || return 2
+                rm -f "$ENFORCEMENT_STATE_FILE"
                 return 1
             fi
             now=$(date +%s)
             if [ "$now" -ge "$until_epoch" ]; then
-                rm -f "$ENFORCEMENT_STATE_FILE" || return 2
+                rm -f "$ENFORCEMENT_STATE_FILE"
                 return 1
             fi
             ENFORCEMENT_GUARD_MODE="grace"
@@ -3880,7 +3558,7 @@ enforcement_guard_active() {
             return 0
             ;;
         *)
-            rm -f "$ENFORCEMENT_STATE_FILE" || return 2
+            rm -f "$ENFORCEMENT_STATE_FILE"
             return 1
             ;;
     esac
@@ -3932,7 +3610,6 @@ tc_boot_grace_active() {
 # 修改 check_and_limit_traffic 函数
 check_and_limit_traffic() {
     local current_usage limit_threshold unit_label shutdown_guard_status comparison_status
-    local enforcement_guard_status=0 pending_status=0
     local limit_reached=false
     [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && unit_label="GB" || unit_label="GiB"
 
@@ -3997,24 +3674,16 @@ check_and_limit_traffic() {
                 return 1
             fi
         fi
-        enforcement_guard_active || enforcement_guard_status=$?
-        case "$enforcement_guard_status" in
-            0)
-                if [ "$ENFORCEMENT_GUARD_MODE" = "grace" ]; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') 当前处于执行宽限期，剩余约 $ENFORCEMENT_GUARD_REMAINING 分钟；本轮只统计，不执行限制。" | tee -a "$LOG_FILE"
-                    write_usage_state "grace" "$current_usage" "$limit_threshold" "$unit_label" || return 1
-                else
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') 限制执行已暂停（原因：${ENFORCEMENT_GUARD_REASON:-manual}）；本轮只统计，不执行限制。" | tee -a "$LOG_FILE"
-                    write_usage_state "paused" "$current_usage" "$limit_threshold" "$unit_label" || return 1
-                fi
-                return 0
-                ;;
-            1) ;;
-            *)
-                echo "$(date '+%Y-%m-%d %H:%M:%S') 无法可靠读取限制执行状态，本轮拒绝改变现有执行状态。" | tee -a "$LOG_FILE"
-                return 1
-                ;;
-        esac
+        if enforcement_guard_active; then
+            if [ "$ENFORCEMENT_GUARD_MODE" = "grace" ]; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 当前处于执行宽限期，剩余约 $ENFORCEMENT_GUARD_REMAINING 分钟；本轮只统计，不执行限制。" | tee -a "$LOG_FILE"
+                write_usage_state "grace" "$current_usage" "$limit_threshold" "$unit_label" || return 1
+            else
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 限制执行已暂停（原因：${ENFORCEMENT_GUARD_REASON:-manual}）；本轮只统计，不执行限制。" | tee -a "$LOG_FILE"
+                write_usage_state "paused" "$current_usage" "$limit_threshold" "$unit_label" || return 1
+            fi
+            return 0
+        fi
         if [ "$LIMIT_MODE" = "tc" ]; then
             if tc_boot_grace_active; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') 系统仍在开机限速宽限期，剩余约 $TC_BOOT_GRACE_REMAINING 分钟；暂不下发 TC 限速。" | tee -a "$LOG_FILE"
@@ -4032,43 +3701,24 @@ check_and_limit_traffic() {
             fi
             write_usage_state "limited" "$current_usage" "$limit_threshold" "$unit_label" || return 1
         elif [ "$LIMIT_MODE" = "shutdown" ]; then
-            pending_status=0
-            has_pending_shutdown || pending_status=$?
-            case "$pending_status" in
-                0)
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制，系统已有计划关机，未重复提交或覆盖" | tee -a "$LOG_FILE"
-                    ;;
-                1)
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制，系统将在 1 分钟后关机" | tee -a "$LOG_FILE"
-                    if ! write_shutdown_state; then
-                        echo "$(date '+%Y-%m-%d %H:%M:%S') 无法预写关机保护状态，本轮拒绝提交计划关机" | tee -a "$LOG_FILE"
-                        return 1
-                    fi
-                    if ! shutdown -h +1 "TrafficCop-Lite[$SHUTDOWN_TASK_TOKEN] 流量超出限制，系统将在 1 分钟后关机"; then
-                        pending_status=0
-                        has_pending_shutdown || pending_status=$?
-                        case "$pending_status" in
-                            0)
-                                echo "$(date '+%Y-%m-%d %H:%M:%S') 关机命令返回失败但仍检测到计划任务，已保留归属状态供安全清理" | tee -a "$LOG_FILE"
-                                ;;
-                            1)
-                                if ! rm -f "$SHUTDOWN_STATE_FILE"; then
-                                    echo "$(date '+%Y-%m-%d %H:%M:%S') 计划关机失败，且无法清理预写状态；下轮将继续安全核验" | tee -a "$LOG_FILE"
-                                fi
-                                ;;
-                            *)
-                                echo "$(date '+%Y-%m-%d %H:%M:%S') 关机命令返回失败，且无法查询计划任务；已保留预写状态供下轮安全核验" | tee -a "$LOG_FILE"
-                                ;;
-                        esac
-                        echo "$(date '+%Y-%m-%d %H:%M:%S') 计划关机失败" | tee -a "$LOG_FILE"
-                        return 1
-                    fi
-                    ;;
-                *)
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') 无法查询当前计划关机，本轮拒绝提交新任务。" | tee -a "$LOG_FILE"
+            if has_pending_shutdown; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制，系统已有计划关机，未重复提交或覆盖" | tee -a "$LOG_FILE"
+            else
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制，系统将在 1 分钟后关机" | tee -a "$LOG_FILE"
+                if ! write_shutdown_state; then
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') 无法预写关机保护状态，本轮拒绝提交计划关机" | tee -a "$LOG_FILE"
                     return 1
-                    ;;
-            esac
+                fi
+                if ! shutdown -h +1 "TrafficCop-Lite[$SHUTDOWN_TASK_TOKEN] 流量超出限制，系统将在 1 分钟后关机"; then
+                    if has_pending_shutdown; then
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') 关机命令返回失败但仍检测到计划任务，已保留归属状态供安全清理" | tee -a "$LOG_FILE"
+                    elif ! rm -f "$SHUTDOWN_STATE_FILE"; then
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') 计划关机失败，且无法清理预写状态；下轮将继续安全核验" | tee -a "$LOG_FILE"
+                    fi
+                    echo "$(date '+%Y-%m-%d %H:%M:%S') 计划关机失败" | tee -a "$LOG_FILE"
+                    return 1
+                fi
+            fi
             write_usage_state "shutdown" "$current_usage" "$limit_threshold" "$unit_label" || return 1
         fi
     else
@@ -4083,14 +3733,10 @@ check_and_limit_traffic() {
 
 # 检查是否需要重置限制
 check_reset_limit() {
-    local period_start last_reset_period="" tmp_file enforcement_reason=""
-    local enforcement_status=0
+    local period_start last_reset_period tmp_file enforcement_reason
 
     period_start=$(get_period_start_date)
-    if [ -e "$PERIOD_STATE_FILE" ]; then
-        [ -f "$PERIOD_STATE_FILE" ] && [ -r "$PERIOD_STATE_FILE" ] || return 1
-        last_reset_period=$(cat "$PERIOD_STATE_FILE" 2>/dev/null) || return 1
-    fi
+    last_reset_period=$(cat "$PERIOD_STATE_FILE" 2>/dev/null || true)
 
     if [ "$last_reset_period" = "$period_start" ]; then
         return 0
@@ -4104,15 +3750,10 @@ check_reset_limit() {
             return 1
         fi
     fi
-    rm -f "$USAGE_STATE_FILE" || return 1
-    read_enforcement_state || enforcement_status=$?
-    case "$enforcement_status" in
-        0) enforcement_reason="$ENFORCEMENT_STATE_REASON_VALUE" ;;
-        1|3) ;;
-        *) return 1 ;;
-    esac
+    rm -f "$USAGE_STATE_FILE"
+    enforcement_reason=$(enforcement_state_value "REASON")
     if [ "$enforcement_reason" = "shutdown_reboot" ]; then
-        rm -f "$ENFORCEMENT_STATE_FILE" || return 1
+        rm -f "$ENFORCEMENT_STATE_FILE"
     fi
 
     tmp_file="${PERIOD_STATE_FILE}.tmp.$$"
@@ -4321,12 +3962,7 @@ recover_owned_tc_hierarchy() {
         echo "无法删除当前冲突 root qdisc，TrafficCop 规则未重建。" >&2
         return 1
     fi
-    if ! rm -f "$DOG_TC_OWNER_FILE"; then
-        rm -f "$prepared_state"
-        release_tc_hierarchy_lock
-        echo "当前 qdisc 已处理，但无法删除旧的 Dog 归属标记；已停止重建。" >&2
-        return 1
-    fi
+    rm -f "$DOG_TC_OWNER_FILE"
 
     if [ "$state_expected" = "true" ]; then
         if "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root handle 1: htb default 30 2>/dev/null &&

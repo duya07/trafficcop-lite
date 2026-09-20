@@ -72,7 +72,7 @@ test_period_reset_cancels_owned_shutdown() {
         rm -f "$SHUTDOWN_STATE_FILE"
     }
     clear_owned_tc_rules() { printf '%s\n' 'called' > "$work/tc-cleared"; }
-    read_enforcement_state() { return 1; }
+    enforcement_state_value() { printf '%s\n' ''; }
 
     check_reset_limit >/dev/null || return 1
     assert_file_content 'called' "$work/shutdown-cancelled" || return 1
@@ -99,7 +99,7 @@ test_period_reset_stops_when_shutdown_cancel_fails() {
     get_period_start_date() { printf '%s\n' '2027-01-01'; }
     clear_owned_shutdown_schedule() { return 1; }
     clear_owned_tc_rules() { printf '%s\n' 'unexpected' > "$work/tc-cleared"; }
-    read_enforcement_state() { return 1; }
+    enforcement_state_value() { printf '%s\n' ''; }
 
     if check_reset_limit >/dev/null; then
         return 1
@@ -338,12 +338,11 @@ test_cron_service_start_failure_propagates_to_dependency_check() {
     load_function "$MONITOR_SCRIPT" ensure_service_running || return 1
     command_exists() { [ "$1" = systemctl ]; }
     systemctl() {
-        case "${1:-}" in
-            list-unit-files) printf '%s\n' 'cron.service enabled' ;;
-            is-active) return 1 ;;
-        esac
+        if [ "${1:-}" = list-unit-files ]; then
+            printf '%s\n' 'cron.service enabled'
+        fi
     }
-    run_privileged() { return 0; }
+    run_privileged() { return 42; }
     if ensure_service_running cron cron > "$work/output"; then
         return 1
     fi
@@ -688,16 +687,6 @@ test_vnstat_custom_daemon_config_path_is_preserved_idempotently() {
     resolve_vnstat_config_path || return 1
     [ "$VNSTAT_CONFIG_PATH" = "$config_path" ] || return 1
     assert_file_content "$config_path" "$VNSTAT_CONFIG_PATH_FILE" || return 1
-    assert_absent "$work/mv-called" || return 1
-
-    cat() {
-        [ "${1:-}" != "$VNSTAT_CONFIG_PATH_FILE" ] || return 41
-        command cat "$@"
-    }
-    if resolve_vnstat_config_path; then
-        return 1
-    fi
-    [ "$(command cat "$VNSTAT_CONFIG_PATH_FILE")" = "$config_path" ] || return 1
     assert_absent "$work/mv-called"
 }
 
@@ -729,19 +718,7 @@ test_vnstat_default_config_requires_matching_install_prefixes() {
     vnstat() { printf 'Config file: %s\n' "$config_path"; }
     resolve_vnstat_config_path || return 1
     [ "$VNSTAT_CONFIG_PATH" = "$config_path" ] || return 1
-    assert_file_content "$config_path" "$VNSTAT_CONFIG_PATH_FILE" || return 1
-
-    local second_config="$work/second-vnstat.conf"
-    printf '%s\n' 'SaveInterval 2' > "$second_config"
-    rm -f "$VNSTAT_CONFIG_PATH_FILE"
-    unset VNSTAT_CONFIG_PATH
-    vnstat() {
-        printf 'Config file: %s\nConfig file: %s\n' "$config_path" "$second_config"
-    }
-    if resolve_vnstat_config_path; then
-        return 1
-    fi
-    assert_absent "$VNSTAT_CONFIG_PATH_FILE"
+    assert_file_content "$config_path" "$VNSTAT_CONFIG_PATH_FILE"
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
@@ -1126,18 +1103,7 @@ test_update_replaces_full_release_and_preserves_state() {
     grep -Fqx 'SCRIPT_VERSION="1.0.2"' "$backup_main" || return 1
     [ "$UPDATE_PREVIOUS_VERSION" = '1.0.2' ] || return 1
     [ "$UPDATE_NEW_VERSION" = '1.1.9' ] || return 1
-    assert_file_content 'called' "$work/shortcut-called" || return 1
-
-    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.2.0"' > "$remote_dir/trafficcop-lite.sh"
-    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.2.0"' > "$remote_dir/$MONITOR_SCRIPT"
-    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.2.0"' > "$remote_dir/$TELEGRAM_SCRIPT"
-    printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v3.0' > "$remote_dir/$MACHINE_LIMIT_SCRIPT"
-    install_shortcut_link() { return 1; }
-    local update_status=0
-    update_scripts 'https://example.invalid/release' >/dev/null || update_status=$?
-    [ "$update_status" -eq 2 ] || return 1
-    grep -Fqx 'SCRIPT_VERSION="1.2.0"' "$WORK_DIR/trafficcop-lite.sh" || return 1
-    grep -Fqx '# TrafficCop Lite Machine Limit v3.0' "$WORK_DIR/$MACHINE_LIMIT_SCRIPT"
+    assert_file_content 'called' "$work/shortcut-called"
 }
 
 # shellcheck disable=SC2034
@@ -1817,15 +1783,11 @@ test_tc_builds_unified_htb_directly() {
         [ "$lock_held" = "true" ] || return 1
         printf '%s\n' "$1|$2" > "$work/base-classes"
     }
-    tc_verify_unified_hierarchy() {
-        printf '%s\n' "${3:-full}" > "$work/verify-scope"
-        return 0
-    }
+    tc_verify_unified_hierarchy() { return 0; }
 
     apply_tc_limit 90 >/dev/null || return 1
     grep -Fq 'qdisc replace dev eth0 root handle 1: htb default 30' "$work/tc-called" || return 1
     assert_file_content 'eth0|90kbit' "$work/base-classes" || return 1
-    assert_file_content 'base' "$work/verify-scope" || return 1
     assert_file_content 'eth0|90' "$TC_STATE_FILE" || return 1
     [ "$lock_held" = "false" ] || return 1
     ! grep -Eq 'dog_tc_manager|--apply-global-tc-limit|--remove-global-tc-limit' "$MONITOR_SCRIPT"
@@ -1948,37 +1910,14 @@ test_invalid_dog_config_cannot_authorize_adoption() {
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
-test_dog_config_parser_preserves_empty_runtime_ids() {
-    local work
-    work=$(mktemp -d "$TEST_ROOT/dog-empty-runtime-ids.XXXXXX") || return 1
-    DOG_CONFIG_FILE="$work/config.json"
-    cat > "$DOG_CONFIG_FILE" <<'JSON'
-{"ports":{"3266":{"enabled":true,"bandwidth_limit":{"enabled":true,"rate":"10Mbps"}}}}
-JSON
-
-    load_function "$MONITOR_SCRIPT" dog_configured_class_records || return 1
-    dog_bandwidth_to_tc() {
-        printf '%s\n' "$1" > "$work/rate"
-        printf '%s\n' '10mbit'
-    }
-
-    if dog_configured_class_records >/dev/null; then
-        return 1
-    fi
-    assert_file_content '10Mbps' "$work/rate"
-}
-
-# shellcheck disable=SC2034,SC2209,SC2317,SC2329
 test_unified_hierarchy_verification_requires_full_contract() {
     TC_DEFAULT_CLASS_RATE='1kbit'
-    DOG_CONFIG_FILE="$TEST_ROOT/nonexistent-dog-config"
     load_function "$MONITOR_SCRIPT" tc_verify_unified_hierarchy || return 1
     tc_root_is_htb_handle_one() { return 0; }
     tc_root_has_default_30() { return 1; }
     tc_root_has_parent_class() { return 0; }
     tc_class_line() { printf '%s\n' 'class htb 1:30 parent 1:1'; }
     tc_class_rate_matches() { return 0; }
-    tc_consumers_match_unified_contract() { return 0; }
     if tc_verify_unified_hierarchy eth0 90kbit; then
         return 1
     fi
@@ -1997,30 +1936,6 @@ test_unified_hierarchy_verification_requires_full_contract() {
 
     tc_class_line() { printf '%s\n' 'class htb 1:30 parent 1:1'; }
     tc_verify_unified_hierarchy eth0 90kbit
-}
-
-# shellcheck disable=SC2034,SC2209,SC2317,SC2329
-test_unified_hierarchy_base_verification_skips_pending_dog_consumers() {
-    TC_DEFAULT_CLASS_RATE='1kbit'
-    DOG_CONFIG_FILE="$TEST_ROOT/pending-dog-config"
-    printf '%s\n' '{"ports":{"3266":{"bandwidth_limit":{"enabled":true,"rate":"10Mbps"}}}}' > "$DOG_CONFIG_FILE"
-
-    load_function "$MONITOR_SCRIPT" tc_verify_unified_hierarchy || return 1
-    tc_root_is_htb_handle_one() { return 0; }
-    tc_root_has_default_30() { return 0; }
-    tc_root_has_parent_class() { return 0; }
-    tc_class_line() { printf '%s\n' 'class htb 1:30 parent 1:1'; }
-    tc_class_rate_matches() { return 0; }
-    dog_configured_class_ids() { return 1; }
-    tc_consumers_match_unified_contract() { [ "$#" -eq 1 ]; }
-
-    if tc_verify_unified_hierarchy eth0 90kbit full; then
-        return 1
-    fi
-    tc_verify_unified_hierarchy eth0 90kbit base || return 1
-    if tc_verify_unified_hierarchy eth0 90kbit invalid; then
-        return 1
-    fi
 }
 
 # shellcheck disable=SC2016,SC2034,SC2209,SC2317,SC2329
@@ -2172,21 +2087,6 @@ EOF
     if read_config >/dev/null; then
         return 1
     fi
-
-    BOT_TOKEN='stale-secret'
-    rm -f "$CONFIG_FILE"
-    if read_config >/dev/null; then
-        return 1
-    fi
-    [ -z "${BOT_TOKEN:-}" ] || return 1
-
-    printf '%s\n' 'CONFIG_FORMAT=plain-v2' > "$CONFIG_FILE"
-    BOT_TOKEN='stale-secret'
-    chmod() { return 1; }
-    if read_config >/dev/null; then
-        return 1
-    fi
-    [ -z "${BOT_TOKEN:-}" ]
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
@@ -2388,7 +2288,6 @@ test_traffic_accounting_modes() {
     RETENTION_STATE_FILE="$WORK_DIR/coverage"
 
     load_function "$MONITOR_SCRIPT" normalize_vnstat_json_for_interface || return 1
-    load_function "$MONITOR_SCRIPT" retention_state_value || return 1
     load_function "$MONITOR_SCRIPT" get_traffic_usage || return 1
     get_period_start_date() { printf '%s\n' '2026-07-01'; }
     get_period_end_date() { printf '%s\n' '2026-07-31'; }
@@ -2808,20 +2707,7 @@ test_machine_legacy_shutdown_cancel_failure_is_reported() {
     if disable_machine_limit <<< 'y' >/dev/null; then
         return 1
     fi
-    [ -f "$BACKUP_CONFIG_FILE" ] || return 1
-
-    printf '%s\n' 'LIMIT_MODE=tc' > "$CONFIG_FILE"
-    printf '%s\n' 'MODE=paused' > "$ENFORCEMENT_STATE_FILE"
-    rm() {
-        if [ "${1:-}" = -f ] && [ "${2:-}" = "$ENFORCEMENT_STATE_FILE" ]; then
-            return 42
-        fi
-        command rm "$@"
-    }
-    if disable_machine_limit >/dev/null; then
-        return 1
-    fi
-    [ -f "$ENFORCEMENT_STATE_FILE" ]
+    [ -f "$BACKUP_CONFIG_FILE" ]
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
@@ -2863,26 +2749,20 @@ test_shortcut_conflicts_are_preserved() {
     printf '%s\n' '#!/bin/bash' > "$WORK_DIR/trafficcop-lite.sh"
 
     load_function "$ROOT_DIR/trafficcop-lite.sh" install_shortcut_link || return 1
-    load_function "$ROOT_DIR/trafficcop-lite.sh" shortcut_command_hint || return 1
     printf '%s\n' 'foreign-command' > "$SHORTCUT_PATH"
-    SHORTCUT_COMMAND_AVAILABLE=true
-    install_shortcut_link >/dev/null || return 1
-    [ "$SHORTCUT_COMMAND_AVAILABLE" = false ] || return 1
+    if install_shortcut_link >/dev/null; then
+        return 1
+    fi
     assert_file_content 'foreign-command' "$SHORTCUT_PATH" || return 1
-    [ "$(shortcut_command_hint)" = "sudo bash $WORK_DIR/trafficcop-lite.sh" ] || return 1
 
     rm -f "$SHORTCUT_PATH"
     broken_target="$work/missing-target"
     if ln -s "$broken_target" "$SHORTCUT_PATH" 2>/dev/null && [ -L "$SHORTCUT_PATH" ]; then
-        SHORTCUT_COMMAND_AVAILABLE=true
-        install_shortcut_link >/dev/null || return 1
-        [ "$SHORTCUT_COMMAND_AVAILABLE" = false ] || return 1
+        if install_shortcut_link >/dev/null; then
+            return 1
+        fi
         [ "$(readlink "$SHORTCUT_PATH")" = "$broken_target" ] || return 1
     fi
-
-    rm -f "$SHORTCUT_PATH"
-    install_shortcut_link >/dev/null || return 1
-    [ "$(shortcut_command_hint)" = 'sudo ntc' ]
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
@@ -3699,312 +3579,11 @@ test_tc_recovery_unit_ownership_is_fail_closed() {
 
     rm -f "$TC_RECOVERY_UNIT_FILE"
     install_tc_recovery_service_files || return 1
-    grep -Fq '[ -e "$dog_script" ] || [ -L "$dog_script" ] ||' "$TC_RECOVERY_RUNNER" || return 1
-    grep -Fq '[ -r "$dog_script" ] && [ -r "$dog_config" ]' "$TC_RECOVERY_RUNNER" || return 1
-    grep -Fq 'Dog installation is incomplete; TC recovery was not run for Dog.' "$TC_RECOVERY_RUNNER" || return 1
-    grep -Fq '[ -e "$ntc_monitor" ] || [ -L "$ntc_monitor" ] ||' "$TC_RECOVERY_RUNNER" || return 1
-    grep -Fq '[ -r "$ntc_monitor" ] && [ -r "$ntc_config" ]' "$TC_RECOVERY_RUNNER" || return 1
-    grep -Fq 'TrafficCop Lite installation is incomplete; TC recovery was not run for NTC.' "$TC_RECOVERY_RUNNER" || return 1
     grep -Fq 'bash "$dog_script" --recover-tc "$mode" || result=1' "$TC_RECOVERY_RUNNER" || return 1
     grep -Fq 'bash "$ntc_monitor" --tc-recover-owned "$mode" || result=1' "$TC_RECOVERY_RUNNER" || return 1
     grep -Fq 'exit "$result"' "$TC_RECOVERY_RUNNER" || return 1
     extract_function "$ROOT_DIR/trafficcop-lite.sh" uninstall_lite |
         grep -Fq 'if ! cleanup_tc_recovery_files_if_unused'
-}
-
-# shellcheck disable=SC2034,SC2209,SC2317,SC2329
-test_shutdown_query_errors_are_fail_closed() {
-    local work status
-    work=$(mktemp -d "$TEST_ROOT/shutdown-query-errors.XXXXXX") || return 1
-    LOG_FILE="$work/log"
-    WORK_DIR="$work"
-    RED=''
-    NC=''
-
-    shutdown() {
-        case "${1:-}" in
-            --help) printf '%s\n' '--show' ;;
-            --show) return 42 ;;
-            *) printf '%s\n' "$*" >> "$work/shutdown-called" ;;
-        esac
-    }
-    command_exists() { return 1; }
-    load_function "$MONITOR_SCRIPT" has_pending_shutdown || return 1
-    status=0
-    has_pending_shutdown || status=$?
-    [ "$status" -eq 2 ] || return 1
-    load_function "$ROOT_DIR/trafficcop-lite.sh" lite_has_pending_shutdown || return 1
-    status=0
-    lite_has_pending_shutdown || status=$?
-    [ "$status" -eq 2 ] || return 1
-    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" has_pending_shutdown || return 1
-    status=0
-    has_pending_shutdown || status=$?
-    [ "$status" -eq 2 ] || return 1
-
-    cat() {
-        if [ "${1:-}" = /proc/sys/kernel/random/boot_id ]; then
-            printf '%s\n' boot-a
-        else
-            command cat "$@"
-        fi
-    }
-    load_function "$MONITOR_SCRIPT" shutdown_state_value || return 1
-    load_function "$MONITOR_SCRIPT" clear_owned_shutdown_schedule || return 1
-    SHUTDOWN_STATE_FILE="$work/monitor-state"
-    printf '%s\n' 'BOOT_ID=boot-a' > "$SHUTDOWN_STATE_FILE"
-    has_pending_shutdown() { return 2; }
-    clear_owned_shutdown_schedule >/dev/null 2>&1 && return 1
-    [ -f "$SHUTDOWN_STATE_FILE" ] || return 1
-
-    load_function "$ROOT_DIR/trafficcop-lite.sh" cancel_shutdown_interactive || return 1
-    SHUTDOWN_STATE_FILE="$work/main-state"
-    printf '%s\n' 'BOOT_ID=boot-a' > "$SHUTDOWN_STATE_FILE"
-    lite_has_pending_shutdown() { return 2; }
-    cancel_shutdown_interactive >/dev/null 2>&1 && return 1
-    [ -f "$SHUTDOWN_STATE_FILE" ] || return 1
-
-    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" cancel_owned_shutdown || return 1
-    SHUTDOWN_STATE_FILE="$work/machine-state"
-    printf '%s\n' 'BOOT_ID=boot-a' > "$SHUTDOWN_STATE_FILE"
-    has_pending_shutdown() { return 2; }
-    cancel_owned_shutdown >/dev/null 2>&1 && return 1
-    [ -f "$SHUTDOWN_STATE_FILE" ] || return 1
-    assert_absent "$work/shutdown-called"
-}
-
-# shellcheck disable=SC2034,SC2209,SC2317,SC2329
-test_period_state_failures_do_not_advance_the_cycle() {
-    local work
-    work=$(mktemp -d "$TEST_ROOT/period-state-errors.XXXXXX") || return 1
-    PERIOD_STATE_FILE="$work/period"
-    USAGE_STATE_FILE="$work/usage"
-    ENFORCEMENT_STATE_FILE="$work/enforcement"
-    LOG_FILE="$work/log"
-    printf '%s\n' 2026-01-01 > "$PERIOD_STATE_FILE"
-    printf '%s\n' usage > "$USAGE_STATE_FILE"
-
-    load_function "$MONITOR_SCRIPT" check_reset_limit || return 1
-    get_period_start_date() { printf '%s\n' 2027-01-01; }
-    clear_owned_shutdown_schedule() { printf '%s\n' called > "$work/shutdown-cleared"; }
-    clear_owned_tc_rules() { printf '%s\n' called > "$work/tc-cleared"; }
-    read_enforcement_state() { return 1; }
-    cat() {
-        [ "${1:-}" != "$PERIOD_STATE_FILE" ] || return 42
-        command cat "$@"
-    }
-
-    check_reset_limit >/dev/null 2>&1 && return 1
-    [ "$(command cat "$PERIOD_STATE_FILE")" = 2026-01-01 ] || return 1
-    [ "$(command cat "$USAGE_STATE_FILE")" = usage ] || return 1
-    assert_absent "$work/shutdown-cleared" || return 1
-    assert_absent "$work/tc-cleared" || return 1
-
-    cat() { command cat "$@"; }
-    rm() {
-        if [ "${1:-}" = -f ] && [ "${2:-}" = "$USAGE_STATE_FILE" ]; then
-            return 43
-        fi
-        command rm "$@"
-    }
-    check_reset_limit >/dev/null 2>&1 && return 1
-    [ "$(command cat "$PERIOD_STATE_FILE")" = 2026-01-01 ] || return 1
-    [ "$(command cat "$USAGE_STATE_FILE")" = usage ]
-}
-
-# shellcheck disable=SC2034,SC2209,SC2317,SC2329
-test_enforcement_state_errors_preserve_the_guard() {
-    local work status
-    work=$(mktemp -d "$TEST_ROOT/enforcement-state-errors.XXXXXX") || return 1
-    ENFORCEMENT_STATE_FILE="$work/enforcement"
-    CYAN=''
-    NC=''
-    printf '%s\n' 'MODE=paused' > "$ENFORCEMENT_STATE_FILE"
-
-    load_function "$MONITOR_SCRIPT" read_enforcement_state || return 1
-    load_function "$MONITOR_SCRIPT" enforcement_guard_active || return 1
-    cat() {
-        [ "${1:-}" != "$ENFORCEMENT_STATE_FILE" ] || return 42
-        command cat "$@"
-    }
-    status=0
-    enforcement_guard_active || status=$?
-    [ "$status" -eq 2 ] || return 1
-    [ -f "$ENFORCEMENT_STATE_FILE" ] || return 1
-
-    cat() { command cat "$@"; }
-    printf '%s\n' 'MODE=invalid' > "$ENFORCEMENT_STATE_FILE"
-    rm() {
-        if [ "${1:-}" = -f ] && [ "${2:-}" = "$ENFORCEMENT_STATE_FILE" ]; then
-            return 43
-        fi
-        command rm "$@"
-    }
-    status=0
-    enforcement_guard_active || status=$?
-    [ "$status" -eq 2 ] || return 1
-    [ -f "$ENFORCEMENT_STATE_FILE" ] || return 1
-
-    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" manage_enforcement_control || return 1
-    cancel_owned_shutdown() { return 0; }
-    if manage_enforcement_control <<< 1 >/dev/null 2>&1; then
-        return 1
-    fi
-    [ -f "$ENFORCEMENT_STATE_FILE" ]
-}
-
-# shellcheck disable=SC2034,SC2209,SC2317,SC2329
-test_telegram_state_errors_send_nothing() {
-    local work
-    work=$(mktemp -d "$TEST_ROOT/telegram-state-errors.XXXXXX") || return 1
-    LAST_NOTIFICATION_FILE="$work/last-notification"
-    LAST_DAILY_REPORT_FILE="$work/last-daily"
-    PERIOD_STATE_FILE="$work/period"
-    USAGE_STATE_FILE="$work/usage"
-    CRON_LOG="$work/log"
-
-    load_function "$TELEGRAM_SCRIPT" read_notification_state || return 1
-    : > "$LAST_NOTIFICATION_FILE"
-    read_notification_state && return 1
-    printf '%s\n' corrupt > "$LAST_NOTIFICATION_FILE"
-    read_notification_state && return 1
-    printf '%s\n' '2026-01-01 10:00:00 正常' > "$LAST_NOTIFICATION_FILE"
-    read_notification_state || return 1
-    [ "$LAST_STATUS" = '正常' ] || return 1
-
-    load_function "$TELEGRAM_SCRIPT" check_and_notify || return 1
-    read_current_traffic_state() { return 1; }
-    read_notification_state() { return 1; }
-    log_cron() { :; }
-    send_new_cycle_notification() { printf '%s\n' cycle >> "$work/sent"; }
-    send_throttle_warning() { printf '%s\n' throttle >> "$work/sent"; }
-    send_shutdown_warning() { printf '%s\n' shutdown >> "$work/sent"; }
-    send_throttle_lifted() { printf '%s\n' lifted >> "$work/sent"; }
-    check_and_notify >/dev/null 2>&1 && return 1
-    assert_absent "$work/sent" || return 1
-
-    read_notification_state() {
-        LAST_STATUS='正常'
-        LAST_CYCLE_EVENT=''
-        NOTIFICATION_STATE_MODERN=true
-        return 0
-    }
-    write_notification_state_file() { return 1; }
-    check_and_notify >/dev/null 2>&1 && return 1
-    assert_absent "$work/sent" || return 1
-
-    load_function "$TELEGRAM_SCRIPT" main || return 1
-    check_runtime_dependencies() { return 0; }
-    check_running() { return 0; }
-    read_config() {
-        TG_DISABLED=false
-        REPORT_TIMEZONE=UTC
-        DAILY_REPORT_TIME=00:00
-        return 0
-    }
-    check_and_notify() { return 0; }
-    debug_log() { :; }
-    daily_report() { printf '%s\n' daily >> "$work/sent"; }
-    printf '%s\n' invalid > "$LAST_DAILY_REPORT_FILE"
-    main -cron >/dev/null 2>&1 && return 1
-    assert_absent "$work/sent" || return 1
-
-    rm -f "$LAST_DAILY_REPORT_FILE"
-    write_daily_report_state_file() { return 1; }
-    main -cron >/dev/null 2>&1 && return 1
-    assert_absent "$work/sent"
-}
-
-# shellcheck disable=SC2034,SC2209,SC2317,SC2329
-test_vnstat_state_read_errors_never_fall_back() {
-    local work
-    work=$(mktemp -d "$TEST_ROOT/vnstat-state-errors.XXXXXX") || return 1
-    WORK_DIR="$work/state"
-    CONFIG_FILE="$WORK_DIR/traffic_monitor_config.txt"
-    VNSTAT_CONFIG_PATH_FILE="$WORK_DIR/vnstat_config_path"
-    RETENTION_STATE_FILE="$WORK_DIR/vnstat_daily_coverage_start"
-    mkdir -p "$WORK_DIR"
-    printf '%s\n' configured > "$CONFIG_FILE"
-    printf '%s\n' /etc/vnstat.conf > "$VNSTAT_CONFIG_PATH_FILE"
-    printf '%s\n' 2026-01-01 > "$RETENTION_STATE_FILE"
-    vnstat() { printf '%s\n' called >> "$work/vnstat-called"; }
-    cat() {
-        case "${1:-}" in
-            "$VNSTAT_CONFIG_PATH_FILE"|"$RETENTION_STATE_FILE") return 42 ;;
-            *) command cat "$@" ;;
-        esac
-    }
-
-    load_function "$ROOT_DIR/trafficcop-lite.sh" lite_vnstat_cmd || return 1
-    lite_vnstat_cmd --json >/dev/null 2>&1 && return 1
-    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" machine_vnstat_cmd || return 1
-    machine_vnstat_cmd --json >/dev/null 2>&1 && return 1
-    load_function "$MONITOR_SCRIPT" retention_state_value || return 1
-    retention_state_value >/dev/null 2>&1 && return 1
-    load_function "$ROOT_DIR/trafficcop-lite.sh" lite_retention_state_value || return 1
-    lite_retention_state_value >/dev/null 2>&1 && return 1
-    assert_absent "$work/vnstat-called"
-}
-
-# shellcheck disable=SC2034,SC2209,SC2317,SC2329
-test_tc_parser_and_consumer_errors_are_strict() {
-    local status
-    TC_BIN=mock_tc
-    load_function "$MONITOR_SCRIPT" tc_root_qdisc || return 1
-    load_function "$MONITOR_SCRIPT" tc_class_line || return 1
-    load_function "$MONITOR_SCRIPT" is_default_qdisc_line || return 1
-    mock_tc() {
-        case "${1:-}" in
-            qdisc) printf '%s\n' 'qdisc htb 1: root default 30' ;;
-            class) printf '%s\n' 'class htb 1:1 root rate 1Mbit ceil 1Mbit' ;;
-        esac
-    }
-    awk() { return 42; }
-    status=0
-    tc_root_qdisc eth0 >/dev/null 2>&1 || status=$?
-    [ "$status" -eq 2 ] || return 1
-    status=0
-    tc_class_line eth0 1:1 >/dev/null 2>&1 || status=$?
-    [ "$status" -eq 2 ] || return 1
-    status=0
-    is_default_qdisc_line 'malformed root state' >/dev/null 2>&1 || status=$?
-    [ "$status" -eq 2 ] || return 1
-    unset -f awk
-
-    is_default_qdisc_line '' || return 1
-    is_default_qdisc_line 'qdisc fq 0: root refcnt 2 limit 10000p' || return 1
-    is_default_qdisc_line 'qdisc mq 0: root' || return 1
-    status=0
-    is_default_qdisc_line 'qdisc fq 8001: root refcnt 2 limit 10000p' || status=$?
-    [ "$status" -eq 1 ] || return 1
-
-    TC_BIN=mock_filter_tc
-    load_function "$MONITOR_SCRIPT" tc_filter_output || return 1
-    load_function "$MONITOR_SCRIPT" tc_consumers_match_unified_contract || return 1
-    tc_class_output() {
-        printf '%s\n' \
-            'class htb 1:1 root rate 1Mbit ceil 1Mbit' \
-            'class htb 1:30 parent 1:1 rate 1Kbit ceil 1Mbit' \
-            'class htb 1:1001 parent 1:1 rate 1Kbit ceil 10Mbit'
-    }
-    mock_filter_tc() { printf '%s\n' "$MOCK_FILTER_TEXT"; }
-    MOCK_FILTER_TEXT=$'filter protocol all pref 1 fw chain 0\nfilter protocol all pref 1 fw chain 0 handle 0x51001000/0xfffff000 classid 1:1001'
-    tc_consumers_match_unified_contract eth0 1:1001 || return 1
-    MOCK_FILTER_TEXT=$'filter protocol all pref 1 fw chain 0 handle 0x51001000/0xfffff000 classid 1:1001\nfilter protocol all pref 2 fw chain 0 handle 0x51001000/0xfffff000 classid 1:1001'
-    tc_consumers_match_unified_contract eth0 1:1001 && return 1
-    MOCK_FILTER_TEXT='filter protocol all pref'
-    status=0
-    tc_consumers_match_unified_contract eth0 1:1001 || status=$?
-    [ "$status" -eq 2 ] || return 1
-    tc_class_output() {
-        printf '%s\n' \
-            'class htb 1:1 root rate 1Mbit ceil 1Mbit' \
-            'class htb 1:30 parent 1:1 rate 1Kbit ceil 1Mbit' \
-            'class htb 1:1001 parent 1:1 rate 1Kbit ceil 10Mbit' \
-            'class htb 1:999 parent 1:1 rate 1Kbit ceil 1Mbit'
-    }
-    tc_consumers_match_unified_contract eth0 1:1001 && return 1
-    return 0
 }
 
 run_test() {
@@ -4090,9 +3669,7 @@ run_test 'disabled residual state accepts the Dog-rebuilt parent' test_disabled_
 run_test 'TC recovery unit ownership and disable failures are fail-closed' test_tc_recovery_unit_ownership_is_fail_closed
 run_test 'legacy TBF adoption requires a matching numeric speed' test_legacy_tbf_requires_matching_numeric_speed
 run_test 'invalid Dog config cannot authorize HTB adoption' test_invalid_dog_config_cannot_authorize_adoption
-run_test 'Dog config parsing preserves empty runtime ID fields' test_dog_config_parser_preserves_empty_runtime_ids
 run_test 'unified HTB verification requires the full root and class contract' test_unified_hierarchy_verification_requires_full_contract
-run_test 'new HTB base verification skips only pending Dog consumers' test_unified_hierarchy_base_verification_skips_pending_dog_consumers
 run_test 'root crontab updates hold the TrafficCop project lock' test_monitor_crontab_update_holds_project_lock
 run_test 'all root crontab writers validate candidates before installation' test_all_crontab_writers_build_candidates_before_installing
 run_test 'shutdown scheduling requires a prepared ownership state' test_shutdown_requires_prepared_state
@@ -4131,12 +3708,6 @@ run_test 'machine enable clear failures roll back before monitor or cron' test_e
 run_test 'machine enable failure restores enforcement and remains fail-open' test_enable_failure_restores_old_enforcement_but_stays_fail_open
 run_test 'restore failures recover the previous config' test_restore_failure_restores_previous_config
 run_test 'restore from enabled state preserves paused enforcement on failure' test_restore_from_enabled_state_preserves_paused_enforcement_on_failure
-run_test 'shutdown query errors preserve every owned task marker' test_shutdown_query_errors_are_fail_closed
-run_test 'period state failures never advance the cycle marker' test_period_state_failures_do_not_advance_the_cycle
-run_test 'enforcement state errors preserve the active guard' test_enforcement_state_errors_preserve_the_guard
-run_test 'Telegram state errors send no notification' test_telegram_state_errors_send_nothing
-run_test 'vnStat state read errors never fall back to another config' test_vnstat_state_read_errors_never_fall_back
-run_test 'TC parsers and consumer checks reject ambiguous state' test_tc_parser_and_consumer_errors_are_strict
 
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

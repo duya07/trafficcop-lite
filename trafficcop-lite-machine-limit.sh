@@ -814,7 +814,11 @@ show_status() {
     show_monitor_task_status
     
     # 检查定时任务
-    if read_root_crontab_locked 2>/dev/null | grep -F -q "$SCRIPT_PATH"; then
+    local cron_content="" cron_status=0
+    cron_content=$(read_root_crontab_locked 2>/dev/null) || cron_status=$?
+    if [ "$cron_status" -ne 0 ]; then
+        echo -e "定时任务: ${YELLOW}无法读取${NC}"
+    elif printf '%s\n' "$cron_content" | grep -F -q "$SCRIPT_PATH"; then
         echo -e "定时任务: ${GREEN}已设置${NC}"
     else
         echo -e "定时任务: ${RED}未设置${NC}"
@@ -1004,7 +1008,12 @@ show_detailed_status() {
     
     # 检查定时任务详情
     echo -e "${CYAN}定时任务详情:${NC}"
-    read_root_crontab_locked 2>/dev/null | grep -v "^#" | grep -F "$WORK_DIR" || echo "无相关定时任务"
+    local cron_detail=""
+    if ! cron_detail=$(read_root_crontab_locked 2>/dev/null); then
+        echo -e "${YELLOW}无法读取 root crontab，无法列出定时任务。${NC}"
+    else
+        printf '%s\n' "$cron_detail" | grep -v "^#" | grep -F "$WORK_DIR" || echo "无相关定时任务"
+    fi
     echo ""
     
     # 检查最近的日志

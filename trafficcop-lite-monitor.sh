@@ -1249,7 +1249,11 @@ check_and_install_packages() {
 check_existing_setup() {
      if [ -s "$CONFIG_FILE" ] && read_config; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 配置已存在"| tee -a "$LOG_FILE"
-        if read_root_crontab_locked 2>/dev/null | grep -Fq "$SCRIPT_PATH --run"; then
+        local crontab_content="" crontab_status=0
+        crontab_content=$(read_root_crontab_locked 2>/dev/null) || crontab_status=$?
+        if [ "$crontab_status" -ne 0 ]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 无法读取 root crontab，未能确认定时任务状态。"| tee -a "$LOG_FILE"
+        elif printf '%s\n' "$crontab_content" | grep -Fq "$SCRIPT_PATH --run"; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 每分钟一次的定时任务已在执行。"| tee -a "$LOG_FILE"
         else
             echo "$(date '+%Y-%m-%d %H:%M:%S') 警告：定时任务未找到，可能需要重新设置。"| tee -a "$LOG_FILE"
@@ -2442,16 +2446,17 @@ get_traffic_usage() {
             usage_bytes=$(echo "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
                 '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .rx] | add // 0') || return 1
             ;;
-        total)
-            usage_bytes=$(echo "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
-                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | (.rx + .tx)] | add // 0') || return 1
-            ;;
         max)
             rx_bytes=$(echo "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
                 '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .rx] | add // 0') || return 1
             tx_bytes=$(echo "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
                 '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .tx] | add // 0') || return 1
             usage_bytes=$(awk -v rx="$rx_bytes" -v tx="$tx_bytes" 'BEGIN { if (rx >= tx) print rx; else print tx }')
+            ;;
+        # 兜底分支必须排在所有具体分支之后：放前面会抢先匹配 max，让 max 静默按 total 计算。
+        total|*)
+            usage_bytes=$(echo "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
+                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | (.rx + .tx)] | add // 0') || return 1
             ;;
     esac
 

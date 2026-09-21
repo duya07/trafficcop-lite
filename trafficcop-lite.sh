@@ -3,7 +3,7 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.1.11"
+SCRIPT_VERSION="1.1.12"
 LAST_UPDATE="2026-08-30"
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -110,7 +110,7 @@ install_tc_recovery_service_files() {
         return 1
     fi
     mkdir -p "$runner_dir" || return 1
-    cat > "$runner_tmp" <<'EOF'
+    if ! cat > "$runner_tmp" <<'EOF'
 #!/bin/bash
 # traffic-tools-tc-recovery-v1
 set -euo pipefail
@@ -128,18 +128,34 @@ ntc_config=/etc/trafficcop-lite/traffic_monitor_config.txt
 handled=false
 result=0
 
-if [ -r "$dog_script" ] && [ -r "$dog_config" ]; then
-    bash "$dog_script" --recover-tc "$mode" || result=1
+# 入口在而配置不可读属于异常：必须报出来，不能静默跳过恢复。
+# 此模板由 dog 与 ntc 共用，两边必须逐字一致，否则后运行的一方会覆盖先运行的一方。
+if [ -r "$dog_script" ]; then
+    if [ -r "$dog_config" ]; then
+        bash "$dog_script" --recover-tc "$mode" || result=1
+    else
+        echo "port-traffic-dog 已安装但配置不可读，跳过 TC 恢复: $dog_config" >&2
+        result=1
+    fi
     handled=true
 fi
-if [ -r "$ntc_monitor" ] && [ -r "$ntc_config" ]; then
-    bash "$ntc_monitor" --tc-recover-owned "$mode" || result=1
+if [ -r "$ntc_monitor" ]; then
+    if [ -r "$ntc_config" ]; then
+        bash "$ntc_monitor" --tc-recover-owned "$mode" || result=1
+    else
+        echo "trafficcop-lite 已安装但配置不可读，跳过 TC 恢复: $ntc_config" >&2
+        result=1
+    fi
     handled=true
 fi
 
 $handled || exit 0
 exit "$result"
 EOF
+    then
+        rm -f "$runner_tmp"
+        return 1
+    fi
     chmod 755 "$runner_tmp" || { rm -f "$runner_tmp"; return 1; }
     if ! cmp -s "$runner_tmp" "$TC_RECOVERY_RUNNER"; then
         mv -f "$runner_tmp" "$TC_RECOVERY_RUNNER" || { rm -f "$runner_tmp"; return 1; }
@@ -521,8 +537,9 @@ install_all_components() {
 install_shortcut_link() {
     if { [ -e "$SHORTCUT_PATH" ] || [ -L "$SHORTCUT_PATH" ]; } \
         && [ "$(readlink "$SHORTCUT_PATH" 2>/dev/null)" != "$WORK_DIR/trafficcop-lite.sh" ]; then
-        echo -e "${YELLOW}! $SHORTCUT_PATH 已存在，未覆盖。${NC}"
-        echo -e "${YELLOW}  你仍可使用：sudo bash $WORK_DIR/trafficcop-lite.sh${NC}"
+        echo -e "${YELLOW}! $SHORTCUT_PATH 已被其他文件占用，未覆盖。${NC}"
+        echo -e "${YELLOW}  这只是一个便捷入口，不影响功能。你仍可使用：sudo bash $WORK_DIR/trafficcop-lite.sh${NC}"
+        echo -e "${YELLOW}  想恢复 sudo ntc：先移走 $SHORTCUT_PATH，再运行一次本脚本。${NC}"
         return 1
     fi
 
@@ -548,7 +565,9 @@ install_shortcut_link() {
 
 install_shortcut() {
     install_all_components || return 1
-    install_shortcut_link
+    # 快捷命令只是便捷入口：被外部文件占用或装不上都不影响本项目可用，
+    # 因此不能算作安装失败（否则主入口会在这里把用户挡在菜单外）。
+    install_shortcut_link || true
 }
 
 source_has_complete_bundle() {
@@ -715,7 +734,7 @@ update_scripts() {
     if ! $release_changed; then
         rm -f "${temp_files[@]}" 2>/dev/null || true
         verify_installed_scripts || return 1
-        install_shortcut_link || return 1
+        install_shortcut_link || true
         install_tc_recovery_service_files || return 1
         echo ""
         echo -e "${GREEN}当前已是最新版本：${UPDATE_NEW_VERSION:-未知}${NC}"
@@ -762,7 +781,8 @@ update_scripts() {
         return 1
     fi
 
-    install_shortcut_link || return 1
+    # 脚本本体已校验通过，快捷命令装不上不改变“更新成功”这个事实。
+    install_shortcut_link || true
     install_tc_recovery_service_files || return 1
 
     echo ""
@@ -934,8 +954,14 @@ show_status_line() {
     local telegram_cron="未设置"
     local config_state="未配置"
     local root_crontab=""
+    local crontab_status=0
 
-    root_crontab=$(read_root_crontab_locked 2>/dev/null || true)
+    root_crontab=$(read_root_crontab_locked 2>/dev/null) || crontab_status=$?
+    if [ "$crontab_status" -ne 0 ]; then
+        # 读不出来和“没设置”是两回事：如实显示，别让用户以为定时任务掉了。
+        monitor_cron="读取失败"
+        telegram_cron="读取失败"
+    fi
     if printf '%s\n' "$root_crontab" | grep -F -q "$WORK_DIR/$MONITOR_SCRIPT"; then
         monitor_cron="已设置"
     fi
@@ -1576,7 +1602,12 @@ view_logs() {
             2) tail_file "$WORK_DIR/tg_notifier_cron.log" "Telegram 通知日志"; pause ;;
             3)
                 echo -e "${CYAN}TrafficCop-Lite 定时任务:${NC}"
-                read_root_crontab_locked 2>/dev/null | grep -F "$WORK_DIR" || echo "无相关定时任务"
+                local cron_list=""
+                if ! cron_list=$(read_root_crontab_locked 2>/dev/null); then
+                    echo -e "${YELLOW}无法读取 root crontab，无法列出定时任务。${NC}"
+                else
+                    printf '%s\n' "$cron_list" | grep -F "$WORK_DIR" || echo "无相关定时任务"
+                fi
                 pause
                 ;;
             0) return ;;

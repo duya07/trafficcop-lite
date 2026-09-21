@@ -3586,6 +3586,108 @@ test_tc_recovery_unit_ownership_is_fail_closed() {
         grep -Fq 'if ! cleanup_tc_recovery_files_if_unused'
 }
 
+# ---- 本轮修复的回归保护 ----
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_invalid_traffic_mode_falls_back_to_total() {
+    command -v jq >/dev/null 2>&1 || return 1
+    MAIN_INTERFACE='eth0'
+    TRAFFIC_PERIOD='monthly'
+    TRAFFIC_UNIT='decimal'
+    ALLOW_PARTIAL_HISTORY='false'
+    WORK_DIR="$TEST_ROOT/nonexistent"
+    RETENTION_STATE_FILE="$WORK_DIR/coverage"
+
+    load_function "$MONITOR_SCRIPT" normalize_vnstat_json_for_interface || return 1
+    load_function "$MONITOR_SCRIPT" get_traffic_usage || return 1
+    get_period_start_date() { printf '%s\n' '2026-07-01'; }
+    get_period_end_date() { printf '%s\n' '2026-07-31'; }
+    date_num_to_iso() { printf '%s\n' "$1"; }
+    vnstat_config_value() {
+        case "$1" in
+            DailyDays) printf '%s\n' '-1' ;;
+            TrafficlessEntries) printf '%s\n' '0' ;;
+        esac
+    }
+    vnstat() {
+        cat <<'JSON'
+{"jsonversion":"2","interfaces":[{"name":"eth0","created":{"date":{"year":2025,"month":1,"day":1}},"updated":{"timestamp":1},"traffic":{"day":[{"date":{"year":2026,"month":6,"day":30},"rx":10000000000,"tx":10000000000},{"date":{"year":2026,"month":7,"day":1},"rx":1000000000,"tx":2000000000},{"date":{"year":2026,"month":7,"day":2},"rx":3000000000,"tx":1000000000}]}}]}
+JSON
+    }
+    vnstat_cmd() { vnstat "$@"; }
+    vnstat_data_is_fresh() { return 0; }
+    check_mode() {
+        TRAFFIC_MODE="$1"
+        [ "$(get_traffic_usage 2>/dev/null)" = "$2" ]
+    }
+
+    # max 分支必须排在兜底之前：否则会被 *) 抢走，静默按 total 计算。
+    check_mode max 4.000 || return 1
+    # 非法值必须按 total 兜底继续限速，而不是静默跳过限速。
+    check_mode bogus 7.000 || return 1
+    check_mode '' 7.000 || return 1
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_shortcut_conflict_does_not_fail_install() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/shortcut-install.XXXXXX") || return 1
+    WORK_DIR="$work/installed"
+    SHORTCUT_PATH="$work/bin/ntc"
+    LEGACY_NCL_SHORTCUT_PATH="$work/bin/ncl"
+    LEGACY_TC_SHORTCUT_PATH="$work/bin/tc"
+    TC_BIN=''
+    RED=''
+    GREEN=''
+    YELLOW=''
+    CYAN=''
+    NC=''
+    mkdir -p "$WORK_DIR" "$(dirname "$SHORTCUT_PATH")"
+    printf '%s\n' '#!/bin/bash' > "$WORK_DIR/trafficcop-lite.sh"
+    printf '%s\n' 'foreign-command' > "$SHORTCUT_PATH"
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" install_shortcut || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" install_shortcut_link || return 1
+
+    # 快捷命令被外部文件占用：不覆盖，也不能让安装整体失败（否则主入口会把人挡在菜单外）。
+    install_all_components() { return 0; }
+    install_shortcut >/dev/null 2>&1 || return 1
+    assert_file_content 'foreign-command' "$SHORTCUT_PATH" || return 1
+
+    # 组件缺失仍然是硬失败。
+    install_all_components() { return 1; }
+    if install_shortcut >/dev/null 2>&1; then
+        return 1
+    fi
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_status_line_reports_unreadable_crontab() {
+    local work output
+    work=$(mktemp -d "$TEST_ROOT/status-unreadable.XXXXXX") || return 1
+    WORK_DIR="$work/installed"
+    MONITOR_SCRIPT='trafficcop-lite-monitor.sh'
+    TELEGRAM_SCRIPT='trafficcop-lite-telegram.sh'
+    RED=''
+    GREEN=''
+    YELLOW=''
+    CYAN=''
+    NC=''
+    mkdir -p "$WORK_DIR"
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" show_status_line || return 1
+    read_root_crontab_locked() { return 1; }
+    ntc_tc_status_label() { printf '%s\n' '未知'; }
+    tc_auto_recovery_state() { printf '%s\n' '未知'; }
+
+    output=$(show_status_line 2>/dev/null) || return 1
+    # 读不出来是“读取失败”，不是“未设置”。
+    grep -Fq '读取失败' <<< "$output" || return 1
+    if grep -Fq '未设置' <<< "$output"; then
+        return 1
+    fi
+}
+
 run_test() {
     local name="$1"
     local test_function="$2"
@@ -3708,6 +3810,9 @@ run_test 'machine enable clear failures roll back before monitor or cron' test_e
 run_test 'machine enable failure restores enforcement and remains fail-open' test_enable_failure_restores_old_enforcement_but_stays_fail_open
 run_test 'restore failures recover the previous config' test_restore_failure_restores_previous_config
 run_test 'restore from enabled state preserves paused enforcement on failure' test_restore_from_enabled_state_preserves_paused_enforcement_on_failure
+run_test 'invalid traffic mode falls back to total' test_invalid_traffic_mode_falls_back_to_total
+run_test 'shortcut conflict does not fail the install' test_shortcut_conflict_does_not_fail_install
+run_test 'status line reports an unreadable crontab' test_status_line_reports_unreadable_crontab
 
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

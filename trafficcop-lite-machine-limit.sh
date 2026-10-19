@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# TrafficCop 机器限速管理脚本 v2.9
+# TrafficCop 机器限速管理脚本 v2.10
 # 提供完整的启用/禁用/恢复机器限速功能
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -30,24 +30,80 @@ find_tc_bin() {
 
 TC_BIN="$(find_tc_bin)"
 
-read_current_crontab() {
-    local error_file="$WORK_DIR/.crontab-read-error.$$"
-    local current_crontab status
+# Keep this small audit writer identical in the four standalone distribution scripts.
+# Only fixed event/result values are accepted; extra arguments are never recorded.
+ntc_operation_log() {
+    local event="${1:-}" result="${2:-}"
+    case "$event" in
+        install|update|update-rollback|monitor-config|config-rollback|tc-apply|tc-clear|tc-recover|stop|machine-enable|machine-disable|machine-restore|machine-rollback|enforcement-pause|enforcement-resume|enforcement-grace|boot-grace|telegram-config|telegram-enable|telegram-disable) ;;
+        *) printf '%s\n' 'NTC audit event rejected' >&2; return 0 ;;
+    esac
+    case "$result" in
+        success|failure|unchanged) ;;
+        *) printf '%s\n' 'NTC audit result rejected' >&2; return 0 ;;
+    esac
+    local description result_text
+    case "$event" in
+        install) description="安装 NTC" ;;
+        update) description="更新脚本" ;;
+        update-rollback) description="恢复更新前的脚本" ;;
+        monitor-config) description="保存流量监控配置" ;;
+        config-rollback) description="恢复原配置" ;;
+        tc-apply) description="应用整机限速" ;;
+        tc-clear) description="撤销整机限速" ;;
+        tc-recover) description="恢复 Dog/NTC 限速" ;;
+        stop) description="停止监控和通知" ;;
+        machine-enable) description="启用整机流量限制" ;;
+        machine-disable) description="停用整机流量限制" ;;
+        machine-restore) description="恢复整机流量配置" ;;
+        machine-rollback) description="回退整机流量配置" ;;
+        enforcement-pause) description="暂停流量限制" ;;
+        enforcement-resume) description="恢复流量限制" ;;
+        enforcement-grace) description="设置临时宽限期" ;;
+        boot-grace) description="设置开机宽限期" ;;
+        telegram-config) description="保存 Telegram 通知配置" ;;
+        telegram-enable) description="启用 Telegram 通知" ;;
+        telegram-disable) description="停用 Telegram 通知" ;;
+    esac
+    case "$result" in success) result_text="成功" ;; failure) result_text="失败" ;; unchanged) result_text="保持不变" ;; esac
+    if ! (
+        umask 077
+        [ -n "${WORK_DIR:-}" ] && [ ! -L "$WORK_DIR" ] || exit 1
+        mkdir -p "$WORK_DIR" && chmod 700 "$WORK_DIR" || exit 1
+        audit_file="$WORK_DIR/operations.log"
+        for audit_path in "$audit_file" "$audit_file.1" "$audit_file.2" "$audit_file.3" "$audit_file.lock"; do
+            [ ! -L "$audit_path" ] || exit 1
+            if [ -e "$audit_path" ]; then
+                [ -f "$audit_path" ] && [ "$(stat -c %h "$audit_path")" = 1 ] || exit 1
+                chmod 600 "$audit_path" || exit 1
+            fi
+        done
+        exec 8>"$audit_file.lock" || exit 1
+        chmod 600 "$audit_file.lock" && flock -w 2 8 || exit 1
+        if [ -f "$audit_file" ] && [ "$(stat -c %s "$audit_file")" -ge 1048576 ]; then
+            rm -f "$audit_file.3" || exit 1
+            [ ! -f "$audit_file.2" ] || mv -f "$audit_file.2" "$audit_file.3" || exit 1
+            [ ! -f "$audit_file.1" ] || mv -f "$audit_file.1" "$audit_file.2" || exit 1
+            mv -f "$audit_file" "$audit_file.1" || exit 1
+        fi
+        : >> "$audit_file" && chmod 600 "$audit_file" || exit 1
+        printf '%s %s：%s EVENT=%s RESULT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$description" "$result_text" "$event" "$result" >> "$audit_file" || exit 1
+    ) 2>/dev/null; then
+        printf 'NTC 操作日志写入失败，业务结果保持原值 (NTC audit log unavailable EVENT=%s RESULT=%s)\n' "$event" "$result" >&2
+    fi
+    # Logging failures must never change the business result or the caller's shell options.
+    return 0
+}
 
-    current_crontab=$(LC_ALL=C crontab -l 2>"$error_file")
-    status=$?
+read_current_crontab() {
+    local current_crontab="" status=0
+    current_crontab=$(LC_ALL=C crontab -l 2>&1) || status=$?
     if [ "$status" -eq 0 ]; then
-        rm -f "$error_file"
         printf '%s\n' "$current_crontab"
         return 0
     fi
-    if grep -Eqi 'no crontab for|no such file or directory' "$error_file" 2>/dev/null; then
-        rm -f "$error_file"
-        return 0
-    fi
-
-    echo "读取当前 crontab 失败：$(cat "$error_file" 2>/dev/null)" >&2
-    rm -f "$error_file"
+    grep -Eqi 'no crontab for|no such file or directory' <<< "$current_crontab" && return 0
+    printf '%s\n' '无法读取 root crontab。' >&2
     return 1
 }
 
@@ -66,13 +122,8 @@ release_root_crontab_lock() {
 }
 
 read_root_crontab_locked() {
-    local current_crontab="" status=0
-
-    acquire_root_crontab_lock || return 1
-    current_crontab=$(read_current_crontab) || status=$?
-    release_root_crontab_lock
-    [ "$status" -eq 0 ] || return "$status"
-    printf '%s\n' "$current_crontab"
+    # Crontab installs are atomic; a status snapshot needs no writer lock or files.
+    read_current_crontab
 }
 
 tc_state_value() {
@@ -454,10 +505,12 @@ disable_machine_limit() {
     echo ""
     if $has_error; then
         echo -e "${RED}机器监控已禁用，但部分清理操作失败；状态文件已保留，请查看上方错误。${NC}"
+        ntc_operation_log machine-disable failure
         return 1
     fi
     echo -e "${GREEN}✓ 机器限速已完全禁用${NC}"
     echo -e "${CYAN}说明: 原配置已备份，可随时恢复${NC}"
+    ntc_operation_log machine-disable success
 }
 
 rollback_enable_machine_limit() {
@@ -497,9 +550,11 @@ rollback_enable_machine_limit() {
     fi
 
     if $rollback_failed; then
+        ntc_operation_log machine-rollback failure
         return 1
     fi
     rm -f "$config_backup" "$enforcement_backup"
+    ntc_operation_log machine-rollback success
 }
 
 # 启用机器限速
@@ -520,10 +575,11 @@ enable_machine_limit() {
     if [ ! -f "$CONFIG_FILE" ]; then
         echo -e "${RED}错误: 未找到配置文件 $CONFIG_FILE${NC}"
         echo "请先运行 trafficcop-lite-monitor.sh 进行初始配置"
+        ntc_operation_log machine-enable failure
         return 1
     fi
     
-    cp "$CONFIG_FILE" "$enable_backup" || return 1
+    cp "$CONFIG_FILE" "$enable_backup" || { ntc_operation_log machine-enable failure; return 1; }
     chmod 600 "$enable_backup" 2>/dev/null || true
     if grep -q '^DISABLED=true$' "$CONFIG_FILE" 2>/dev/null; then
         activation_from_disabled=true
@@ -531,6 +587,7 @@ enable_machine_limit() {
     if [ -f "$ENFORCEMENT_STATE_FILE" ]; then
         if ! cp -p "$ENFORCEMENT_STATE_FILE" "$enforcement_backup"; then
             rm -f "$enable_backup"
+            ntc_operation_log machine-enable failure
             return 1
         fi
         chmod 600 "$enforcement_backup" 2>/dev/null || true
@@ -550,6 +607,7 @@ enable_machine_limit() {
         else
             echo -e "${RED}无法建立启用宽限，且回滚不完整；备份已保留，请立即检查。${NC}"
         fi
+        ntc_operation_log machine-enable failure
         return 1
     fi
     echo "✓ 已设置 10 分钟启用宽限，期间只统计流量"
@@ -567,6 +625,7 @@ enable_machine_limit() {
             else
                 echo -e "${RED}配置文件恢复失败且回滚不完整；备份已保留，请立即检查。${NC}"
             fi
+            ntc_operation_log machine-enable failure
             return 1
         fi
         chmod 600 "$CONFIG_FILE" 2>/dev/null || true
@@ -581,6 +640,7 @@ enable_machine_limit() {
         else
             echo -e "${RED}监控测试失败且回滚不完整；备份已保留，请立即检查。${NC}"
         fi
+        ntc_operation_log machine-enable failure
         return 1
     fi
 
@@ -592,6 +652,7 @@ enable_machine_limit() {
         else
             echo -e "${RED}定时任务添加失败且回滚不完整；备份已保留，请立即检查。${NC}"
         fi
+        ntc_operation_log machine-enable failure
         return 1
     fi
     rm -f "$enable_backup" "$enforcement_backup"
@@ -600,6 +661,7 @@ enable_machine_limit() {
     echo -e "${GREEN}✓ 机器限速已启用${NC}"
     echo -e "${CYAN}监控将通过定时任务每分钟执行一次${NC}"
     echo -e "${CYAN}刚才已执行一次测试，可在日志中查看结果${NC}"
+    ntc_operation_log machine-enable success
 }
 
 # 恢复之前的配置
@@ -614,6 +676,7 @@ restore_machine_limit() {
     if [ ! -f "$BACKUP_CONFIG_FILE" ]; then
         echo -e "${RED}错误: 未找到备份配置文件${NC}"
         echo "无法恢复，请手动重新配置"
+        ntc_operation_log machine-restore failure
         return 1
     fi
 
@@ -622,6 +685,7 @@ restore_machine_limit() {
         if ! cp "$CONFIG_FILE" "$rollback_file" || ! chmod 600 "$rollback_file" 2>/dev/null; then
             rm -f "$rollback_file"
             echo -e "${RED}无法备份当前配置，未执行恢复。${NC}"
+            ntc_operation_log machine-restore failure
             return 1
         fi
         had_config=true
@@ -633,6 +697,7 @@ restore_machine_limit() {
         rm -f "$restore_tmp"
         rm -f "$rollback_file"
         echo -e "${RED}配置恢复失败，未启动监控。${NC}"
+        ntc_operation_log machine-restore failure
         return 1
     fi
     chmod 600 "$CONFIG_FILE" 2>/dev/null || true
@@ -642,6 +707,7 @@ restore_machine_limit() {
     if { $operation_from_disabled && enable_machine_limit --from-disabled-restore; } ||
        { ! $operation_from_disabled && enable_machine_limit; }; then
         rm -f "$rollback_file"
+        ntc_operation_log machine-restore success
         return 0
     fi
 
@@ -657,11 +723,12 @@ restore_machine_limit() {
     else
         echo -e "${RED}启用失败且无法移除本次恢复的配置，请手动检查 $CONFIG_FILE。${NC}"
     fi
+    ntc_operation_log machine-restore failure
     return 1
 }
 
 manage_enforcement_control() {
-    local control_choice grace_minutes until_epoch config_tmp
+    local control_choice grace_minutes until_epoch config_tmp audit_event
 
     echo -e "${CYAN}==================== 限制执行控制 ====================${NC}"
     echo "流量统计和 cron 可保持运行；这里仅控制达到阈值后是否真正限速或关机。"
@@ -674,22 +741,27 @@ manage_enforcement_control() {
     read -r -p "请选择 [0-4]: " control_choice
     case "$control_choice" in
         1)
-            cancel_owned_shutdown || return 1
-            rm -f "$ENFORCEMENT_STATE_FILE"
+            cancel_owned_shutdown || { ntc_operation_log enforcement-resume failure; return 1; }
+            rm -f "$ENFORCEMENT_STATE_FILE" || { ntc_operation_log enforcement-resume failure; return 1; }
             echo "✓ 已恢复限制执行；下次监控达到阈值时将按配置处理"
+            ntc_operation_log enforcement-resume success
             ;;
         2|3)
+            if [ "$control_choice" = 2 ]; then audit_event=enforcement-grace; else audit_event=enforcement-pause; fi
             if ! acquire_monitor_cleanup_lock; then
                 echo "✗ 无法取得监控锁，未修改执行状态"
+                ntc_operation_log "$audit_event" failure
                 return 1
             fi
             if ! clear_tc_rules; then
                 release_monitor_cleanup_lock
                 echo "✗ 无法安全清理当前 TC 规则，未修改执行状态"
+                ntc_operation_log "$audit_event" failure
                 return 1
             fi
             if ! cancel_owned_shutdown; then
                 release_monitor_cleanup_lock
+                ntc_operation_log "$audit_event" failure
                 return 1
             fi
             if [ "$control_choice" = "2" ]; then
@@ -702,15 +774,19 @@ manage_enforcement_control() {
                 until_epoch=$(( $(date +%s) + grace_minutes * 60 ))
                 write_enforcement_state "grace" "$until_epoch" "manual" || {
                     release_monitor_cleanup_lock
+                    ntc_operation_log enforcement-grace failure
                     return 1
                 }
                 echo "✓ 已设置 $grace_minutes 分钟宽限"
+                ntc_operation_log enforcement-grace success
             else
                 write_enforcement_state "paused" "0" "manual" || {
                     release_monitor_cleanup_lock
+                    ntc_operation_log enforcement-pause failure
                     return 1
                 }
                 echo "✓ 已暂停限制执行；流量统计仍会继续"
+                ntc_operation_log enforcement-pause success
             fi
             release_monitor_cleanup_lock
             ;;
@@ -736,9 +812,11 @@ manage_enforcement_control() {
                 || ! mv -f "$config_tmp" "$CONFIG_FILE"; then
                 rm -f "$config_tmp"
                 echo "TC 开机宽限更新失败。"
+                ntc_operation_log boot-grace failure
                 return 1
             fi
             echo "✓ TC 开机宽限已更新为 $grace_minutes 分钟"
+            ntc_operation_log boot-grace success
             ;;
         0) return 0 ;;
         *) echo "无效选择"; return 1 ;;
@@ -1073,6 +1151,10 @@ main() {
         echo -e "${RED}请使用 root 权限运行此脚本。${NC}"
         exit 1
     fi
+    if [ "${1:-}" = --status ]; then
+        show_status
+        return 0
+    fi
 
     # 创建工作目录
     mkdir -p "$WORK_DIR"
@@ -1084,9 +1166,6 @@ main() {
     elif [ "$1" = "--enable" ]; then
         enable_machine_limit
         exit $?
-    elif [ "$1" = "--status" ]; then
-        show_status
-        exit 0
     fi
     
     while true; do
@@ -1143,4 +1222,6 @@ main() {
     done
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

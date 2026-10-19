@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.1.12"
-LAST_UPDATE="2026-08-30"
+SCRIPT_VERSION="1.1.13"
+LAST_UPDATE="2026-10-19"
 
 WORK_DIR="/etc/trafficcop-lite"
 MONITOR_SCRIPT="trafficcop-lite-monitor.sh"
@@ -57,6 +57,71 @@ find_tc_bin() {
 }
 
 TC_BIN="$(find_tc_bin)"
+
+# Keep this small audit writer identical in the four standalone distribution scripts.
+# Only fixed event/result values are accepted; extra arguments are never recorded.
+ntc_operation_log() {
+    local event="${1:-}" result="${2:-}"
+    case "$event" in
+        install|update|update-rollback|monitor-config|config-rollback|tc-apply|tc-clear|tc-recover|stop|machine-enable|machine-disable|machine-restore|machine-rollback|enforcement-pause|enforcement-resume|enforcement-grace|boot-grace|telegram-config|telegram-enable|telegram-disable) ;;
+        *) printf '%s\n' 'NTC audit event rejected' >&2; return 0 ;;
+    esac
+    case "$result" in
+        success|failure|unchanged) ;;
+        *) printf '%s\n' 'NTC audit result rejected' >&2; return 0 ;;
+    esac
+    local description result_text
+    case "$event" in
+        install) description="安装 NTC" ;;
+        update) description="更新脚本" ;;
+        update-rollback) description="恢复更新前的脚本" ;;
+        monitor-config) description="保存流量监控配置" ;;
+        config-rollback) description="恢复原配置" ;;
+        tc-apply) description="应用整机限速" ;;
+        tc-clear) description="撤销整机限速" ;;
+        tc-recover) description="恢复 Dog/NTC 限速" ;;
+        stop) description="停止监控和通知" ;;
+        machine-enable) description="启用整机流量限制" ;;
+        machine-disable) description="停用整机流量限制" ;;
+        machine-restore) description="恢复整机流量配置" ;;
+        machine-rollback) description="回退整机流量配置" ;;
+        enforcement-pause) description="暂停流量限制" ;;
+        enforcement-resume) description="恢复流量限制" ;;
+        enforcement-grace) description="设置临时宽限期" ;;
+        boot-grace) description="设置开机宽限期" ;;
+        telegram-config) description="保存 Telegram 通知配置" ;;
+        telegram-enable) description="启用 Telegram 通知" ;;
+        telegram-disable) description="停用 Telegram 通知" ;;
+    esac
+    case "$result" in success) result_text="成功" ;; failure) result_text="失败" ;; unchanged) result_text="保持不变" ;; esac
+    if ! (
+        umask 077
+        [ -n "${WORK_DIR:-}" ] && [ ! -L "$WORK_DIR" ] || exit 1
+        mkdir -p "$WORK_DIR" && chmod 700 "$WORK_DIR" || exit 1
+        audit_file="$WORK_DIR/operations.log"
+        for audit_path in "$audit_file" "$audit_file.1" "$audit_file.2" "$audit_file.3" "$audit_file.lock"; do
+            [ ! -L "$audit_path" ] || exit 1
+            if [ -e "$audit_path" ]; then
+                [ -f "$audit_path" ] && [ "$(stat -c %h "$audit_path")" = 1 ] || exit 1
+                chmod 600 "$audit_path" || exit 1
+            fi
+        done
+        exec 8>"$audit_file.lock" || exit 1
+        chmod 600 "$audit_file.lock" && flock -w 2 8 || exit 1
+        if [ -f "$audit_file" ] && [ "$(stat -c %s "$audit_file")" -ge 1048576 ]; then
+            rm -f "$audit_file.3" || exit 1
+            [ ! -f "$audit_file.2" ] || mv -f "$audit_file.2" "$audit_file.3" || exit 1
+            [ ! -f "$audit_file.1" ] || mv -f "$audit_file.1" "$audit_file.2" || exit 1
+            mv -f "$audit_file" "$audit_file.1" || exit 1
+        fi
+        : >> "$audit_file" && chmod 600 "$audit_file" || exit 1
+        printf '%s %s：%s EVENT=%s RESULT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$description" "$result_text" "$event" "$result" >> "$audit_file" || exit 1
+    ) 2>/dev/null; then
+        printf 'NTC 操作日志写入失败，业务结果保持原值 (NTC audit log unavailable EVENT=%s RESULT=%s)\n' "$event" "$result" >&2
+    fi
+    # Logging failures must never change the business result or the caller's shell options.
+    return 0
+}
 
 pause() {
     echo ""
@@ -270,23 +335,14 @@ ensure_work_dir() {
 }
 
 read_current_crontab() {
-    local error_file="$WORK_DIR/.crontab-read-error.$$"
-    local current_crontab status
-
-    current_crontab=$(LC_ALL=C crontab -l 2>"$error_file")
-    status=$?
+    local current_crontab="" status=0
+    current_crontab=$(LC_ALL=C crontab -l 2>&1) || status=$?
     if [ "$status" -eq 0 ]; then
-        rm -f "$error_file"
         printf '%s\n' "$current_crontab"
         return 0
     fi
-    if grep -Eqi 'no crontab for|no such file or directory' "$error_file" 2>/dev/null; then
-        rm -f "$error_file"
-        return 0
-    fi
-
-    echo -e "${RED}读取当前 crontab 失败，已中止操作：$(cat "$error_file" 2>/dev/null)${NC}" >&2
-    rm -f "$error_file"
+    grep -Eqi 'no crontab for|no such file or directory' <<< "$current_crontab" && return 0
+    printf '%s\n' '无法读取 root crontab。' >&2
     return 1
 }
 
@@ -305,13 +361,8 @@ release_root_crontab_lock() {
 }
 
 read_root_crontab_locked() {
-    local current_crontab="" status=0
-
-    acquire_root_crontab_lock || return 1
-    current_crontab=$(read_current_crontab) || status=$?
-    release_root_crontab_lock
-    [ "$status" -eq 0 ] || return "$status"
-    printf '%s\n' "$current_crontab"
+    # Crontab installs are atomic; a status snapshot needs no writer lock or files.
+    read_current_crontab
 }
 
 script_version_from_file() {
@@ -564,10 +615,14 @@ install_shortcut_link() {
 }
 
 install_shortcut() {
-    install_all_components || return 1
+    if ! install_all_components; then
+        ntc_operation_log install failure
+        return 1
+    fi
     # 快捷命令只是便捷入口：被外部文件占用或装不上都不影响本项目可用，
     # 因此不能算作安装失败（否则主入口会在这里把用户挡在菜单外）。
     install_shortcut_link || true
+    ntc_operation_log install success
 }
 
 source_has_complete_bundle() {
@@ -672,7 +727,11 @@ rollback_script_update() {
         fi
     done
 
-    ! $rollback_failed
+    if $rollback_failed; then
+        ntc_operation_log update-rollback failure
+        return 1
+    fi
+    ntc_operation_log update-rollback success
 }
 
 update_scripts() {
@@ -699,23 +758,27 @@ update_scripts() {
         if ! download_url_to_file "$url" "$tmp_file"; then
             echo -e "${RED}下载失败：$script_name${NC}"
             rm -f "${temp_files[@]}" "$tmp_file" 2>/dev/null || true
+            ntc_operation_log update failure
             return 1
         fi
 
         if [ ! -s "$tmp_file" ]; then
             echo -e "${RED}下载文件为空：$script_name${NC}"
             rm -f "${temp_files[@]}" "$tmp_file" 2>/dev/null || true
+            ntc_operation_log update failure
             return 1
         fi
 
         if ! bash -n "$tmp_file" 2>/dev/null; then
             echo -e "${RED}语法检查失败：$script_name，已取消更新。${NC}"
             rm -f "${temp_files[@]}" "$tmp_file" 2>/dev/null || true
+            ntc_operation_log update failure
             return 1
         fi
 
         if ! validate_update_candidate "$script_name" "$tmp_file"; then
             rm -f "${temp_files[@]}" "$tmp_file" 2>/dev/null || true
+            ntc_operation_log update failure
             return 1
         fi
 
@@ -733,17 +796,19 @@ update_scripts() {
 
     if ! $release_changed; then
         rm -f "${temp_files[@]}" 2>/dev/null || true
-        verify_installed_scripts || return 1
+        verify_installed_scripts || { ntc_operation_log update failure; return 1; }
         install_shortcut_link || true
-        install_tc_recovery_service_files || return 1
+        install_tc_recovery_service_files || { ntc_operation_log update failure; return 1; }
         echo ""
         echo -e "${GREEN}当前已是最新版本：${UPDATE_NEW_VERSION:-未知}${NC}"
+        ntc_operation_log update unchanged
         return 0
     fi
     backup_dir="$WORK_DIR/backups/scripts-$(date +%Y%m%d-%H%M%S)-$$"
     if ! mkdir -p "$WORK_DIR/backups" || ! mkdir "$backup_dir"; then
         echo -e "${RED}无法创建脚本备份目录，已取消更新。${NC}"
         rm -f "${temp_files[@]}" 2>/dev/null || true
+        ntc_operation_log update failure
         return 1
     fi
 
@@ -752,11 +817,13 @@ update_scripts() {
             if ! cp -a "$WORK_DIR/$script_name" "$backup_dir/"; then
                 echo -e "${RED}备份 $script_name 失败，已取消更新。${NC}"
                 rm -f "${temp_files[@]}" 2>/dev/null || true
+                ntc_operation_log update failure
                 return 1
             fi
         elif ! : > "$backup_dir/.absent-$script_name"; then
             echo -e "${RED}记录 $script_name 的安装前状态失败，已取消更新。${NC}"
             rm -f "${temp_files[@]}" 2>/dev/null || true
+            ntc_operation_log update failure
             return 1
         fi
     done
@@ -768,6 +835,7 @@ update_scripts() {
                 echo -e "${RED}部分脚本回滚失败，备份保留在：$backup_dir${NC}"
             fi
             rm -f "${temp_files[@]}" 2>/dev/null || true
+            ntc_operation_log update failure
             return 1
         fi
         echo -e "${GREEN}✓ 已更新 $script_name${NC}"
@@ -778,17 +846,19 @@ update_scripts() {
         if ! rollback_script_update "$backup_dir" "${scripts[@]}"; then
             echo -e "${RED}部分脚本回滚失败，备份保留在：$backup_dir${NC}"
         fi
+        ntc_operation_log update failure
         return 1
     fi
 
     # 脚本本体已校验通过，快捷命令装不上不改变“更新成功”这个事实。
     install_shortcut_link || true
-    install_tc_recovery_service_files || return 1
+    install_tc_recovery_service_files || { ntc_operation_log update failure; return 1; }
 
     echo ""
     echo -e "${GREEN}脚本更新完成：${UPDATE_PREVIOUS_VERSION:-未安装} → ${UPDATE_NEW_VERSION:-未知}${NC}"
     echo -e "${GREEN}旧脚本已备份到：$backup_dir${NC}"
     echo -e "${YELLOW}命令行更新后请重新执行 sudo ntc；交互更新将自动载入新版菜单。${NC}"
+    ntc_operation_log update success
 }
 
 update_scripts_interactive() {
@@ -1590,6 +1660,7 @@ view_logs() {
         echo "1) 流量监控日志"
         echo "2) Telegram 通知日志"
         echo "3) 当前 crontab 相关条目"
+        echo "4) 操作审计日志（安装、配置、限速与恢复）"
         echo "0) 返回主菜单"
         echo ""
         if ! read -r -p "请输入选项: " choice; then
@@ -1600,10 +1671,11 @@ view_logs() {
         case "$choice" in
             1) tail_file "$WORK_DIR/traffic_monitor.log" "流量监控日志"; pause ;;
             2) tail_file "$WORK_DIR/tg_notifier_cron.log" "Telegram 通知日志"; pause ;;
+            4) tail_file "$WORK_DIR/operations.log" "操作审计日志"; pause ;;
             3)
                 echo -e "${CYAN}TrafficCop-Lite 定时任务:${NC}"
                 local cron_list=""
-                if ! cron_list=$(read_root_crontab_locked 2>/dev/null); then
+                if ! cron_list=$(read_current_crontab 2>/dev/null); then
                     echo -e "${YELLOW}无法读取 root crontab，无法列出定时任务。${NC}"
                 else
                     printf '%s\n' "$cron_list" | grep -F "$WORK_DIR" || echo "无相关定时任务"
@@ -1824,6 +1896,7 @@ stop_all_services() {
     if ! remove_lite_cron; then
         echo -e "${RED}无法安全移除定时任务，本次未清理 TC 规则。${NC}"
         pause
+        ntc_operation_log stop failure
         return 1
     fi
     echo "✓ 已移除独立版 crontab 条目"
@@ -1832,6 +1905,7 @@ stop_all_services() {
     if ! acquire_monitor_cleanup_lock; then
         echo -e "${RED}无法取得监控锁，本次未清理 TC 规则。${NC}"
         pause
+        ntc_operation_log stop failure
         return 1
     fi
     stop_lite_processes
@@ -1843,8 +1917,10 @@ stop_all_services() {
 
     if $has_error; then
         echo -e "${RED}停止流程未完全成功；安装目录和状态文件已保留，请查看上方错误。${NC}"
+        ntc_operation_log stop failure
     else
         echo -e "${GREEN}独立版服务停止流程完成。${NC}"
+        ntc_operation_log stop success
     fi
     pause
     $has_error && return 1
@@ -1972,6 +2048,22 @@ show_main_menu() {
 
 main() {
     check_root
+    # 自检先于安装目录初始化，保留原始权限和空安装现场。
+    case "${1:-}" in
+        --self-check|--tc-self-check)
+            run_tc_self_check "${2:-}"
+            exit $?
+            ;;
+        --logs)
+            if [ -n "${2:-}" ] || [ ! -t 0 ]; then
+                show_logs_cli "${2:-all}"
+                exit $?
+            fi
+            view_logs
+            exit $?
+            ;;
+        --config) view_config; exit $? ;;
+    esac
     ensure_work_dir
 
     case "${1:-}" in
@@ -1988,18 +2080,6 @@ main() {
             ;;
         --stop)
             stop_all_services
-            exit $?
-            ;;
-        --logs)
-            view_logs
-            exit 0
-            ;;
-        --config)
-            view_config
-            exit 0
-            ;;
-        --self-check|--tc-self-check)
-            run_tc_self_check "${2:-}"
             exit $?
             ;;
         --recover-tc)
@@ -2044,4 +2124,20 @@ main() {
     done
 }
 
-main "$@"
+show_logs_cli() {
+    case "${1:-all}" in
+        operations) tail_file "$WORK_DIR/operations.log" "操作审计日志" ;;
+        monitor) tail_file "$WORK_DIR/traffic_monitor.log" "流量监控日志" ;;
+        telegram) tail_file "$WORK_DIR/tg_notifier_cron.log" "Telegram 通知日志" ;;
+        all)
+            tail_file "$WORK_DIR/operations.log" "操作审计日志"
+            tail_file "$WORK_DIR/traffic_monitor.log" "流量监控日志"
+            tail_file "$WORK_DIR/tg_notifier_cron.log" "Telegram 通知日志"
+            ;;
+        *) printf '%s\n' '日志类型须为 operations、monitor、telegram 或 all。' >&2; return 1 ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

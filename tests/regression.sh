@@ -6,6 +6,7 @@ ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 MONITOR_SCRIPT="$ROOT_DIR/trafficcop-lite-monitor.sh"
 TELEGRAM_SCRIPT="$ROOT_DIR/trafficcop-lite-telegram.sh"
 TEST_ROOT=$(mktemp -d)
+WORK_DIR="$TEST_ROOT/default-audit"
 PASSED=0
 FAILED=0
 
@@ -30,6 +31,25 @@ extract_function() {
 
 load_function() {
     local function_body
+    local helper
+    if [ "$2" != ntc_operation_log ]; then
+        function_body=$(extract_function "$1" ntc_operation_log) || return 1
+        # shellcheck disable=SC2294
+        eval "$function_body"
+    fi
+    case "$2" in
+        apply_tc_limit|clear_owned_tc_rules_locked|recover_owned_tc_hierarchy|tc_self_check|owned_tc_limit_active)
+            for helper in tc_file_is_secure dog_ingress_redirect_complete tc_dog_ifb_device \
+                tc_base_class_snapshot tc_restore_base_snapshot tc_update_dog_ifb tc_verify_dog_ifb; do
+                load_function "$1" "$helper" || return 1
+            done
+            ;;
+        check_and_limit_traffic)
+            for helper in shutdown_state_value shutdown_task_token_from_state pending_shutdown_matches_owned_state; do
+                load_function "$1" "$helper" || return 1
+            done
+            ;;
+    esac
 
     function_body=$(extract_function "$1" "$2") || return 1
     # The source files are repository-controlled; evaluation keeps the function in this shell.
@@ -360,6 +380,8 @@ test_cron_service_start_failure_propagates_to_dependency_check() {
 }
 
 # initial_config 的文件事务由下方定向测试单独覆盖；这些旧用例只隔离验证配置文件回滚语义。
+# These functions are invoked by production functions loaded through eval.
+# shellcheck disable=SC2317
 setup_initial_config_transaction_mocks() {
     begin_initial_vnstat_transaction() { return 0; }
     rollback_initial_vnstat_transaction() { return 0; }
@@ -2517,6 +2539,7 @@ test_self_check_full_invocation_preserves_generic_log() {
         -e "s#^WORK_DIR=.*#WORK_DIR=\"$work\"#" \
         -e "s#^DOG_CONFIG_FILE=.*#DOG_CONFIG_FILE=\"$work/dog-config.json\"#" \
         -e "s#^DOG_TC_OWNER_FILE=.*#DOG_TC_OWNER_FILE=\"$work/dog-owner\"#" \
+        -e 's#^TC_BIN=.*#TC_BIN=true#' \
         "$MONITOR_SCRIPT" > "$candidate" || return 1
     chmod 700 "$candidate" || return 1
     printf '%s\n' seed-line > "$work/traffic_monitor.log"
@@ -3579,8 +3602,12 @@ test_tc_recovery_unit_ownership_is_fail_closed() {
 
     rm -f "$TC_RECOVERY_UNIT_FILE"
     install_tc_recovery_service_files || return 1
+    # Match literal shell source in the generated recovery runner.
+    # shellcheck disable=SC2016
     grep -Fq 'bash "$dog_script" --recover-tc "$mode" || result=1' "$TC_RECOVERY_RUNNER" || return 1
+    # shellcheck disable=SC2016
     grep -Fq 'bash "$ntc_monitor" --tc-recover-owned "$mode" || result=1' "$TC_RECOVERY_RUNNER" || return 1
+    # shellcheck disable=SC2016
     grep -Fq 'exit "$result"' "$TC_RECOVERY_RUNNER" || return 1
     extract_function "$ROOT_DIR/trafficcop-lite.sh" uninstall_lite |
         grep -Fq 'if ! cleanup_tc_recovery_files_if_unused'
@@ -3687,6 +3714,16 @@ test_status_line_reports_unreadable_crontab() {
         return 1
     fi
 }
+
+# Additional IFB tests share the function extractor and private mock workspace.
+# shellcheck source=tests/ifb-regression.sh
+# shellcheck disable=SC1091
+source "$ROOT_DIR/tests/ifb-regression.sh"
+# shellcheck source=tests/logging-regression.sh
+# shellcheck disable=SC1091
+source "$ROOT_DIR/tests/logging-regression.sh"
+# shellcheck source=tests/filter-json-regression.sh disable=SC1091
+source "$ROOT_DIR/tests/filter-json-regression.sh"
 
 run_test() {
     local name="$1"
@@ -3813,6 +3850,34 @@ run_test 'restore from enabled state preserves paused enforcement on failure' te
 run_test 'invalid traffic mode falls back to total' test_invalid_traffic_mode_falls_back_to_total
 run_test 'shortcut conflict does not fail the install' test_shortcut_conflict_does_not_fail_install
 run_test 'status line reports an unreadable crontab' test_status_line_reports_unreadable_crontab
+
+run_test 'IFB apply and clear preserve Dog objects in one TC transaction' test_ifb_apply_and_clear
+run_test 'IFB installed after NTC repairs the same-rate fast path' test_ifb_late_install_and_recovery
+run_test 'IFB partial update failure restores exact physical and IFB rates' test_ifb_apply_failure_rolls_back
+run_test 'IFB state commit failure rolls back both directions' test_ifb_state_commit_failure_rolls_back
+run_test 'IFB clear failure restores both directions and ownership state' test_ifb_clear_failure_rolls_back
+run_test 'IFB state deletion failure rolls back both directions' test_ifb_state_delete_failure_rolls_back
+run_test 'IFB clear also handles an absent physical root transactionally' test_ifb_clear_without_physical_root
+run_test 'IFB unverified ownership and query failures cause zero mutation' test_ifb_unverified_is_zero_mutation
+run_test 'IFB self-check detects parent class port filter and redirect drift' test_ifb_self_check_detects_drift
+run_test 'standalone NTC leaves unknown IFB untouched' test_ifb_standalone_preserves_unknown_device
+run_test 'main CLI self-check preserves insecure permissions and absent install' test_ifb_cli_self_check_is_readonly
+run_test 'invalid NTC state cannot authorize physical or IFB mutation' test_ifb_invalid_ntc_state_is_zero_mutation
+run_test 'IFB class references accept Dog flower groups and ranges' test_ifb_group_and_range_class_references
+run_test 'IFB recovery retains scope and rolls back without port consumers' test_ifb_recovery_without_port_consumers
+run_test 'IFB clear rejects existing child rate drift without mutation' test_ifb_existing_child_drift_is_zero_mutation
+run_test 'IFB missing children fail strict checks but allow clear' test_ifb_missing_child_is_only_allowed_during_clear
+run_test 'NTC installs first when only an unapplied Dog config exists' test_ifb_ntc_first_with_config_only
+run_test 'IFB pending groups and empty class fields preserve record columns' test_ifb_unmaterialized_group_and_empty_class_fields
+run_test 'IFB already removed by Dog clears only residual NTC state' test_ifb_clear_after_dog_removed_device
+run_test 'operation audit permissions rotation and untrusted input' test_operation_log_permissions_rotation_and_input
+run_test 'operation audit failure preserves business result' test_operation_log_failure_preserves_business_result
+run_test 'installation and update rollback audit both outcomes' test_install_and_rollback_audit_results
+run_test 'sourcing every component creates no files or logs' test_operation_logging_source_is_readonly
+run_test 'logs and status preserve absent install and insecure permissions' test_operation_log_view_and_status_are_readonly
+run_test 'IFB operations audit changes but not unchanged apply' test_ifb_operation_audit_and_unchanged_apply
+run_test 'enforcement controls audit success and failure safely' test_enforcement_audit_success_failure_and_no_input_echo
+run_test 'single-port JSON queries isolate unrelated legacy fw output' test_single_port_filter_json_excludes_unrelated_fw_printer
 
 printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
 [ "$FAILED" -eq 0 ]

@@ -3,7 +3,7 @@
 # 设置 PATH 确保 cron 环境能找到所有命令
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-if [ "$(id -u)" -ne 0 ]; then
+if [[ "${BASH_SOURCE[0]}" == "$0" ]] && [ "$(id -u)" -ne 0 ]; then
     echo "请使用 root 权限运行此脚本。"
     exit 1
 fi
@@ -42,9 +42,7 @@ VNSTAT_TRANSACTION_HAD_CONFIG_PATH_FILE=false
 DOG_CONFIG_FILE="/etc/port-traffic-dog/config.json"
 DOG_TC_OWNER_FILE="/etc/port-traffic-dog/tc-root-qdisc.owner"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.1.9"
-mkdir -p "$WORK_DIR"
-chmod 700 "$WORK_DIR" 2>/dev/null || true
+SCRIPT_VERSION="1.1.10"
 
 trim_log_file() {
     local file="$1"
@@ -93,7 +91,71 @@ find_tc_bin() {
 
 TC_BIN="$(find_tc_bin)"
 
-write_invocation_log_header "${1:-}"
+# Keep this small audit writer identical in the four standalone distribution scripts.
+# Only fixed event/result values are accepted; extra arguments are never recorded.
+ntc_operation_log() {
+    local event="${1:-}" result="${2:-}"
+    case "$event" in
+        install|update|update-rollback|monitor-config|config-rollback|tc-apply|tc-clear|tc-recover|stop|machine-enable|machine-disable|machine-restore|machine-rollback|enforcement-pause|enforcement-resume|enforcement-grace|boot-grace|telegram-config|telegram-enable|telegram-disable) ;;
+        *) printf '%s\n' 'NTC audit event rejected' >&2; return 0 ;;
+    esac
+    case "$result" in
+        success|failure|unchanged) ;;
+        *) printf '%s\n' 'NTC audit result rejected' >&2; return 0 ;;
+    esac
+    local description result_text
+    case "$event" in
+        install) description="安装 NTC" ;;
+        update) description="更新脚本" ;;
+        update-rollback) description="恢复更新前的脚本" ;;
+        monitor-config) description="保存流量监控配置" ;;
+        config-rollback) description="恢复原配置" ;;
+        tc-apply) description="应用整机限速" ;;
+        tc-clear) description="撤销整机限速" ;;
+        tc-recover) description="恢复 Dog/NTC 限速" ;;
+        stop) description="停止监控和通知" ;;
+        machine-enable) description="启用整机流量限制" ;;
+        machine-disable) description="停用整机流量限制" ;;
+        machine-restore) description="恢复整机流量配置" ;;
+        machine-rollback) description="回退整机流量配置" ;;
+        enforcement-pause) description="暂停流量限制" ;;
+        enforcement-resume) description="恢复流量限制" ;;
+        enforcement-grace) description="设置临时宽限期" ;;
+        boot-grace) description="设置开机宽限期" ;;
+        telegram-config) description="保存 Telegram 通知配置" ;;
+        telegram-enable) description="启用 Telegram 通知" ;;
+        telegram-disable) description="停用 Telegram 通知" ;;
+    esac
+    case "$result" in success) result_text="成功" ;; failure) result_text="失败" ;; unchanged) result_text="保持不变" ;; esac
+    if ! (
+        umask 077
+        [ -n "${WORK_DIR:-}" ] && [ ! -L "$WORK_DIR" ] || exit 1
+        mkdir -p "$WORK_DIR" && chmod 700 "$WORK_DIR" || exit 1
+        audit_file="$WORK_DIR/operations.log"
+        for audit_path in "$audit_file" "$audit_file.1" "$audit_file.2" "$audit_file.3" "$audit_file.lock"; do
+            [ ! -L "$audit_path" ] || exit 1
+            if [ -e "$audit_path" ]; then
+                [ -f "$audit_path" ] && [ "$(stat -c %h "$audit_path")" = 1 ] || exit 1
+                chmod 600 "$audit_path" || exit 1
+            fi
+        done
+        exec 8>"$audit_file.lock" || exit 1
+        chmod 600 "$audit_file.lock" && flock -w 2 8 || exit 1
+        if [ -f "$audit_file" ] && [ "$(stat -c %s "$audit_file")" -ge 1048576 ]; then
+            rm -f "$audit_file.3" || exit 1
+            [ ! -f "$audit_file.2" ] || mv -f "$audit_file.2" "$audit_file.3" || exit 1
+            [ ! -f "$audit_file.1" ] || mv -f "$audit_file.1" "$audit_file.2" || exit 1
+            mv -f "$audit_file" "$audit_file.1" || exit 1
+        fi
+        : >> "$audit_file" && chmod 600 "$audit_file" || exit 1
+        printf '%s %s：%s EVENT=%s RESULT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$description" "$result_text" "$event" "$result" >> "$audit_file" || exit 1
+    ) 2>/dev/null; then
+        printf 'NTC 操作日志写入失败，业务结果保持原值 (NTC audit log unavailable EVENT=%s RESULT=%s)\n' "$event" "$result" >&2
+    fi
+    # Logging failures must never change the business result or the caller's shell options.
+    return 0
+}
+
 
 
 
@@ -260,12 +322,22 @@ vnstat_config_value_from_file() {
     local target="$2"
     vnstat --config "$config_path" --showconfig 2>/dev/null | awk -v target="$target" '
         {
-            key=$1
+            raw=$1
+            key=raw
             sub(/^[;#]/, "", key)
-            if (key == target) {
-                print $NF
-                exit
+            if (key != target) next
+            # vnStat 的 --showconfig 会先输出被注释掉的示例行、再输出实际生效行。
+            # 注释值只当回退，否则两者不一致时会读到示例值（例如 #MaxBWeth0 8 与实际值 0）。
+            if (raw ~ /^[;#]/) {
+                if (fallback == "") fallback=$NF
+                next
             }
+            print $NF
+            found=1
+            exit
+        }
+        END {
+            if (!found && fallback != "") print fallback
         }
     '
 }
@@ -274,12 +346,21 @@ vnstat_config_value() {
     local target="$1"
     vnstat_cmd --showconfig 2>/dev/null | awk -v target="$target" '
         {
-            key=$1
+            raw=$1
+            key=raw
             sub(/^[;#]/, "", key)
-            if (key == target) {
-                print $NF
-                exit
+            if (key != target) next
+            # 同 vnstat_config_value_from_file：注释示例行与生效行同时存在时，优先取生效行。
+            if (raw ~ /^[;#]/) {
+                if (fallback == "") fallback=$NF
+                next
             }
+            print $NF
+            found=1
+            exit
+        }
+        END {
+            if (!found && fallback != "") print fallback
         }
     '
 }
@@ -1237,7 +1318,7 @@ check_and_install_packages() {
             echo "$(date '+%Y-%m-%d %H:%M:%S') vnstat 统计开始日期: $vnstat_start_time，在此之前的流量不会被纳入统计！" | tee -a "$LOG_FILE"
         else
             echo "$(date '+%Y-%m-%d %H:%M:%S') 无法获取 vnstat 统计开始时间" | tee -a "$LOG_FILE"
-            echo "vnstat JSON 输出: $vnstat_json" | tee -a "$LOG_FILE"
+            echo "vnStat 统计起始信息无效，未记录原始响应。" | tee -a "$LOG_FILE"
         fi
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') 无法获取主要网络接口" | tee -a "$LOG_FILE"
@@ -1283,7 +1364,7 @@ validate_config() {
     case "${TRAFFIC_MODE:-}" in
         out|in|total|max) ;;
         *)
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：TRAFFIC_MODE 无效：${TRAFFIC_MODE:-空}" | tee -a "$LOG_FILE"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：TRAFFIC_MODE 无效。" | tee -a "$LOG_FILE"
             has_error=true
             ;;
     esac
@@ -1291,7 +1372,7 @@ validate_config() {
     case "${TRAFFIC_PERIOD:-}" in
         monthly|quarterly|yearly) ;;
         *)
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：TRAFFIC_PERIOD 无效：${TRAFFIC_PERIOD:-空}" | tee -a "$LOG_FILE"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：TRAFFIC_PERIOD 无效。" | tee -a "$LOG_FILE"
             has_error=true
             ;;
     esac
@@ -1314,7 +1395,7 @@ validate_config() {
     case "$TRAFFIC_UNIT" in
         decimal|binary) ;;
         *)
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：TRAFFIC_UNIT 无效：$TRAFFIC_UNIT" | tee -a "$LOG_FILE"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：TRAFFIC_UNIT 无效。" | tee -a "$LOG_FILE"
             has_error=true
             ;;
     esac
@@ -1384,7 +1465,7 @@ validate_config() {
     case "${LIMIT_MODE:-}" in
         tc|shutdown) ;;
         *)
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：LIMIT_MODE 无效：${LIMIT_MODE:-空}" | tee -a "$LOG_FILE"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：LIMIT_MODE 无效。" | tee -a "$LOG_FILE"
             has_error=true
             ;;
     esac
@@ -1628,9 +1709,11 @@ rollback_monitor_config_transaction() {
     fi
 
     if $rollback_failed; then
+        ntc_operation_log config-rollback failure
         return 1
     fi
     rm -f "$config_backup" "$enforcement_backup" "$tc_backup" "$shutdown_backup"
+    ntc_operation_log config-rollback success
 }
 
 
@@ -1638,26 +1721,26 @@ rollback_monitor_config_transaction() {
 show_current_config() {
     local unit_label
     [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && unit_label="GB" || unit_label="GiB"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 当前配置:"| tee -a "$LOG_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 流量统计模式: $TRAFFIC_MODE"| tee -a "$LOG_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 流量统计周期: $TRAFFIC_PERIOD"| tee -a "$LOG_FILE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') 当前配置:"
+    echo "流量统计模式: $TRAFFIC_MODE"
+    echo "流量统计周期: $TRAFFIC_PERIOD"
     if [ "$TRAFFIC_PERIOD" = "yearly" ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 年度起始月份: ${PERIOD_START_MONTH:-1}"| tee -a "$LOG_FILE"
+        echo "年度起始月份: ${PERIOD_START_MONTH:-1}"
     fi
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 周期起始日: ${PERIOD_START_DAY:-1}"| tee -a "$LOG_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 流量限制: $TRAFFIC_LIMIT $unit_label"| tee -a "$LOG_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 容错范围: $TRAFFIC_TOLERANCE $unit_label"| tee -a "$LOG_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 限速: ${LIMIT_SPEED:-20} kbit/s"| tee -a "$LOG_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 主要网络接口: $MAIN_INTERFACE"| tee -a "$LOG_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 限制模式: $LIMIT_MODE"| tee -a "$LOG_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 历史不足时继续统计: ${ALLOW_PARTIAL_HISTORY:-false}"| tee -a "$LOG_FILE"
+    echo "周期起始日: ${PERIOD_START_DAY:-1}"
+    echo "流量限制: $TRAFFIC_LIMIT $unit_label"
+    echo "容错范围: $TRAFFIC_TOLERANCE $unit_label"
+    echo "限速: ${LIMIT_SPEED:-20} kbit/s"
+    echo "主要网络接口: $MAIN_INTERFACE"
+    echo "限制模式: $LIMIT_MODE"
+    echo "历史不足时继续统计: ${ALLOW_PARTIAL_HISTORY:-false}"
     if [ "${VNSTAT_MAX_BANDWIDTH:-0}" -eq 0 ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') vnStat 异常速率检查: 已关闭 (0)"| tee -a "$LOG_FILE"
+        echo "vnStat 异常速率检查: 已关闭 (0)"
     else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') vnStat 异常速率检查上限: ${VNSTAT_MAX_BANDWIDTH} Mbit/s"| tee -a "$LOG_FILE"
+        echo "vnStat 异常速率检查上限: ${VNSTAT_MAX_BANDWIDTH} Mbit/s"
     fi
     if [ "$LIMIT_MODE" = "tc" ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 开机后限速宽限: ${TC_BOOT_GRACE_MINUTES:-10} 分钟"| tee -a "$LOG_FILE"
+        echo "开机后限速宽限: ${TC_BOOT_GRACE_MINUTES:-10} 分钟"
     fi
 }
 
@@ -2119,6 +2202,7 @@ initial_config() {
         else
             echo "配置写入失败，且无法完整恢复修改前状态；配置与运行态备份已保留，请立即检查。"
         fi
+        ntc_operation_log monitor-config failure
         return 1
     fi
 
@@ -2129,6 +2213,7 @@ initial_config() {
         else
             echo "后续安全处理失败，且无法完整恢复旧运行态；配置与运行态备份已保留，请立即检查。"
         fi
+        ntc_operation_log monitor-config failure
         return 1
     fi
 
@@ -2139,10 +2224,12 @@ initial_config() {
         else
             echo "vnStat 服务持久化失败，且无法完整恢复旧运行态；备份已保留，请立即检查。"
         fi
+        ntc_operation_log monitor-config failure
         return 1
     fi
 
     rm -f "$config_backup" "$enforcement_backup" "$tc_backup" "$shutdown_backup"
+    ntc_operation_log monitor-config success
 }
 
 # 返回指定年月的周期锚点。若用户配置了不存在的日期（如 2 月 31 日），使用当月最后一天。
@@ -2533,7 +2620,7 @@ tc_state_file_is_interpretable() {
     tc_file_is_secure "$TC_STATE_FILE" || return 1
     tc_file_unique_value "$TC_STATE_FILE" INTERFACE >/dev/null || return 1
     tc_file_unique_value "$TC_STATE_FILE" LIMIT_SPEED >/dev/null || return 1
-    for key in SCHEMA PROVIDER QDISC_LINE BOOT_ID PERIOD_START APPLIED_AT; do
+    for key in SCHEMA PROVIDER QDISC_LINE BOOT_ID PERIOD_START APPLIED_AT IFB_INTERFACE; do
         tc_file_optional_unique_value "$TC_STATE_FILE" "$key" >/dev/null || return 1
     done
 }
@@ -2708,12 +2795,16 @@ tc_state_is_unified_for_interface() {
 }
 
 dog_bandwidth_to_tc() {
-    local value="${1,,}"
+    local value="${1,,}" number unit
 
-    case "$value" in
-        *kbps) [[ "$value" =~ ^[0-9]+kbps$ ]] && printf '%skbit\n' "${value%kbps}" ;;
-        *mbps) [[ "$value" =~ ^[0-9]+mbps$ ]] && printf '%smbit\n' "${value%mbps}" ;;
-        *gbps) [[ "$value" =~ ^[0-9]+gbps$ ]] && printf '%sgbit\n' "${value%gbps}" ;;
+    [[ "$value" =~ ^([0-9]+)(kbps|mbps|gbps|kbit|mbit|gbit|bit)$ ]] || return 1
+    number="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+        kbps|kbit) printf '%skbit\n' "$number" ;;
+        mbps|mbit) printf '%smbit\n' "$number" ;;
+        gbps|gbit) printf '%sgbit\n' "$number" ;;
+        bit) printf '%sbit\n' "$number" ;;
         *) return 1 ;;
     esac
 }
@@ -2728,12 +2819,18 @@ dog_configured_class_records() {
         select((.value.enabled // true) == true) |
         select((.value.bandwidth_limit.enabled // false) == true) |
         select((.value.bandwidth_limit.rate // "unlimited") != "unlimited") |
-        [.key, (.value.bandwidth_limit.class_id // ""),
+        [.key, (if (.value.bandwidth_limit.class_id // "") == "" then "__none__"
+                else .value.bandwidth_limit.class_id end),
          (.value.bandwidth_limit.rate // ""),
          ((.value.bandwidth_limit.mark_id // "") | tostring)] | @tsv
     ' "$DOG_CONFIG_FILE" 2>/dev/null) || return 1
     [ -n "$raw_records" ] || return 0
     while IFS=$'\t' read -r port class_id rate mark_id; do
+        [ "$class_id" = "__none__" ] && class_id=""
+        if [ -z "$class_id" ] && [[ "$port" == *,* ]]; then
+            # Dog 写入配置后，端口组在首次实际应用前还没有可证明的 class_id；NTC 不凭空创建它。
+            continue
+        fi
         tc_rate=$(dog_bandwidth_to_tc "$rate") || return 1
         if ! [[ "$class_id" =~ ^1:([0-9a-fA-F]+)$ ]]; then
             if [[ "$port" =~ ^[0-9]+$ ]]; then
@@ -2749,9 +2846,7 @@ dog_configured_class_records() {
                 return 1
             fi
         fi
-        if [[ "$port" =~ ^([0-9]+)-([0-9]+)$ ]]; then
-            start_port="${BASH_REMATCH[1]}"
-            end_port="${BASH_REMATCH[2]}"
+        if [[ "$port" =~ ^([0-9]+)-([0-9]+)$ ]] || [[ "$port" =~ ^[0-9]+(,[0-9]+)+$ ]]; then
             [[ "$mark_id" =~ ^[0-9]+$ ]] || return 1
         elif ! [[ "$port" =~ ^[0-9]+$ ]]; then
             return 1
@@ -2771,11 +2866,19 @@ dog_single_port_filters_complete() {
     local port="$2"
     local class_id="$3"
     local filter_prio=$((port % 1000 + 1))
-    local sport_hex dport_hex filter_json
+    local sport_hex dport_hex filter_json filter_ipv4 filter_ipv6
 
     sport_hex=$(printf '%x' "$((port << 16))")
     dport_hex=$(printf '%x' "$port")
-    filter_json=$("$TC_BIN" -j filter show dev "$interface" parent 1:0 2>/dev/null) || return 2
+    # iproute2 6.1 的 fw JSON printer 会混入非 JSON 文本；单端口无需读取它。
+    # 按协议查询仍须完整验证全部 TCP/UDP 单端口分类器。
+    filter_ipv4=$("$TC_BIN" -j filter show dev "$interface" parent 1:0 protocol ip 2>/dev/null) || return 2
+    filter_ipv6=$("$TC_BIN" -j filter show dev "$interface" parent 1:0 protocol ipv6 2>/dev/null) || return 2
+    # tc 会省略已由查询条件确定的 protocol；显式字段仍按原值校验。
+    filter_json=$(printf '%s\n%s\n' "$filter_ipv4" "$filter_ipv6" |
+        jq -cs 'if length == 2 and all(.[]; type == "array") then
+            (.[0] | map(.protocol //= "ip")) + (.[1] | map(.protocol //= "ipv6"))
+        else error("invalid filter arrays") end') || return 2
     jq -e \
         --arg class_id "$class_id" \
         --arg sport_hex "$sport_hex" \
@@ -2827,8 +2930,9 @@ dog_port_range_filter_complete() {
 
 dog_live_objects_match_config() {
     local interface="$1"
+    local match_mode="${3:-strict}"
     local configured_records configured_ids class_output filter_output actual_ids filter_ids
-    local port class_id expected_rate mark_id minor_hex minor expected_mark status
+    local port class_id expected_rate mark_id minor_hex minor expected_mark status class_line
 
     configured_records=$(dog_configured_class_records) || return 1
     configured_ids=$(printf '%s\n' "$configured_records" | awk -F '\t' 'NF >= 2 { print $2 }' | sort -u)
@@ -2853,17 +2957,27 @@ dog_live_objects_match_config() {
         [ -z "$class_id" ] && continue
         printf '%s\n' "$configured_ids" | grep -Fqx "$class_id" || return 1
     done <<< "$filter_ids"
-    while IFS= read -r class_id; do
-        [ -z "$class_id" ] && continue
-        printf '%s\n' "$actual_ids" | grep -Fqx "$class_id" || return 1
-        printf '%s\n' "$filter_ids" | grep -Fqx "$class_id" || return 1
-    done <<< "$configured_ids"
+    if [ "$match_mode" != allow-missing ]; then
+        while IFS= read -r class_id; do
+            [ -z "$class_id" ] && continue
+            printf '%s\n' "$actual_ids" | grep -Fqx "$class_id" || return 1
+            printf '%s\n' "$filter_ids" | grep -Fqx "$class_id" || return 1
+        done <<< "$configured_ids"
+    fi
 
     while IFS=$'\t' read -r port class_id expected_rate mark_id; do
         [ -n "$port" ] || continue
-        tc_class_rate_matches "$interface" "$class_id" "$TC_DEFAULT_CLASS_RATE" "$expected_rate"
+        class_line=$(tc_class_line "$interface" "$class_id")
         status=$?
+        # 只有查询成功且 class 确实缺失时才允许跳过；速率错误仍须失败关闭。
+        if [ "$status" -eq 1 ] && [ "$match_mode" = allow-missing ]; then continue; fi
         [ "$status" -eq 0 ] || return "$status"
+        tc_class_rate_matches "$interface" "$class_id" "$TC_DEFAULT_CLASS_RATE" "$expected_rate" || return $?
+        # IFB 使用 Dog 自己的分类实现；这里验证 class 和 filter 引用，不复制分类器。
+        if [ "${2:-}" = "classes" ]; then
+            [[ "$class_line" == "class htb $class_id parent 1:1 "* ]] || return 1
+            continue
+        fi
         if [[ "$port" =~ ^[0-9]+$ ]]; then
             dog_single_port_filters_complete "$interface" "$port" "$class_id"
             status=$?
@@ -2986,6 +3100,7 @@ write_tc_state() {
     local speed="$2"
     local qdisc_line="$3"
     local state_file="${4:-$TC_STATE_FILE}"
+    local ifb_interface="${5:-}"
     local period_start tmp_file
 
     period_start=$(get_period_start_date)
@@ -2995,6 +3110,7 @@ write_tc_state() {
         printf 'PROVIDER=%s\n' "$TC_STATE_PROVIDER"
         printf 'INTERFACE=%s\n' "$interface"
         printf 'LIMIT_SPEED=%s\n' "$speed"
+        [ -z "$ifb_interface" ] || printf 'IFB_INTERFACE=%s\n' "$ifb_interface"
         printf 'QDISC_LINE=%s\n' "$qdisc_line"
         printf 'BOOT_ID=%s\n' "$(current_boot_id)"
         printf 'PERIOD_START=%s\n' "$period_start"
@@ -3064,6 +3180,114 @@ tc_state_allows_boot_rebuild() {
     [ -n "$state_boot_id" ] && [ -n "$boot_id" ] && [ "$state_boot_id" != "$boot_id" ]
 }
 
+# 只识别 Dog 已建立的 ifb0；绝不创建 IFB，也不调用会再次获取 TC 锁的 Dog 子进程。
+# 父速率不参与归属判断，使正常 apply 可以修复可验证层级的速率漂移。
+dog_ingress_redirect_complete() {
+    local interface="$1" qdiscs filters
+    qdiscs=$("$TC_BIN" qdisc show dev "$interface" 2>/dev/null) || return 2
+    grep -Eq '^qdisc ingress ffff:([[:space:]]|$)' <<< "$qdiscs" || return 1
+    filters=$("$TC_BIN" filter show dev "$interface" parent ffff: 2>/dev/null) || return 2
+    awk '
+        function check() {
+            if (block ~ /match 00000000\/00000000 at 0/ &&
+                tolower(block) ~ /mirred \(egress redirect to device ifb0\)/) {
+                if (proto == "ip") ipv4++
+                if (proto == "ipv6") ipv6++
+            }
+        }
+        /^filter / {
+            check(); block=$0; proto=""
+            for (i=1; i<NF; i++) if ($i == "protocol") proto=$(i+1)
+            next
+        }
+        { block=block "\n" $0 }
+        END { check(); exit !(ipv4 == 1 && ipv6 == 1) }
+    ' <<< "$filters"
+}
+
+tc_dog_ifb_device() {
+    local interface="$1" match_mode="${2:-strict}" recorded="" records="" link_state status
+    local owner_file="${DOG_TC_OWNER_FILE:-}" config_file="${DOG_CONFIG_FILE:-}"
+
+    # 纯 NTC 不探测、更不会写入其他程序的 IFB。
+    if [ ! -e "$owner_file" ] && [ ! -L "$owner_file" ] &&
+       [ ! -e "$config_file" ] && [ ! -L "$config_file" ] &&
+       ! grep -q '^IFB_INTERFACE=' "$TC_STATE_FILE" 2>/dev/null; then
+        return 0
+    fi
+    if grep -q '^IFB_INTERFACE=' "$TC_STATE_FILE" 2>/dev/null; then
+        recorded=$(tc_state_value IFB_INTERFACE) || return 1
+        [ "$recorded" = ifb0 ] && tc_state_is_unified_for_interface "$interface" || return 1
+    fi
+    if [ -z "$recorded" ] && [ ! -e "$owner_file" ] && [ ! -L "$owner_file" ]; then
+        # Dog 配置文件单独存在不等于 Dog 已接管 TC；允许 NTC 先独立管理出向。
+        return 0
+    fi
+    tc_file_is_secure "$config_file" || return 1
+    records=$(dog_configured_class_records) || return 1
+    if [ -z "$recorded" ]; then
+        tc_file_is_secure "$owner_file" && dog_owner_marker_matches "$interface" || return 1
+    fi
+    link_state=$(ip -j -d link show dev ifb0 2>/dev/null) || return 1
+    jq -e 'length == 1 and .[0].ifname == "ifb0" and
+        .[0].linkinfo.info_kind == "ifb" and (.[0].flags | index("UP") != null)' \
+        <<< "$link_state" >/dev/null 2>&1 || return 1
+    tc_root_is_htb_handle_one ifb0 && tc_root_has_default_30 ifb0 &&
+        tc_root_has_parent_class ifb0 && tc_default_class_is_safe ifb0
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    dog_live_objects_match_config ifb0 classes "$match_mode"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    dog_ingress_redirect_complete "$interface"
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    printf '%s\n' ifb0
+}
+
+tc_base_class_snapshot() {
+    local interface="$1" class_id key value values=""
+    for class_id in 1:1 1:30; do
+        for key in rate ceil; do
+            value=$(tc_class_value "$interface" "$class_id" "$key") || return $?
+            normalize_tc_rate_to_bps "$value" >/dev/null || return 1
+            values+="$value "
+        done
+    done
+    printf '%s\n' "${values% }"
+}
+
+tc_restore_base_snapshot() {
+    local interface="$1" snapshot="$2" parent_rate parent_ceil default_rate default_ceil
+    local failed=0
+    read -r parent_rate parent_ceil default_rate default_ceil <<< "$snapshot"
+    "$TC_BIN" class replace dev "$interface" parent 1: classid 1:1 htb \
+        rate "$parent_rate" ceil "$parent_ceil" 2>/dev/null || failed=1
+    "$TC_BIN" class replace dev "$interface" parent 1:1 classid 1:30 htb \
+        rate "$default_rate" ceil "$default_ceil" 2>/dev/null || failed=1
+    tc_class_rate_matches "$interface" 1:1 "$parent_rate" "$parent_ceil" || failed=1
+    tc_class_rate_matches "$interface" 1:30 "$default_rate" "$default_ceil" || failed=1
+    return "$failed"
+}
+
+tc_update_dog_ifb() {
+    local interface="$1" device="$2" rate="$3" match_mode="${4:-strict}"
+    [ -n "$device" ] || return 0
+    tc_replace_base_classes "$device" "$rate" &&
+        tc_verify_unified_hierarchy "$device" "$rate" &&
+        dog_live_objects_match_config "$device" classes "$match_mode" &&
+        dog_ingress_redirect_complete "$interface"
+}
+
+tc_verify_dog_ifb() {
+    local interface="$1" rate="$2" device status
+    device=$(tc_dog_ifb_device "$interface")
+    status=$?
+    [ "$status" -eq 0 ] || return "$status"
+    [ -n "$device" ] || return 0
+    tc_verify_unified_hierarchy "$device" "$rate"
+}
+
 apply_tc_limit() {
     local speed="$1"
     local existing_qdisc state_interface mode=""
@@ -3072,6 +3296,8 @@ apply_tc_limit() {
     local old_default_line="" old_default_rate="" old_default_ceil=""
     local legacy_speed="" rollback_ok=false
     local query_status verify_status
+    local ifb_device="" ifb_snapshot=""
+    local state_schema="" state_provider="" state_speed=""
 
     if [ -z "$TC_BIN" ] || ! [[ "$speed" =~ ^[1-9][0-9]*$ ]]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 未找到系统 tc 命令，无法执行限速" | tee -a "$LOG_FILE"
@@ -3084,6 +3310,23 @@ apply_tc_limit() {
     fi
 
     state_interface=$(tc_state_interface)
+    if { [ -e "$TC_STATE_FILE" ] || [ -L "$TC_STATE_FILE" ]; } && [ -z "$state_interface" ]; then
+        echo "TC 状态无法安全解释，未修改 TC。" | tee -a "$LOG_FILE"
+        release_tc_hierarchy_lock
+        return 1
+    fi
+    if [ -n "$state_interface" ]; then
+        state_schema=$(tc_state_value SCHEMA)
+        state_provider=$(tc_state_value PROVIDER)
+        state_speed=$(tc_state_value LIMIT_SPEED)
+        if { [ -n "$state_schema" ] && [ "$state_schema" != "$TC_STATE_SCHEMA" ]; } ||
+           { [ -n "$state_provider" ] && [ "$state_provider" != "$TC_STATE_PROVIDER" ]; } ||
+           ! [[ "$state_speed" =~ ^[1-9][0-9]*$ ]]; then
+            echo "TC 状态格式或归属无效，未修改 TC。" | tee -a "$LOG_FILE"
+            release_tc_hierarchy_lock
+            return 1
+        fi
+    fi
     if [ -n "$state_interface" ] && [ "$state_interface" != "$MAIN_INTERFACE" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') TC 状态文件属于接口 $state_interface，当前配置接口为 $MAIN_INTERFACE，将先清理旧接口限速。" | tee -a "$LOG_FILE"
         if ! clear_owned_tc_rules_locked "配置接口已变更"; then
@@ -3102,6 +3345,16 @@ apply_tc_limit() {
     elif [ "$query_status" -eq 1 ]; then
         existing_qdisc=""
     fi
+    if ! ifb_device=$(tc_dog_ifb_device "$MAIN_INTERFACE"); then
+        echo "Dog 入向层级归属或运行态无法验证，未修改 TC。" | tee -a "$LOG_FILE"
+        release_tc_hierarchy_lock
+        return 1
+    fi
+    if [ -n "$ifb_device" ] && ! ifb_snapshot=$(tc_base_class_snapshot "$ifb_device"); then
+        ntc_operation_log tc-apply failure
+        release_tc_hierarchy_lock
+        return 1
+    fi
 
     tc_root_is_unified_compatible "$MAIN_INTERFACE"
     query_status=$?
@@ -3113,7 +3366,9 @@ apply_tc_limit() {
         mode="existing"
         if tc_state_is_unified_for_interface "$MAIN_INTERFACE" &&
            [ "$(tc_state_value LIMIT_SPEED)" = "$speed" ]; then
-            tc_verify_unified_hierarchy "$MAIN_INTERFACE" "${speed}kbit"
+            tc_verify_unified_hierarchy "$MAIN_INTERFACE" "${speed}kbit" &&
+                tc_verify_dog_ifb "$MAIN_INTERFACE" "${speed}kbit" &&
+                [ "$(tc_state_value IFB_INTERFACE)" = "$ifb_device" ]
             verify_status=$?
             if [ "$verify_status" -eq 0 ]; then
                 release_tc_hierarchy_lock
@@ -3167,7 +3422,7 @@ apply_tc_limit() {
         return 1
     fi
 
-    if ! write_tc_state "$MAIN_INTERFACE" "$speed" "" "$prepared_state"; then
+    if ! write_tc_state "$MAIN_INTERFACE" "$speed" "" "$prepared_state" "$ifb_device"; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') 无法预写统一 HTB 状态，已拒绝修改系统 qdisc。" | tee -a "$LOG_FILE"
         release_tc_hierarchy_lock
         return 1
@@ -3183,9 +3438,11 @@ apply_tc_limit() {
 
     if tc_replace_base_classes "$MAIN_INTERFACE" "${speed}kbit" &&
        tc_verify_unified_hierarchy "$MAIN_INTERFACE" "${speed}kbit" &&
+       tc_update_dog_ifb "$MAIN_INTERFACE" "$ifb_device" "${speed}kbit" &&
        mv -f "$prepared_state" "$TC_STATE_FILE"; then
         release_tc_hierarchy_lock
         echo "$(date '+%Y-%m-%d %H:%M:%S') 统一 HTB 整机限速已应用，现有端口子类保持不变。" | tee -a "$LOG_FILE"
+        ntc_operation_log tc-apply success
         return 0
     fi
 
@@ -3221,6 +3478,15 @@ apply_tc_limit() {
             fi
             ;;
     esac
+    if $rollback_ok && [ "$mode" = existing ]; then
+        tc_class_rate_matches "$MAIN_INTERFACE" 1:1 "$old_parent_rate" "$old_parent_ceil" || rollback_ok=false
+        if [ -n "$old_default_line" ]; then
+            tc_class_rate_matches "$MAIN_INTERFACE" 1:30 "$old_default_rate" "$old_default_ceil" || rollback_ok=false
+        fi
+    fi
+    if [ -n "$ifb_device" ] && ! tc_restore_base_snapshot "$ifb_device" "$ifb_snapshot"; then
+        rollback_ok=false
+    fi
 
     if $rollback_ok; then
         rm -f "$prepared_state"
@@ -3228,16 +3494,23 @@ apply_tc_limit() {
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') 严重错误：统一 HTB 回滚失败；预写状态保留在 $prepared_state。" | tee -a "$LOG_FILE"
     fi
+    ntc_operation_log tc-apply failure
     release_tc_hierarchy_lock
     return 1
 }
 
 clear_owned_tc_rules_locked() {
+    local TC_PARENT_RATE="${TC_PARENT_RATE:-100gbit}"
     local reason="$1"
     local state_interface qdisc_line state_speed state_schema state_provider
     local rollback_ok=false
     local query_status verify_status
+    local ifb_device="" ifb_snapshot="" restore_parent_rate=""
 
+    if [ -L "$TC_STATE_FILE" ]; then
+        echo "$reason：TC 状态路径不可信，保留规则和状态。" | tee -a "$LOG_FILE"
+        return 1
+    fi
     if [ ! -f "$TC_STATE_FILE" ]; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：未发现本脚本 TC 状态标记，保留现有 qdisc。" | tee -a "$LOG_FILE"
         return 0
@@ -3298,10 +3571,28 @@ clear_owned_tc_rules_locked() {
         return 1
     fi
 
+    if [ "$(tc_state_value IFB_INTERFACE)" = ifb0 ] &&
+       ! ip -j -d link show dev ifb0 >/dev/null 2>&1 &&
+       { [ -z "$qdisc_line" ] || is_default_qdisc_line "$qdisc_line"; }; then
+        # Dog 已清空物理 root 并删除 IFB；此时 IFB 已经完成清理，允许撤销 NTC 残留状态。
+        ifb_device=""
+    elif ! ifb_device=$(tc_dog_ifb_device "$state_interface" allow-missing); then
+        echo "$reason：Dog 入向层级无法安全验证，保留规则和状态。" | tee -a "$LOG_FILE"
+        return 1
+    fi
+    if [ -n "$ifb_device" ] && ! ifb_snapshot=$(tc_base_class_snapshot "$ifb_device"); then
+        return 1
+    fi
+
     if is_default_qdisc_line "$qdisc_line"; then
-        if rm -f "$TC_STATE_FILE"; then
+        if tc_update_dog_ifb "$state_interface" "$ifb_device" "$TC_PARENT_RATE" allow-missing &&
+           rm -f "$TC_STATE_FILE"; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB 已不存在，仅清理本脚本状态。" | tee -a "$LOG_FILE"
             return 0
+        fi
+        if [ -n "$ifb_device" ]; then
+            tc_restore_base_snapshot "$ifb_device" "$ifb_snapshot" ||
+                echo "$reason：IFB 回滚失败，请立即检查。" | tee -a "$LOG_FILE"
         fi
         echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB 已不存在，但状态文件删除失败。" | tee -a "$LOG_FILE"
         return 1
@@ -3316,6 +3607,7 @@ clear_owned_tc_rules_locked() {
         echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB 与本脚本状态不一致，保留规则和状态。" | tee -a "$LOG_FILE"
         return 1
     fi
+    restore_parent_rate="${state_speed}kbit"
     tc_verify_unified_hierarchy "$state_interface" "${state_speed}kbit"
     verify_status=$?
     if [ "$verify_status" -eq 2 ]; then
@@ -3326,32 +3618,11 @@ clear_owned_tc_rules_locked() {
         trafficcop_config_is_disabled || disabled_status=$?
         if [ "$disabled_status" -eq 0 ] &&
            tc_verify_unified_hierarchy "$state_interface" "$TC_PARENT_RATE"; then
-            tc_has_other_consumers "$state_interface"
-            query_status=$?
-            if [ "$query_status" -eq 2 ]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：无法确认其他 TC 使用者，保留规则和状态。" | tee -a "$LOG_FILE"
-                return 1
-            elif [ "$query_status" -eq 0 ]; then
-                if rm -f "$TC_STATE_FILE"; then
-                    echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：整机上限已撤销，已清理残留状态并保留端口子类。" | tee -a "$LOG_FILE"
-                    return 0
-                fi
-                return 1
-            fi
-            if ! "$TC_BIN" qdisc del dev "$state_interface" root handle 1: 2>/dev/null; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：残留统一 HTB root 清理失败，保留状态。" | tee -a "$LOG_FILE"
-                return 1
-            fi
-            if rm -f "$TC_STATE_FILE"; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：已清理残留的整机限速状态和 HTB root。" | tee -a "$LOG_FILE"
-                return 0
-            fi
-            "$TC_BIN" qdisc replace dev "$state_interface" root handle 1: htb default 30 2>/dev/null &&
-                tc_replace_base_classes "$state_interface" "$TC_PARENT_RATE" >/dev/null 2>&1 || true
+            restore_parent_rate="$TC_PARENT_RATE"
+        else
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB 与本脚本状态不一致，保留规则和状态。" | tee -a "$LOG_FILE"
             return 1
         fi
-        echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：统一 HTB 与本脚本状态不一致，保留规则和状态。" | tee -a "$LOG_FILE"
-        return 1
     fi
 
     tc_has_other_consumers "$state_interface"
@@ -3360,21 +3631,31 @@ clear_owned_tc_rules_locked() {
         echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：无法确认其他 TC 使用者，保留规则和状态。" | tee -a "$LOG_FILE"
         return 1
     elif [ "$query_status" -eq 0 ]; then
-        if ! tc_replace_base_classes "$state_interface" "$TC_PARENT_RATE" ||
-           ! tc_verify_unified_hierarchy "$state_interface" "$TC_PARENT_RATE"; then
-            tc_replace_base_classes "$state_interface" "${state_speed}kbit" >/dev/null 2>&1 || true
-            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：无法撤销全局父限速，已尝试恢复。" | tee -a "$LOG_FILE"
-            return 1
-        fi
-        if rm -f "$TC_STATE_FILE"; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：已撤销整机上限，现有端口子类和过滤器保持不变。" | tee -a "$LOG_FILE"
+        if { [ "$restore_parent_rate" = "$TC_PARENT_RATE" ] ||
+             { tc_replace_base_classes "$state_interface" "$TC_PARENT_RATE" &&
+               tc_verify_unified_hierarchy "$state_interface" "$TC_PARENT_RATE"; }; } &&
+           tc_update_dog_ifb "$state_interface" "$ifb_device" "$TC_PARENT_RATE" allow-missing &&
+           rm -f "$TC_STATE_FILE"; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：已撤销整机上限，现有端口子类、过滤器和入向 redirect 保持不变。" | tee -a "$LOG_FILE"
             return 0
         fi
-        tc_replace_base_classes "$state_interface" "${state_speed}kbit" >/dev/null 2>&1 && rollback_ok=true
+        if tc_replace_base_classes "$state_interface" "$restore_parent_rate" >/dev/null 2>&1 &&
+           tc_verify_unified_hierarchy "$state_interface" "$restore_parent_rate"; then
+            rollback_ok=true
+        fi
     else
+        if ! tc_update_dog_ifb "$state_interface" "$ifb_device" "$TC_PARENT_RATE" allow-missing; then
+            [ -z "$ifb_device" ] || tc_restore_base_snapshot "$ifb_device" "$ifb_snapshot" ||
+                echo "$reason：IFB 回滚失败，请立即检查。" | tee -a "$LOG_FILE"
+            return 1
+        fi
         if ! "$TC_BIN" qdisc del dev "$state_interface" root handle 1: 2>/dev/null; then
             tc_root_is_htb_handle_one "$state_interface"
             query_status=$?
+            if [ "$query_status" -ne 1 ] && [ -n "$ifb_device" ]; then
+                tc_restore_base_snapshot "$ifb_device" "$ifb_snapshot" ||
+                    echo "$reason：IFB 回滚失败，请立即检查。" | tee -a "$LOG_FILE"
+            fi
             if [ "$query_status" -eq 2 ]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：root 清理后状态查询失败，保留状态。" | tee -a "$LOG_FILE"
                 return 1
@@ -3388,9 +3669,12 @@ clear_owned_tc_rules_locked() {
             return 0
         fi
         if "$TC_BIN" qdisc replace dev "$state_interface" root handle 1: htb default 30 2>/dev/null &&
-           tc_replace_base_classes "$state_interface" "${state_speed}kbit"; then
+           tc_replace_base_classes "$state_interface" "$restore_parent_rate"; then
             rollback_ok=true
         fi
+    fi
+    if [ -n "$ifb_device" ] && ! tc_restore_base_snapshot "$ifb_device" "$ifb_snapshot"; then
+        rollback_ok=false
     fi
 
     if $rollback_ok; then
@@ -3403,15 +3687,22 @@ clear_owned_tc_rules_locked() {
 
 clear_owned_tc_rules() {
     local reason="$1"
-    local result
+    local result had_state=false
+    { [ -e "$TC_STATE_FILE" ] || [ -L "$TC_STATE_FILE" ]; } && had_state=true
 
     if ! acquire_tc_hierarchy_lock; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') $reason：无法取得统一 TC 层级锁。" | tee -a "$LOG_FILE"
+        ntc_operation_log tc-clear failure
         return 1
     fi
     clear_owned_tc_rules_locked "$reason"
     result=$?
     release_tc_hierarchy_lock
+    if [ "$result" -ne 0 ]; then
+        ntc_operation_log tc-clear failure
+    elif $had_state; then
+        ntc_operation_log tc-clear success
+    fi
     return "$result"
 }
 
@@ -3587,7 +3878,8 @@ owned_tc_limit_active() {
         tc_root_is_unified_compatible "$state_interface"
         query_status=$?
         [ "$query_status" -eq 0 ] || return "$query_status"
-        tc_verify_unified_hierarchy "$state_interface" "${state_speed}kbit"
+        tc_verify_unified_hierarchy "$state_interface" "${state_speed}kbit" &&
+            tc_verify_dog_ifb "$state_interface" "${state_speed}kbit"
         return $?
     fi
     tc_legacy_tbf_is_owned "$state_interface" "$qdisc_line"
@@ -3706,8 +3998,16 @@ check_and_limit_traffic() {
             fi
             write_usage_state "limited" "$current_usage" "$limit_threshold" "$unit_label" || return 1
         elif [ "$LIMIT_MODE" = "shutdown" ]; then
-            if has_pending_shutdown; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制，系统已有计划关机，未重复提交或覆盖" | tee -a "$LOG_FILE"
+            if pending_shutdown_matches_owned_state; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制，本脚本已提交计划关机，未重复提交或覆盖" | tee -a "$LOG_FILE"
+            elif has_pending_shutdown; then
+                # 存在非本脚本提交的计划关机（例如运维手动 shutdown）。按既有设计不覆盖他人计划，
+                # 但也不能把这次动作记成自己的，否则状态文件与通知会谎报关机来源。
+                # 注意：新状态值 shutdown_external 必须同步存在于 trafficcop-lite-telegram.sh 的
+                # read_current_traffic_state 允许列表、状态显示映射与通知状态机中。
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制；检测到非本脚本提交的计划关机，按设计不覆盖，本轮不提交自己的关机" | tee -a "$LOG_FILE"
+                write_usage_state "shutdown_external" "$current_usage" "$limit_threshold" "$unit_label" || return 1
+                return 0
             else
                 echo "$(date '+%Y-%m-%d %H:%M:%S') 流量超出限制，系统将在 1 分钟后关机" | tee -a "$LOG_FILE"
                 if ! write_shutdown_state; then
@@ -3776,12 +4076,15 @@ check_reset_limit() {
 resolve_tc_self_check_interface() {
     local requested_interface="${1:-}"
     local configured_interface="" state_interface="" detected_interface=""
+    if [ -e "$CONFIG_FILE" ] || [ -L "$CONFIG_FILE" ]; then
+        tc_file_is_secure "$CONFIG_FILE" || return 1
+        configured_interface=$(tc_file_optional_unique_value "$CONFIG_FILE" MAIN_INTERFACE) || return 1
+    fi
 
     if [ -n "$requested_interface" ]; then
         printf '%s\n' "$requested_interface"
         return 0
     fi
-    configured_interface=$(grep '^MAIN_INTERFACE=' "$CONFIG_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-)
     state_interface=$(tc_state_interface)
     if [ -n "$configured_interface" ] && [ -n "$state_interface" ] &&
        [ "$configured_interface" != "$state_interface" ]; then
@@ -3809,6 +4112,7 @@ recover_owned_tc_hierarchy() {
         --auto|--manual) ;;
         *)
             echo "不支持的 TC 恢复模式: $mode" >&2
+            ntc_operation_log tc-recover failure
             return 2
             ;;
     esac
@@ -3831,16 +4135,19 @@ recover_owned_tc_hierarchy() {
         1) ;;
         *)
             echo "TrafficCop 配置无法安全解释，拒绝修改 TC。" >&2
+            ntc_operation_log tc-recover failure
             return 1
             ;;
     esac
 
     [ -n "$TC_BIN" ] || {
         echo "未找到系统 tc 命令，无法恢复。" >&2
+        ntc_operation_log tc-recover failure
         return 1
     }
     [[ "${MAIN_INTERFACE:-}" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || {
         echo "TrafficCop 配置中的网卡无效，拒绝修改 TC。" >&2
+        ntc_operation_log tc-recover failure
         return 1
     }
 
@@ -3852,6 +4159,7 @@ recover_owned_tc_hierarchy() {
     if [ -e "$TC_STATE_FILE" ]; then
         if ! tc_state_file_is_interpretable; then
             echo "TrafficCop TC 状态文件无法安全解释，拒绝删除 qdisc。" >&2
+            ntc_operation_log tc-recover failure
             return 1
         fi
         state_interface=$(tc_state_interface)
@@ -3863,6 +4171,7 @@ recover_owned_tc_hierarchy() {
            [ "$state_provider" != "$TC_STATE_PROVIDER" ] ||
            ! [[ "$state_speed" =~ ^[1-9][0-9]*$ ]]; then
             echo "TrafficCop TC 状态文件无法安全解释，拒绝删除 qdisc。" >&2
+            ntc_operation_log tc-recover failure
             return 1
         fi
         state_expected=true
@@ -3879,6 +4188,7 @@ recover_owned_tc_hierarchy() {
 
     if ! acquire_tc_hierarchy_lock; then
         echo "无法取得统一 TC 层级锁，未修改 qdisc。" >&2
+        ntc_operation_log tc-recover failure
         return 1
     fi
 
@@ -3888,6 +4198,7 @@ recover_owned_tc_hierarchy() {
     if [ "$query_status" -eq 2 ]; then
         release_tc_hierarchy_lock
         echo "无法读取当前 root qdisc，未作任何 TC 修改。" >&2
+        ntc_operation_log tc-recover failure
         return 1
     elif [ "$query_status" -eq 1 ]; then
         qdisc_line=""
@@ -3897,6 +4208,7 @@ recover_owned_tc_hierarchy() {
     if [ "$unified_status" -eq 2 ]; then
         release_tc_hierarchy_lock
         echo "TC 层级查询失败，未作任何 TC 修改。" >&2
+        ntc_operation_log tc-recover failure
         return 1
     fi
     if [ "$state_expected" = "true" ] && [ "$unified_status" -eq 0 ]; then
@@ -3905,21 +4217,45 @@ recover_owned_tc_hierarchy() {
         if [ "$verify_status" -eq 2 ]; then
             release_tc_hierarchy_lock
             echo "TC 层级查询失败，未作任何 TC 修改。" >&2
+            ntc_operation_log tc-recover failure
             return 1
-        elif [ "$verify_status" -eq 0 ]; then
-            dog_status=0
-            if [ -e "$DOG_CONFIG_FILE" ] || [ -L "$DOG_CONFIG_FILE" ]; then
-                dog_live_objects_match_config "$MAIN_INTERFACE" || dog_status=$?
-            fi
-            if [ "$dog_status" -eq 2 ]; then
+        fi
+        dog_status=0
+        if [ -e "$DOG_CONFIG_FILE" ] || [ -L "$DOG_CONFIG_FILE" ]; then
+            dog_live_objects_match_config "$MAIN_INTERFACE" || dog_status=$?
+        fi
+        if [ "$dog_status" -eq 2 ]; then
+            release_tc_hierarchy_lock
+            echo "Dog TC 层级查询失败，未作任何 TC 修改。" >&2
+            ntc_operation_log tc-recover failure
+            return 1
+        elif [ "$dog_status" -eq 0 ]; then
+            local ifb_device="" ifb_status=0
+            ifb_device=$(tc_dog_ifb_device "$MAIN_INTERFACE") || ifb_status=$?
+            if [ "$ifb_status" -ne 0 ]; then
                 release_tc_hierarchy_lock
-                echo "Dog TC 层级查询失败，未作任何 TC 修改。" >&2
+                echo "Dog 入向层级不完整或归属无法验证，请先由共享入口恢复 Dog。" >&2
+                ntc_operation_log tc-recover failure
                 return 1
-            elif [ "$dog_status" -eq 0 ]; then
+            fi
+            tc_verify_dog_ifb "$MAIN_INTERFACE" "${state_speed}kbit"
+            ifb_status=$?
+            if [ "$ifb_status" -eq 2 ]; then
+                release_tc_hierarchy_lock
+                ntc_operation_log tc-recover failure
+                return 1
+            elif [ "$verify_status" -eq 0 ] && [ "$ifb_status" -eq 0 ] &&
+                 [ "$(tc_state_value IFB_INTERFACE)" = "$ifb_device" ]; then
                 release_tc_hierarchy_lock
                 echo "Dog/NTC TC 规则完整，无需重建。"
                 return 0
             fi
+            # 父速率漂移无需删树；释放锁后重用带两侧回滚的普通协调事务。
+            release_tc_hierarchy_lock
+            apply_tc_limit "$state_speed"
+            local repair_status=$?
+            if [ "$repair_status" -eq 0 ]; then ntc_operation_log tc-recover success; else ntc_operation_log tc-recover failure; fi
+            return "$repair_status"
         fi
     fi
 
@@ -3934,6 +4270,7 @@ recover_owned_tc_hierarchy() {
        ! is_default_qdisc_line "$qdisc_line"; then
         release_tc_hierarchy_lock
         echo "自动恢复检测到外部或未知 root qdisc，拒绝接管；请使用 --manual 明确确认。" >&2
+        ntc_operation_log tc-recover failure
         return 1
     fi
 
@@ -3943,20 +4280,31 @@ recover_owned_tc_hierarchy() {
         if ! dog_classes=$(dog_configured_class_ids 2>/dev/null); then
             release_tc_hierarchy_lock
             echo "Dog 配置存在但无法安全解析，拒绝删除 qdisc。" >&2
+            ntc_operation_log tc-recover failure
             return 1
         fi
     fi
     if [ -n "$dog_classes" ]; then
         release_tc_hierarchy_lock
         echo "检测到 Dog 端口限速配置，请使用共享 traffic-tools-tc-recovery 服务恢复。" >&2
+        ntc_operation_log tc-recover failure
         return 1
     fi
 
+    local recovery_ifb="" recovery_ifb_snapshot=""
+    if ! recovery_ifb=$(tc_dog_ifb_device "$MAIN_INTERFACE") ||
+       { [ -n "$recovery_ifb" ] && ! recovery_ifb_snapshot=$(tc_base_class_snapshot "$recovery_ifb"); }; then
+        release_tc_hierarchy_lock
+        echo "Dog 入向层级无法安全验证，未删除当前 qdisc。" >&2
+        ntc_operation_log tc-recover failure
+        return 1
+    fi
     local prepared_state="${TC_STATE_FILE}.recovery.$$"
     if [ "$state_expected" = "true" ] &&
-       ! write_tc_state "$MAIN_INTERFACE" "$state_speed" "" "$prepared_state"; then
+       ! write_tc_state "$MAIN_INTERFACE" "$state_speed" "" "$prepared_state" "$recovery_ifb"; then
         release_tc_hierarchy_lock
         echo "无法预写 TrafficCop TC 恢复状态，未删除当前 qdisc。" >&2
+        ntc_operation_log tc-recover failure
         return 1
     fi
 
@@ -3965,40 +4313,61 @@ recover_owned_tc_hierarchy() {
         rm -f "$prepared_state"
         release_tc_hierarchy_lock
         echo "无法删除当前冲突 root qdisc，TrafficCop 规则未重建。" >&2
+        ntc_operation_log tc-recover failure
         return 1
     fi
-    rm -f "$DOG_TC_OWNER_FILE"
+    if [ -z "$recovery_ifb" ]; then rm -f "$DOG_TC_OWNER_FILE"; fi
 
     if [ "$state_expected" = "true" ]; then
         if "$TC_BIN" qdisc replace dev "$MAIN_INTERFACE" root handle 1: htb default 30 2>/dev/null &&
            tc_replace_base_classes "$MAIN_INTERFACE" "${state_speed}kbit" &&
            tc_verify_unified_hierarchy "$MAIN_INTERFACE" "${state_speed}kbit" &&
+           tc_update_dog_ifb "$MAIN_INTERFACE" "$recovery_ifb" "${state_speed}kbit" &&
            mv -f "$prepared_state" "$TC_STATE_FILE"; then
             release_tc_hierarchy_lock
             echo "TrafficCop 统一 HTB 已按现有状态重建。"
+            ntc_operation_log tc-recover success
             return 0
         fi
-        rm -f "$prepared_state"
+        local recovery_rollback_ok=true
+        if [ -n "$recovery_ifb" ]; then
+            tc_restore_base_snapshot "$recovery_ifb" "$recovery_ifb_snapshot" || recovery_rollback_ok=false
+        fi
+        if ! "$TC_BIN" qdisc del dev "$MAIN_INTERFACE" root handle 1: 2>/dev/null; then
+            tc_root_is_htb_handle_one "$MAIN_INTERFACE"
+            query_status=$?
+            [ "$query_status" -eq 1 ] || recovery_rollback_ok=false
+        fi
+        if $recovery_rollback_ok; then
+            rm -f "$prepared_state"
+        else
+            echo "TC 恢复事务回滚失败；预写状态保留在 $prepared_state。" >&2
+        fi
         release_tc_hierarchy_lock
         echo "冲突 qdisc 已清除，但 TrafficCop 统一 HTB 未能完整重建。" >&2
+        ntc_operation_log tc-recover failure
         return 1
     fi
 
     release_tc_hierarchy_lock
     # 首次冲突没有旧状态时，删除完成后重新计算流量；只有确实超额才创建 NTC 层级。
     check_and_limit_traffic
+    local recovery_status=$?
+    if [ "$recovery_status" -eq 0 ]; then ntc_operation_log tc-recover success; else ntc_operation_log tc-recover failure; fi
+    return "$recovery_status"
 }
 
 tc_self_check() {
     local interface qdisc_line state_speed state_schema result=1
     local query_status verify_status default_status default_line disabled_status dog_status
+    local success_message="" expected_ifb_rate="${TC_PARENT_RATE:-100gbit}"
 
     if [ -z "$TC_BIN" ]; then
         echo "TC_SELF_CHECK=ERROR REASON=tc-not-found"
         return 1
     fi
     if ! interface=$(resolve_tc_self_check_interface "${1:-}") ||
-       ! [[ "$interface" =~ ^[A-Za-z0-9_.:-]+$ ]]; then
+       ! [[ "$interface" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]]; then
         echo "TC_SELF_CHECK=ERROR REASON=interface-unresolved"
         return 1
     fi
@@ -4014,7 +4383,7 @@ tc_self_check() {
         release_tc_hierarchy_lock
         return 1
     fi
-    if [ -e "$TC_STATE_FILE" ] && ! tc_state_file_is_interpretable; then
+    if { [ -e "$TC_STATE_FILE" ] || [ -L "$TC_STATE_FILE" ]; } && ! tc_state_file_is_interpretable; then
         echo "TC_SELF_CHECK=CONFLICT INTERFACE=$interface REASON=trafficcop-state-invalid"
         release_tc_hierarchy_lock
         return 1
@@ -4038,12 +4407,12 @@ tc_self_check() {
         if [ -f "$TC_STATE_FILE" ]; then
             echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=state-without-unified-htb"
         else
-            echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=absent"
+            success_message="TC_SELF_CHECK=OK INTERFACE=$interface MODEL=absent"
             result=0
         fi
     elif printf '%s\n' "$qdisc_line" | grep -q ' tbf '; then
         if tc_legacy_tbf_is_owned "$interface" "$qdisc_line"; then
-            echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=legacy-trafficcop-tbf ACTION=migrate-on-next-apply"
+            success_message="TC_SELF_CHECK=OK INTERFACE=$interface MODEL=legacy-trafficcop-tbf ACTION=migrate-on-next-apply"
             result=0
         else
             echo "TC_SELF_CHECK=CONFLICT INTERFACE=$interface REASON=foreign-tbf"
@@ -4082,7 +4451,8 @@ tc_self_check() {
                     elif [ "$dog_status" -ne 0 ]; then
                         echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=dog-port-rules-mismatch"
                     else
-                        echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=$TC_STATE_SCHEMA OWNER=trafficcop-lite"
+                        success_message="TC_SELF_CHECK=OK INTERFACE=$interface MODEL=$TC_STATE_SCHEMA OWNER=trafficcop-lite"
+                        expected_ifb_rate="${state_speed}kbit"
                         result=0
                     fi
                 else
@@ -4101,13 +4471,26 @@ tc_self_check() {
                 if [ "$query_status" -eq 2 ]; then
                     echo "TC_SELF_CHECK=ERROR INTERFACE=$interface REASON=tc-query-failed"
                 elif [ "$query_status" -eq 0 ] && [ -n "$default_line" ]; then
-                    echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=$TC_STATE_SCHEMA OWNER=port-traffic-dog"
+                    success_message="TC_SELF_CHECK=OK INTERFACE=$interface MODEL=$TC_STATE_SCHEMA OWNER=port-traffic-dog"
                     result=0
                 else
-                    echo "TC_SELF_CHECK=OK INTERFACE=$interface MODEL=legacy-dog-htb ACTION=add-default-class-on-next-apply"
+                    success_message="TC_SELF_CHECK=OK INTERFACE=$interface MODEL=legacy-dog-htb ACTION=add-default-class-on-next-apply"
                     result=0
                 fi
             fi
+        fi
+    fi
+    if [ "$result" -eq 0 ]; then
+        tc_verify_dog_ifb "$interface" "$expected_ifb_rate"
+        verify_status=$?
+        if [ "$verify_status" -eq 2 ]; then
+            echo "TC_SELF_CHECK=ERROR INTERFACE=$interface REASON=tc-query-failed"
+            result=1
+        elif [ "$verify_status" -ne 0 ]; then
+            echo "TC_SELF_CHECK=DRIFT INTERFACE=$interface REASON=dog-ingress-mismatch"
+            result=1
+        else
+            printf '%s\n' "$success_message"
         fi
     fi
 
@@ -4278,8 +4661,20 @@ main() {
 
 
 
-# 执行主函数
-main "$@"
-exit_code=$?
-write_invocation_log_footer "${1:-}"
-exit "$exit_code"
+# Sourcing exposes functions without creating files, installing traps or running a menu.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    case "${1:-}" in
+        --self-check|--tc-self-check) ;;
+        *)
+            umask 077
+            mkdir -p "$WORK_DIR"
+            chmod 700 "$WORK_DIR" 2>/dev/null || true
+            [ ! -f "$LOG_FILE" ] || chmod 600 "$LOG_FILE" 2>/dev/null || true
+            ;;
+    esac
+    write_invocation_log_header "${1:-}" || printf '%s\n' 'NTC monitor log unavailable' >&2
+    main "$@"
+    exit_code=$?
+    write_invocation_log_footer "${1:-}" || printf '%s\n' 'NTC monitor log unavailable' >&2
+    exit "$exit_code"
+fi

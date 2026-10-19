@@ -1,14 +1,12 @@
 #!/bin/bash
 
-if [ "$(id -u)" -ne 0 ]; then
+if [[ "${BASH_SOURCE[0]}" == "$0" ]] && [ "$(id -u)" -ne 0 ]; then
     echo "请使用 root 权限运行此脚本。"
     exit 1
 fi
 
 # 设置新的工作目录
 WORK_DIR="/etc/trafficcop-lite"
-mkdir -p "$WORK_DIR"
-chmod 700 "$WORK_DIR" 2>/dev/null || true
 
 # 更新文件路径
 CONFIG_FILE="$WORK_DIR/tg_notifier_config.txt"
@@ -22,7 +20,72 @@ TG_LOCK_FILE="$WORK_DIR/tg_notifier.lock"
 ROOT_CRONTAB_LOCK_FILE="${TRAFFICCOP_ROOT_CRONTAB_LOCK_FILE:-$WORK_DIR/root-crontab.lock}"
 CRON_LOG_MAX_LINES="${CRON_LOG_MAX_LINES:-2000}"
 TG_DEBUG="${TG_DEBUG:-false}"
-SCRIPT_VERSION="1.1.4"
+SCRIPT_VERSION="1.1.5"
+
+# Keep this small audit writer identical in the four standalone distribution scripts.
+# Only fixed event/result values are accepted; extra arguments are never recorded.
+ntc_operation_log() {
+    local event="${1:-}" result="${2:-}"
+    case "$event" in
+        install|update|update-rollback|monitor-config|config-rollback|tc-apply|tc-clear|tc-recover|stop|machine-enable|machine-disable|machine-restore|machine-rollback|enforcement-pause|enforcement-resume|enforcement-grace|boot-grace|telegram-config|telegram-enable|telegram-disable) ;;
+        *) printf '%s\n' 'NTC audit event rejected' >&2; return 0 ;;
+    esac
+    case "$result" in
+        success|failure|unchanged) ;;
+        *) printf '%s\n' 'NTC audit result rejected' >&2; return 0 ;;
+    esac
+    local description result_text
+    case "$event" in
+        install) description="安装 NTC" ;;
+        update) description="更新脚本" ;;
+        update-rollback) description="恢复更新前的脚本" ;;
+        monitor-config) description="保存流量监控配置" ;;
+        config-rollback) description="恢复原配置" ;;
+        tc-apply) description="应用整机限速" ;;
+        tc-clear) description="撤销整机限速" ;;
+        tc-recover) description="恢复 Dog/NTC 限速" ;;
+        stop) description="停止监控和通知" ;;
+        machine-enable) description="启用整机流量限制" ;;
+        machine-disable) description="停用整机流量限制" ;;
+        machine-restore) description="恢复整机流量配置" ;;
+        machine-rollback) description="回退整机流量配置" ;;
+        enforcement-pause) description="暂停流量限制" ;;
+        enforcement-resume) description="恢复流量限制" ;;
+        enforcement-grace) description="设置临时宽限期" ;;
+        boot-grace) description="设置开机宽限期" ;;
+        telegram-config) description="保存 Telegram 通知配置" ;;
+        telegram-enable) description="启用 Telegram 通知" ;;
+        telegram-disable) description="停用 Telegram 通知" ;;
+    esac
+    case "$result" in success) result_text="成功" ;; failure) result_text="失败" ;; unchanged) result_text="保持不变" ;; esac
+    if ! (
+        umask 077
+        [ -n "${WORK_DIR:-}" ] && [ ! -L "$WORK_DIR" ] || exit 1
+        mkdir -p "$WORK_DIR" && chmod 700 "$WORK_DIR" || exit 1
+        audit_file="$WORK_DIR/operations.log"
+        for audit_path in "$audit_file" "$audit_file.1" "$audit_file.2" "$audit_file.3" "$audit_file.lock"; do
+            [ ! -L "$audit_path" ] || exit 1
+            if [ -e "$audit_path" ]; then
+                [ -f "$audit_path" ] && [ "$(stat -c %h "$audit_path")" = 1 ] || exit 1
+                chmod 600 "$audit_path" || exit 1
+            fi
+        done
+        exec 8>"$audit_file.lock" || exit 1
+        chmod 600 "$audit_file.lock" && flock -w 2 8 || exit 1
+        if [ -f "$audit_file" ] && [ "$(stat -c %s "$audit_file")" -ge 1048576 ]; then
+            rm -f "$audit_file.3" || exit 1
+            [ ! -f "$audit_file.2" ] || mv -f "$audit_file.2" "$audit_file.3" || exit 1
+            [ ! -f "$audit_file.1" ] || mv -f "$audit_file.1" "$audit_file.2" || exit 1
+            mv -f "$audit_file" "$audit_file.1" || exit 1
+        fi
+        : >> "$audit_file" && chmod 600 "$audit_file" || exit 1
+        printf '%s %s：%s EVENT=%s RESULT=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$description" "$result_text" "$event" "$result" >> "$audit_file" || exit 1
+    ) 2>/dev/null; then
+        printf 'NTC 操作日志写入失败，业务结果保持原值 (NTC audit log unavailable EVENT=%s RESULT=%s)\n' "$event" "$result" >&2
+    fi
+    # Logging failures must never change the business result or the caller's shell options.
+    return 0
+}
 
 # 此函数只由 EXIT trap 调用，ShellCheck 无法沿字符串形式的 trap 识别调用关系。
 # shellcheck disable=SC2317,SC2329
@@ -63,15 +126,6 @@ migrate_files() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') 使用独立工作目录: $WORK_DIR" | tee -a "$CRON_LOG"
 }
 
-# 在脚本开始时调用迁移函数
-migrate_files
-
-# 切换到工作目录
-cd "$WORK_DIR" || exit 1
-trap 'trim_log_file "$CRON_LOG" "$CRON_LOG_MAX_LINES"' EXIT
-
-echo "----------------------------------------------"| tee -a "$CRON_LOG"
-echo "$(date '+%Y-%m-%d %H:%M:%S') : 当前版本：$SCRIPT_VERSION" | tee -a "$CRON_LOG"
 
 # 检查是否有同名的 crontab 正在执行:
 check_running() {
@@ -293,11 +347,13 @@ write_config() {
         write_config_value "TG_DISABLED" "${TG_DISABLED:-false}"
     } > "$tmp_file"; then
         rm -f "$tmp_file"
+        ntc_operation_log telegram-config failure
         return 1
     fi
     chmod 600 "$tmp_file" 2>/dev/null || true
-    mv -f "$tmp_file" "$CONFIG_FILE" || { rm -f "$tmp_file"; return 1; }
+    mv -f "$tmp_file" "$CONFIG_FILE" || { rm -f "$tmp_file"; ntc_operation_log telegram-config failure; return 1; }
     echo "配置已保存到 $CONFIG_FILE"
+    ntc_operation_log telegram-config success
 }
 
 
@@ -532,7 +588,7 @@ read_current_traffic_state() {
     done < "$USAGE_STATE_FILE"
 
     case "$CURRENT_TRAFFIC_STATUS" in
-        normal|limited|shutdown|grace|paused) ;;
+        normal|limited|shutdown|shutdown_external|grace|paused) ;;
         *) return 1 ;;
     esac
     [[ "$CURRENT_TRAFFIC_PERIOD_START" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
@@ -567,6 +623,7 @@ check_and_notify() {
     if read_current_traffic_state; then
         case "$CURRENT_TRAFFIC_STATUS" in
             shutdown) current_status="关机" ;;
+            shutdown_external) current_status="外部关机计划" ;;
             limited) current_status="限速" ;;
             normal) current_status="正常" ;;
             grace) current_status="宽限" ;;
@@ -610,10 +667,10 @@ check_and_notify() {
                     fi
                 fi
                 ;;
-            关机)
-                if [ "$effective_last_status" != "关机" ]; then
+            关机|外部关机计划)
+                if [ "$effective_last_status" != "$current_status" ]; then
                     if send_shutdown_warning; then
-                        next_status="关机"
+                        next_status="$current_status"
                         log_cron "关机通知发送成功"
                     else
                         log_cron "关机通知发送失败，将在下次任务重试"
@@ -621,7 +678,8 @@ check_and_notify() {
                 fi
                 ;;
             正常)
-                if [ "$effective_last_status" = "限速" ] || [ "$effective_last_status" = "关机" ]; then
+                if [ "$effective_last_status" = "限速" ] || [ "$effective_last_status" = "关机" ] ||
+                   [ "$effective_last_status" = "外部关机计划" ]; then
                     if send_throttle_lifted; then
                         next_status="正常"
                         log_cron "限速解除通知发送成功"
@@ -743,6 +801,7 @@ enable_telegram_notifications() {
     # 配置仍为关闭时先创建任务；即使 cron 立即触发也会安全跳过。
     if ! setup_cron; then
         echo "自动通知开启失败，当前仍保持关闭状态。"
+        ntc_operation_log telegram-enable failure
         return 1
     fi
 
@@ -751,9 +810,11 @@ enable_telegram_notifications() {
         TG_DISABLED=true
         remove_telegram_cron >/dev/null 2>&1 || true
         echo "自动通知开启失败：无法更新配置，已清理新建的定时任务。"
+        ntc_operation_log telegram-enable failure
         return 1
     fi
     echo "Telegram 自动通知已开启。"
+    ntc_operation_log telegram-enable success
 }
 
 # shellcheck disable=SC2317,SC2329
@@ -761,13 +822,16 @@ disable_telegram_notifications() {
     TG_DISABLED=true
     if ! write_config; then
         echo "自动通知关闭失败：无法更新配置。"
+        ntc_operation_log telegram-disable failure
         return 1
     fi
     if ! remove_telegram_cron; then
         echo "自动通知已标记为关闭，但定时任务清理失败；残留任务运行时也会跳过推送。"
+        ntc_operation_log telegram-disable failure
         return 1
     fi
     echo "Telegram 自动通知已关闭；配置和手动功能仍保留。"
+    ntc_operation_log telegram-disable success
 }
 
 # 更新cron任务中的时间（当修改每日报告时间时调用）
@@ -790,7 +854,7 @@ update_cron_time() {
 daily_report() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 开始生成每日报告"| tee -a "$CRON_LOG"
     echo "$(date '+%Y-%m-%d %H:%M:%S') : DAILY_REPORT_TIME=$DAILY_REPORT_TIME"| tee -a "$CRON_LOG"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') : Telegram 配置已加载，机器名=$MACHINE_NAME"| tee -a "$CRON_LOG"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') : Telegram 配置已加载"| tee -a "$CRON_LOG"
     if ! read_current_traffic_state; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') : 实时流量状态不存在、无效或已过期，稍后重试每日报告"| tee -a "$CRON_LOG"
         return 1
@@ -1001,8 +1065,19 @@ if [[ "$*" == *"-cron"* ]]; then
 }
 
 
-# 执行主函数
-main "$@"
-exit_code=$?
-echo "----------------------------------------------"| tee -a "$CRON_LOG"
-exit "$exit_code"
+# Sourcing only defines functions; no directory, log, trap or notification is initialized.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    umask 077
+    mkdir -p "$WORK_DIR"
+    chmod 700 "$WORK_DIR" 2>/dev/null || true
+    [ ! -f "$CRON_LOG" ] || chmod 600 "$CRON_LOG" 2>/dev/null || true
+    migrate_files
+    cd "$WORK_DIR" || exit 1
+    trap 'trim_log_file "$CRON_LOG" "$CRON_LOG_MAX_LINES"' EXIT
+    echo "----------------------------------------------"| tee -a "$CRON_LOG"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') : 当前版本：$SCRIPT_VERSION" | tee -a "$CRON_LOG"
+    main "$@"
+    exit_code=$?
+    echo "----------------------------------------------"| tee -a "$CRON_LOG"
+    exit "$exit_code"
+fi

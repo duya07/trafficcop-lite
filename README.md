@@ -45,6 +45,11 @@
 29. 机器限速启用宽限会在同一监控锁内先撤销 NTC 自有整机限速和计划关机，再提交宽限状态；Dog 的端口 class/filter 会保留。
 30. 显式配置的周期起始日必须是 `1-31`；非法值会停止本轮计算并在主页提示配置异常，不再由不同组件各自归一化。
 31. TC 自检不会写入通用监控日志；机器状态只把明确的自动化执行标记视为最近运行，打开主页或执行自检不会伪造监控活动。
+32. Dog 已建立并可验证归属的 `ifb0` 会与物理网卡在同一 TC 锁和事务内同步 `1:1`/`1:30` 父速率。撤销、宽限、暂停、周期重置、停止和卸载会同时解除两侧整机上限，保留 Dog 的端口 class/filter 和 ingress redirect；IFB 更新或状态提交/删除失败会恢复修改前两侧速率。
+33. NTC 自检和恢复会核对已协作 IFB 的父速率、端口 class/filter 引用及 IPv4/IPv6 redirect。只有父速率漂移时可原地修复；配置、设备类型或归属无法验证时拒绝写入，应先通过共享恢复入口修复 Dog。NTC 单独安装仍只管理出向，不创建 IFB。
+34. Dog 配置中的逗号组在首次实际下发前可能没有 `class_id`；NTC 不凭空创建该 class。缺失、`null` 或空字符串的 class 字段不会导致速率/mark 列错位；已存在的 Dog class/filter 必须全部能由可信配置解释，未知对象或归属不明时保持失败关闭。
+35. 清除、宽限、暂停、停止和卸载允许 Dog 已经删除的端口 class 缺失；IFB 上现存端口 class 仍须匹配配置速率和父类，并校验 filter 引用、双栈 redirect 及默认类。现存 class 的速率错误不会按缺失跳过，apply 和自检仍要求配置中的已物化 class 完整。如果 IFB 已删除且物理 root 已回到默认状态，只清理 NTC 自己的残留状态。
+36. 两个项目可先后独立安装；NTC 单独运行或仅有尚未下发的 Dog 配置时只管理出向 HTB，不探测或创建未知 `ifb0`。首次登记 `IFB_INTERFACE=ifb0` 必须由可验证的 Dog owner/config、设备类型、class/filter 和 IPv4/IPv6 redirect 共同证明；登记后可在有效 NTC 状态和 Dog 配置范围内处理 Dog 已删除最后一个端口及 owner 标记的清理。
 
 ## 下载方式说明
 
@@ -114,10 +119,11 @@ sudo ntc --uninstall
 
 - `--install`: 安装/更新组件，并创建 `ntc` 快捷命令；使用单独下载的主脚本安装时会同步刷新整套组件。
 - `--update`: 从仓库更新脚本文件，不覆盖配置和日志。
+- `--logs`: 查看日志。操作审计会在真实操作完成后记录中文结果；查看日志、自检和状态查询不会为了“有记录”而修改安装目录。
+- 操作审计文件为 `/etc/trafficcop-lite/operations.log`，默认 `0700` 目录、`0600` 文件，单文件达到 1 MiB 后轮转并保留 3 份。记录包含自然语言动作、成功/失败/保持不变结果以及 `EVENT`/`RESULT` 字段，不记录配置内容、Token、通知 URL 或用户输入。
 - `--stop`: 停止独立版监控和通知任务。
-- `--logs`: 查看日志。
 - `--config`: 查看配置。
-- `--self-check [INTERFACE]`: 只读检查指定网卡（或自动识别网卡）的统一 HTB、状态归属与兼容性。
+- `--self-check [INTERFACE]` / `--tc-self-check [INTERFACE]`: 只读检查统一 HTB、状态归属和已协作的 Dog IFB；不创建目录、不修正权限、不写监控日志。
 - `--recover-tc --manual`: 显式调用共享恢复入口；它可能删除当前 root qdisc，通常应优先在主菜单 `9` 阅读提示并确认。
 - `--uninstall`: 卸载 TrafficCop Lite。
 
@@ -300,15 +306,16 @@ sudo /usr/sbin/tc qdisc show
 
 - 脚本会安装依赖、写入 crontab，并可能配置 TC 限速或关机模式，请先在测试机确认。
 - TC 模式会用 `/etc/trafficcop-lite/tc_limit_state` 记录自身管理的整机上限。NTC 直接创建或更新统一 HTB；Dog 存在时保留其端口类和过滤器，不存在时也可独立工作。
+- IFB 协作首次使用 Dog 的网卡/机器归属标记、可信配置、`ifb0` 设备类型及现有 class/filter/双栈 redirect 验证运行态；同步成功后在 `tc_limit_state` 中记录可选的 `IFB_INTERFACE=ifb0`。已登记状态可在 Dog 删除最后一个端口和 owner 标记后保留清理范围。NTC 不创建、接管未知 IFB，也不删除 Dog 的入向对象。其余无法验证的归属或链路会保留原规则和状态并报错，须先修复 Dog。
 - NTC 与 Dog 各自使用自己的 root crontab 锁；只有修改同一内核 TC 层级时共用 `/run/lock/traffic-tools-tc.lock`。
 - 外部程序重建 root qdisc 后，主页会报告外部/未知 TC 冲突，普通监控 cron 仍会拒绝覆盖。主菜单 `9` 可在明确确认后删除冲突并只重建 Dog/NTC；不会保留任何第三方规则。
 - 可选的 `traffic-tools-tc-recovery.service` 只在开机网络就绪后执行一次；它只接受默认/缺失 qdisc 或已识别的 Dog/NTC 统一层级，遇到外部或未知 root qdisc 会拒绝自动接管，须从主菜单 `9` 明确确认。运行期间若 root qdisc 再次被其他程序覆盖，也需要用户再次手动恢复；建议关闭其他 TC 管理服务。
 - `enforcement_state` 只记录临时宽限或暂停状态；`shutdown_limit_state` 只记录本脚本计划的流量关机及其 boot ID。
 - 若状态记录与当前 qdisc 不一致，脚本会按外部规则处理并停止自动覆盖。
 - 停止服务/卸载时，未标记的 TC 规则和计划关机会要求确认后才处理。
+- NTC 操作审计默认保留最近 1 MiB × 4 个文件；日志写入失败只提示 `NTC 操作日志写入失败`，不改变已经确定的安装、更新、限速或恢复结果。
 - Telegram cron 日志默认保留最近 2000 行；如需详细调试，可临时设置 `TG_DEBUG=true`。
 - 流量监控日志默认保留最近 5000 行，可通过 `LOG_MAX_LINES` 调整。
-- Telegram 报告时区可独立配置；旧配置默认使用 `Asia/Shanghai`。时区名称必须对应系统 `/usr/share/zoneinfo` 中的有效文件，因此精简系统需要安装 `tzdata`。到达设定时间后当天只发送一次，任务短暂中断时会在恢复后补发。
 - 需要 vnStat 2.x 或更高版本。脚本兼容 `vnstat --showconfig` 中带分号或井号的默认配置项，会管理 `SaveInterval`、必要时的 `UpdateInterval`、当前接口 `MaxBW`，并按周期需求管理 `DailyDays`；`VNSTAT_MAX_BANDWIDTH=0` 为默认值并表示关闭异常速率检查，非零值必须在 `1-50000` 范围内；vnStat 2.0–2.8 还使用上述兼容设置。守护进程未显式指定 `--config` 时，只有运行中的 `vnstatd`、系统 `vnstatd` 命令和 `vnstat` 客户端能证明来自同一安装前缀，脚本才采用客户端报告的默认配置。每个实际配置路径首次变更前都会单独保留原配置备份，卸载时不会自动恢复全局 vnStat 配置。
 - Debian/Ubuntu、RHEL 系、Alpine 和 Arch 系会按已识别的包管理器尝试安装依赖；无法自动启动 cron 或 vnStat 服务时会给出明确提示，请按系统服务管理方式确认其已运行。
 - 网络受限时，优先使用带 `v6.gh-proxy.org` 的命令。
@@ -318,7 +325,11 @@ sudo /usr/sbin/tc qdisc show
 仓库内置失败路径回归测试，并在 GitHub Actions 中执行语法检查、ShellCheck 和回归测试：
 
 ```bash
-bash -n trafficcop-lite.sh trafficcop-lite-monitor.sh trafficcop-lite-telegram.sh trafficcop-lite-machine-limit.sh tests/regression.sh
+for script in trafficcop-lite*.sh tests/*.sh; do bash -n "$script" || exit; done
 shellcheck trafficcop-lite.sh trafficcop-lite-monitor.sh trafficcop-lite-telegram.sh trafficcop-lite-machine-limit.sh tests/regression.sh
 bash tests/regression.sh
 ```
+
+`tests/regression.sh` 保留原有回归，并加载 `tests/ifb-regression.sh` 的独立 mock 用例，覆盖 IFB 部分更新失败、两侧回滚、状态提交/删除失败、现存子类速率错误拒绝清理、已删子类仅允许清理、NTC 先安装、未物化组和空字段解析、未知 IFB 零写入和主 CLI 只读权限检查。测试将临时文件放在私有 `mktemp` 目录，支持通过 `TMPDIR` 指定位置；mock 回归不执行真实 TC 修改。`tests/integration-netns.sh` 是单独的真实内核集成入口，不由 mock 回归自动执行。
+
+单端口分类校验按 IPv4/IPv6 协议分别查询，再验证 TCP/UDP 源/目标端口规则，兼容旧 iproute2 在混合 `fw`/u32/flower 时产生非法全量 JSON 的情况。`tests/filter-json-regression.sh` 保留旧版实际错误格式，并检查缺失规则或查询失败仍被拒绝。

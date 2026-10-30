@@ -20,7 +20,7 @@ TG_LOCK_FILE="$WORK_DIR/tg_notifier.lock"
 ROOT_CRONTAB_LOCK_FILE="${TRAFFICCOP_ROOT_CRONTAB_LOCK_FILE:-$WORK_DIR/root-crontab.lock}"
 CRON_LOG_MAX_LINES="${CRON_LOG_MAX_LINES:-2000}"
 TG_DEBUG="${TG_DEBUG:-false}"
-SCRIPT_VERSION="1.1.5"
+SCRIPT_VERSION="1.1.6"
 
 # Keep this small audit writer identical in the four standalone distribution scripts.
 # Only fixed event/result values are accepted; extra arguments are never recorded.
@@ -162,18 +162,36 @@ run_with_telegram_lock() {
 }
 
 check_runtime_dependencies() {
-    local command_name
+    local command_name entry="$WORK_DIR/trafficcop-lite.sh" mode="${1:-}" perms
     local missing_commands=()
 
     for command_name in curl crontab flock sed awk; do
         command -v "$command_name" >/dev/null 2>&1 || missing_commands+=("$command_name")
     done
-    if [ "${#missing_commands[@]}" -gt 0 ]; then
-        echo "缺少运行依赖：${missing_commands[*]}"
-        echo "请先通过主菜单选项 1 完成流量监控依赖安装。"
-        return 1
+    if ! { [ -s /etc/ssl/certs/ca-certificates.crt ] && [ -r /etc/ssl/certs/ca-certificates.crt ]; } &&
+       ! { [ -s /etc/ssl/cert.pem ] && [ -r /etc/ssl/cert.pem ]; }; then
+        missing_commands+=('@ca-certificates')
     fi
-    return 0
+    [ "${#missing_commands[@]}" -gt 0 ] || return 0
+    echo "缺少运行依赖：${missing_commands[*]}"
+    # Never install packages in a cron invocation or execute an untrusted helper.
+    if [ "$mode" != cron ] && [ -t 0 ] && [ -f "$entry" ] && [ ! -L "$entry" ] &&
+       [ "$(stat -c %u:%h -- "$entry" 2>/dev/null)" = 0:1 ] &&
+       perms=$(stat -c %a -- "$entry") && (( (8#$perms & 0022) == 0 )) &&
+       grep -Fqx '# BEGIN MANAGED DEPENDENCIES' "$entry"; then
+        bash "$entry" --dependencies install || return 1
+        for command_name in "${missing_commands[@]}"; do
+            if [ "$command_name" = '@ca-certificates' ]; then
+                { [ -s /etc/ssl/certs/ca-certificates.crt ] && [ -r /etc/ssl/certs/ca-certificates.crt ]; } ||
+                    { [ -s /etc/ssl/cert.pem ] && [ -r /etc/ssl/cert.pem ]; } || return 1
+            else
+                command -v "$command_name" >/dev/null 2>&1 || return 1
+            fi
+        done
+        return 0
+    fi
+    echo "请通过 NTC 主菜单 10 或主脚本 --dependencies install 安装依赖。"
+    return 1
 }
 
 read_current_crontab() {
@@ -885,9 +903,20 @@ daily_report() {
 
 # 主任务
 main() {
+    local _ separator='======================================'
+    if [ -z "${COLUMNS:-}" ] && [ -t 0 ] && command -v stty >/dev/null 2>&1; then
+        read -r _ COLUMNS < <(stty size 2>/dev/null) || true
+    fi
+    if [[ "${COLUMNS:-80}" =~ ^[0-9]+$ ]] && [ "${COLUMNS:-80}" -lt 38 ]; then
+        separator='========================'
+    fi
     debug_log "进入主任务，参数数量=$#，参数=$*"
     
-    check_runtime_dependencies || return 1
+    if [[ "$*" == *"-cron"* ]]; then
+        check_runtime_dependencies cron || return 1
+    else
+        check_runtime_dependencies interactive || return 1
+    fi
     
 if [[ "$*" == *"-cron"* ]]; then
     check_running || return 1
@@ -942,10 +971,10 @@ if [[ "$*" == *"-cron"* ]]; then
         
         # 显示菜单
         while true; do
-            clear
-            echo "======================================"
-            echo "      Telegram 通知脚本管理菜单"
-            echo "======================================"
+            if [ -t 1 ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-dumb}" != dumb ]; then clear; fi
+            echo "$separator"
+            echo "Telegram 通知脚本管理菜单"
+            echo "$separator"
             echo "当前配置摘要："
             echo "机器名称: $MACHINE_NAME"
             echo "每日报告时间: $DAILY_REPORT_TIME"
@@ -957,7 +986,7 @@ if [[ "$*" == *"-cron"* ]]; then
             else
                 echo "自动通知: 已开启"
             fi
-            echo "======================================"
+            echo "$separator"
             echo "1. 检查流量并推送"
             echo "2. 手动发送每日报告"
             echo "3. 发送测试消息"
@@ -967,7 +996,7 @@ if [[ "$*" == *"-cron"* ]]; then
             echo "7. 查看通知运行日志"
             echo "8. 开启/关闭自动通知"
             echo "0. 退出"
-            echo "======================================"
+            echo "$separator"
             echo -n "请选择操作 [0-8]: "
             
             if ! read -r choice; then

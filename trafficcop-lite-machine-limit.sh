@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# TrafficCop 机器限速管理脚本 v2.10
+# TrafficCop 机器限速管理脚本 v2.11
 # 提供完整的启用/禁用/恢复机器限速功能
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -285,6 +285,38 @@ YELLOW='\033[0;33m'
 BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
+if [ ! -t 1 ] || [ -n "${NO_COLOR+x}" ] || [ "${TERM:-dumb}" = dumb ]; then RED='' GREEN='' YELLOW='' BLUE='' CYAN='' NC=''; fi
+
+machine_require_dependencies() {
+    local command_name entry="$WORK_DIR/trafficcop-lite.sh" perms
+    local missing=()
+    for command_name in vnstat jq bc ip crontab flock curl tac pgrep pkill; do
+        command -v "$command_name" >/dev/null 2>&1 || missing+=("$command_name")
+    done
+    [ -n "$(find_tc_bin)" ] || missing+=(tc)
+    if ! { [ -s /etc/ssl/certs/ca-certificates.crt ] && [ -r /etc/ssl/certs/ca-certificates.crt ]; } &&
+       ! { [ -s /etc/ssl/cert.pem ] && [ -r /etc/ssl/cert.pem ]; }; then
+        missing+=('@ca-certificates')
+    fi
+    [ "${#missing[@]}" -gt 0 ] || return 0
+    echo "缺少运行依赖：${missing[*]}"
+    if [ -t 0 ] && [ -f "$entry" ] && [ ! -L "$entry" ] &&
+       [ "$(stat -c %u:%h -- "$entry" 2>/dev/null)" = 0:1 ] &&
+       perms=$(stat -c %a -- "$entry") && (( (8#$perms & 0022) == 0 )) &&
+       grep -Fqx '# BEGIN MANAGED DEPENDENCIES' "$entry"; then
+        bash "$entry" --dependencies install || return 1
+        for command_name in "${missing[@]}"; do
+            if [ "$command_name" = tc ]; then [ -n "$(find_tc_bin)" ] || return 1
+            elif [ "$command_name" = '@ca-certificates' ]; then
+                { [ -s /etc/ssl/certs/ca-certificates.crt ] && [ -r /etc/ssl/certs/ca-certificates.crt ]; } ||
+                    { [ -s /etc/ssl/cert.pem ] && [ -r /etc/ssl/cert.pem ]; } || return 1
+            else command -v "$command_name" >/dev/null 2>&1 || return 1; fi
+        done
+        return 0
+    fi
+    echo "请通过 NTC 主菜单 10 或主脚本 --dependencies install 安装依赖。"
+    return 1
+}
 
 # 检查网络接口
 get_main_interface() {
@@ -1127,10 +1159,14 @@ show_detailed_status() {
 
 # 主菜单
 show_menu() {
-    clear
-    echo -e "${BLUE}╔════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║        TrafficCop 机器限速管理         ║${NC}"
-    echo -e "${BLUE}╚════════════════════════════════════════╝${NC}"
+    if [ -t 1 ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-dumb}" != dumb ]; then clear; fi
+    if [[ "${COLUMNS:-80}" =~ ^[0-9]+$ ]] && [ "${COLUMNS:-80}" -lt 42 ]; then
+        echo -e "${BLUE}TrafficCop 机器限速管理${NC}"
+    else
+        echo -e "${BLUE}╔════════════════════════════════════════╗${NC}"
+        echo -e "${BLUE}║        TrafficCop 机器限速管理         ║${NC}"
+        echo -e "${BLUE}╚════════════════════════════════════════╝${NC}"
+    fi
     echo ""
     show_status
     echo ""
@@ -1147,6 +1183,10 @@ show_menu() {
 
 # 主程序
 main() {
+    local _
+    if [ -z "${COLUMNS:-}" ] && [ -t 0 ] && command -v stty >/dev/null 2>&1; then
+        read -r _ COLUMNS < <(stty size 2>/dev/null) || true
+    fi
     if [ "$(id -u)" -ne 0 ]; then
         echo -e "${RED}请使用 root 权限运行此脚本。${NC}"
         exit 1
@@ -1164,6 +1204,7 @@ main() {
         disable_machine_limit
         exit $?
     elif [ "$1" = "--enable" ]; then
+        machine_require_dependencies || return 1
         enable_machine_limit
         exit $?
     fi
@@ -1187,12 +1228,12 @@ main() {
                 ;;
             2)
                 echo ""
-                enable_machine_limit
+                machine_require_dependencies && enable_machine_limit
                 read -r -p "按回车键继续..."
                 ;;
             3)
                 echo ""
-                restore_machine_limit
+                machine_require_dependencies && restore_machine_limit
                 read -r -p "按回车键继续..."
                 ;;
             4)

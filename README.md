@@ -117,7 +117,7 @@ sudo ntc --recover-tc --manual
 sudo ntc --uninstall
 ```
 
-- `--install`: 安装/更新组件，并创建 `ntc` 快捷命令；使用单独下载的主脚本安装时会同步刷新整套组件。
+- `--install`: 安装前检查全部组件所需命令，仅在确认后安装缺失项，再安装/更新组件和快捷命令；使用 `--install --yes` 可明确允许非交互安装依赖。单文件入口会同步刷新整套组件。
 - `--update`: 从仓库更新脚本文件，不覆盖配置和日志。
 - `--logs`: 查看日志。操作审计会在真实操作完成后记录中文结果；查看日志、自检和状态查询不会为了“有记录”而修改安装目录。
 - 操作审计文件为 `/etc/trafficcop-lite/operations.log`，默认 `0700` 目录、`0600` 文件，单文件达到 1 MiB 后轮转并保留 3 份。记录包含自然语言动作、成功/失败/保持不变结果以及 `EVENT`/`RESULT` 字段，不记录配置内容、Token、通知 URL 或用户输入。
@@ -126,6 +126,25 @@ sudo ntc --uninstall
 - `--self-check [INTERFACE]` / `--tc-self-check [INTERFACE]`: 只读检查统一 HTB、状态归属和已协作的 Dog IFB；不创建目录、不修正权限、不写监控日志。
 - `--recover-tc --manual`: 显式调用共享恢复入口；它可能删除当前 root qdisc，通常应优先在主菜单 `9` 阅读提示并确认。
 - `--uninstall`: 卸载 TrafficCop Lite。
+
+### 依赖管理
+
+主菜单 `10` 显示依赖当前状态，并提供检测、按需安装、查看账本与卸载。也可以直接运行主脚本的独立入口：
+
+```bash
+sudo bash trafficcop-lite.sh --dependencies check
+sudo bash trafficcop-lite.sh --dependencies install
+sudo bash trafficcop-lite.sh --dependencies install --yes
+sudo bash trafficcop-lite.sh --dependencies owned
+sudo bash trafficcop-lite.sh --dependencies remove
+sudo bash trafficcop-lite.sh --dependencies remove --all
+```
+
+`check` 和 `owned` 只读；检测到包已安装但命令或 HTTPS 证书文件不可用时会报异常而不是假装安装成功。安装会显示缺失项及 APT 模拟计划，并仅将安装前没有、计划中存在且安装后实际安装的包（含传递依赖）记录到 `/var/lib/trafficcop-lite/dependencies/installed-packages`。部分安装失败也会记录实际新增包。这个目录独立于配置目录，卸载 NTC 不会删除它；`DEPENDENCY_STATE_DIR` 可显式指定另一绝对路径。
+
+先完整卸载 NTC，并确认没有 NTC 脚本、进程或 crontab 任务，才能单独卸载依赖。默认仅卸载账本里的新增包；`--all` 明确扩大到本项目相关的原有包，须谨慎确认。系统基础/Essential/Protected 包、Dog 仍需要的包及这些包的已安装依赖闭包会保留；模拟计划中范围外的级联删除会被拒绝，不执行 `autoremove` 或 `purge`。`--yes` 可跳过依赖安装或卸载确认，但不会跳过安全检查。脚本的 `--uninstall` 本身保留所有系统包；交互卸载完成后可另行进入依赖菜单。卸载后可继续使用下载的 `trafficcop-lite.sh` 执行依赖命令。
+
+完整归属账本和自动依赖卸载仅支持 Debian/Ubuntu 的 APT。dnf、yum、apk、pacman 保留按缺失命令安装及安装后复检，但不建立 APT 账本，也不支持自动依赖卸载。若安装中断后出现 `pending-before` 或 `pending-plan`，后续安装和卸载会停止；请先检查事务快照与系统包状态并人工处理，不要盲目认领或删除记录。
 
 主菜单入口:
 
@@ -139,6 +158,7 @@ sudo ntc --uninstall
 7) 更新脚本
 8) 卸载 TrafficCop-Lite
 9) TC 冲突处理/自动恢复
+10) 依赖检测、安装与卸载
 ```
 
 Telegram 管理菜单提供 `8. 开启/关闭自动通知`。关闭后会移除本项目的 Telegram 定时任务并保存关闭状态，但不会删除 Bot 配置，也不影响测试消息和手动发送；再次开启时会恢复唯一的每分钟检查任务。
@@ -328,8 +348,10 @@ sudo /usr/sbin/tc qdisc show
 for script in trafficcop-lite*.sh tests/*.sh; do bash -n "$script" || exit; done
 shellcheck trafficcop-lite.sh trafficcop-lite-monitor.sh trafficcop-lite-telegram.sh trafficcop-lite-machine-limit.sh tests/regression.sh
 bash tests/regression.sh
+bash tests/dependencies-regression.sh
 ```
 
 `tests/regression.sh` 保留原有回归，并加载 `tests/ifb-regression.sh` 的独立 mock 用例，覆盖 IFB 部分更新失败、两侧回滚、状态提交/删除失败、现存子类速率错误拒绝清理、已删子类仅允许清理、NTC 先安装、未物化组和空字段解析、未知 IFB 零写入和主 CLI 只读权限检查。测试将临时文件放在私有 `mktemp` 目录，支持通过 `TMPDIR` 指定位置；mock 回归不执行真实 TC 修改。`tests/integration-netns.sh` 是单独的真实内核集成入口，不由 mock 回归自动执行。
+`tests/dependencies-regression.sh` 在工作区私有临时目录中使用假 APT/dpkg 验证依赖 CLI 和独立监控安装，不修改主机软件包；账本权限测试需要 root，非 root 会显示 SKIP。此测试为单独入口，不改变现有 CI workflow。
 
 单端口分类校验按 IPv4/IPv6 协议分别查询，再验证 TCP/UDP 源/目标端口规则，兼容旧 iproute2 在混合 `fw`/u32/flower 时产生非法全量 JSON 的情况。`tests/filter-json-regression.sh` 保留旧版实际错误格式，并检查缺失规则或查询失败仍被拒绝。

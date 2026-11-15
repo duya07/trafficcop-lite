@@ -359,7 +359,7 @@ sudo /usr/sbin/tc qdisc show
 ```bash
 for script in trafficcop-lite*.sh tests/*.sh; do bash -n "$script" || exit; done
 shellcheck trafficcop-lite.sh trafficcop-lite-monitor.sh trafficcop-lite-telegram.sh trafficcop-lite-machine-limit.sh tests/regression.sh
-bash tests/regression.sh
+sudo bash tests/regression.sh          # 非 root 时调用主脚本 CLI 的 2 条用例记为 skip
 bash tests/dependencies-regression.sh
 ```
 

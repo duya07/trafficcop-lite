@@ -9,6 +9,7 @@ TEST_ROOT=$(mktemp -d)
 WORK_DIR="$TEST_ROOT/default-audit"
 PASSED=0
 FAILED=0
+SKIPPED=0
 
 cleanup() {
     case "$TEST_ROOT" in
@@ -3882,6 +3883,16 @@ run_test() {
     fi
 }
 
+# 调用主脚本 CLI 的用例：主脚本按设计要求 root，非 root（如 GitHub Actions runner）下记为 SKIP。
+run_root_test() {
+    if [ "$EUID" -ne 0 ]; then
+        printf 'skip - %s（需要 root）\n' "$1"
+        SKIPPED=$((SKIPPED + 1))
+        return 0
+    fi
+    run_test "$@"
+}
+
 run_test 'period reset cancels owned shutdown' test_period_reset_cancels_owned_shutdown
 run_test 'period reset aborts safely on cancellation failure' test_period_reset_stops_when_shutdown_cancel_fails
 run_test 'shutdown cleanup respects boot ownership' test_shutdown_cleanup_respects_boot_ownership
@@ -4013,7 +4024,7 @@ run_test 'IFB clear also handles an absent physical root transactionally' test_i
 run_test 'IFB unverified ownership and query failures cause zero mutation' test_ifb_unverified_is_zero_mutation
 run_test 'IFB self-check detects parent class port filter and redirect drift' test_ifb_self_check_detects_drift
 run_test 'standalone NTC leaves unknown IFB untouched' test_ifb_standalone_preserves_unknown_device
-run_test 'main CLI self-check preserves insecure permissions and absent install' test_ifb_cli_self_check_is_readonly
+run_root_test 'main CLI self-check preserves insecure permissions and absent install' test_ifb_cli_self_check_is_readonly
 run_test 'invalid NTC state cannot authorize physical or IFB mutation' test_ifb_invalid_ntc_state_is_zero_mutation
 run_test 'IFB class references accept Dog flower groups and ranges' test_ifb_group_and_range_class_references
 run_test 'IFB recovery retains scope and rolls back without port consumers' test_ifb_recovery_without_port_consumers
@@ -4026,10 +4037,10 @@ run_test 'operation audit permissions rotation and untrusted input' test_operati
 run_test 'operation audit failure preserves business result' test_operation_log_failure_preserves_business_result
 run_test 'installation and update rollback audit both outcomes' test_install_and_rollback_audit_results
 run_test 'sourcing every component creates no files or logs' test_operation_logging_source_is_readonly
-run_test 'logs and status preserve absent install and insecure permissions' test_operation_log_view_and_status_are_readonly
+run_root_test 'logs and status preserve absent install and insecure permissions' test_operation_log_view_and_status_are_readonly
 run_test 'IFB operations audit changes but not unchanged apply' test_ifb_operation_audit_and_unchanged_apply
 run_test 'enforcement controls audit success and failure safely' test_enforcement_audit_success_failure_and_no_input_echo
 run_test 'single-port JSON queries isolate unrelated legacy fw output' test_single_port_filter_json_excludes_unrelated_fw_printer
 
-printf '\n%d passed, %d failed\n' "$PASSED" "$FAILED"
+printf '\n%d passed, %d failed, %d skipped\n' "$PASSED" "$FAILED" "$SKIPPED"
 [ "$FAILED" -eq 0 ]

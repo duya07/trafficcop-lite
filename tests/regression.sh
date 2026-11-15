@@ -44,6 +44,17 @@ load_function() {
                 load_function "$1" "$helper" || return 1
             done
             ;;
+        dog_configured_class_records|dog_config_reserves_default_class)
+            for helper in dog_bandwidth_to_tc tc_file_is_secure dog_tc_manifest_file dog_config_schema \
+                dog_legacy_class_records dog_manifest_class_records; do
+                load_function "$1" "$helper" || return 1
+            done
+            ;;
+        update_scripts|download_component)
+            for helper in fetch_release_sums verify_release_file; do
+                load_function "$1" "$helper" || return 1
+            done
+            ;;
         check_and_limit_traffic)
             for helper in shutdown_state_value shutdown_task_token_from_state pending_shutdown_matches_owned_state; do
                 load_function "$1" "$helper" || return 1
@@ -1102,6 +1113,7 @@ test_update_replaces_full_release_and_preserves_state() {
     printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.7"' > "$remote_dir/$MONITOR_SCRIPT"
     printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.1.3"' > "$remote_dir/$TELEGRAM_SCRIPT"
     printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.7' > "$remote_dir/$MACHINE_LIMIT_SCRIPT"
+    (cd "$remote_dir" && sha256sum trafficcop-lite*.sh > SHA256SUMS) || return 1
 
     load_function "$ROOT_DIR/trafficcop-lite.sh" script_version_from_file || return 1
     load_function "$ROOT_DIR/trafficcop-lite.sh" version_is_newer || return 1
@@ -2181,6 +2193,129 @@ test_telegram_token_is_not_in_curl_arguments() {
 }
 
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_update_rejects_checksum_mismatch_and_missing_sums() {
+    local work remote_dir script_name
+    work=$(mktemp -d "$TEST_ROOT/update-sums.XXXXXX") || return 1
+    WORK_DIR="$work/installed"; remote_dir="$work/remote"
+    MONITOR_SCRIPT='trafficcop-lite-monitor.sh'; TELEGRAM_SCRIPT='trafficcop-lite-telegram.sh'
+    MACHINE_LIMIT_SCRIPT='trafficcop-lite-machine-limit.sh'; RAW_BASE='https://example.invalid/direct'
+    RED=''; GREEN=''; YELLOW=''; CYAN=''; NC=''
+    mkdir -p "$WORK_DIR" "$remote_dir"
+    for script_name in trafficcop-lite.sh "$MONITOR_SCRIPT" "$TELEGRAM_SCRIPT"; do
+        printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.0.0"' > "$WORK_DIR/$script_name"
+        printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.2.0"' > "$remote_dir/$script_name"
+    done
+    printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.0' > "$WORK_DIR/$MACHINE_LIMIT_SCRIPT"
+    printf '%s\n' '#!/bin/bash' '# TrafficCop Lite Machine Limit v2.12' > "$remote_dir/$MACHINE_LIMIT_SCRIPT"
+    (cd "$remote_dir" && sha256sum trafficcop-lite*.sh > SHA256SUMS) || return 1
+    printf '%s\n' '# tampered' >> "$remote_dir/$MONITOR_SCRIPT"
+
+    load_function "$ROOT_DIR/trafficcop-lite.sh" script_version_from_file || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" version_is_newer || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" validate_update_candidate || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" verify_installed_scripts || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" rollback_script_update || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" update_scripts || return 1
+    ensure_work_dir() { mkdir -p "$WORK_DIR"; }
+    download_url_to_file() { [ -f "$remote_dir/$(basename "$1")" ] && cp "$remote_dir/$(basename "$1")" "$2"; }
+    install_shortcut_link() { :; }
+    install_tc_recovery_service_files() { :; }
+
+    # 篡改：任何文件都不得替换。
+    if update_scripts 'https://example.invalid/proxy' >/dev/null 2>&1; then return 1; fi
+    for script_name in trafficcop-lite.sh "$MONITOR_SCRIPT" "$TELEGRAM_SCRIPT"; do
+        grep -Fqx 'SCRIPT_VERSION="1.0.0"' "$WORK_DIR/$script_name" || return 1
+    done
+    # 缺少 SHA256SUMS：同样拒绝。
+    rm -f "$remote_dir/SHA256SUMS"
+    if update_scripts 'https://example.invalid/proxy' >/dev/null 2>&1; then return 1; fi
+    grep -Fqx 'SCRIPT_VERSION="1.0.0"' "$WORK_DIR/$MONITOR_SCRIPT" || return 1
+    # 不留临时文件。
+    [ -z "$(find "$WORK_DIR" -maxdepth 1 -name '.*' -type f -print -quit)" ]
+}
+
+# 监控健康：异常提醒限频、恢复通知、禁用与“未知”不提醒、日报不再每分钟重试。
+# shellcheck disable=SC2034,SC2317,SC2329
+test_telegram_monitor_health_alerts() {
+    local work now
+    work=$(mktemp -d "$TEST_ROOT/tg-health.XXXXXX") || return 1
+    WORK_DIR="$work"; MACHINE_NAME='test-host'
+    MONITOR_HEALTH_FILE="$work/monitor_health"; MONITOR_ALERT_STATE_FILE="$work/last_monitor_alert"
+    MONITOR_ALERT_INTERVAL=21600; MONITOR_STALE_SECONDS=600
+    USAGE_STATE_FILE="$work/usage"; PERIOD_STATE_FILE="$work/period"; CRON_LOG="$work/cron.log"
+    load_function "$TELEGRAM_SCRIPT" read_monitor_health || return 1
+    load_function "$TELEGRAM_SCRIPT" check_monitor_health || return 1
+    load_function "$TELEGRAM_SCRIPT" read_current_traffic_state || return 1
+    load_function "$TELEGRAM_SCRIPT" daily_report || return 1
+    log_cron() { :; }
+    debug_log() { :; }
+    telegram_send_message() { printf '%s\n' "$1" >> "$work/sent"; }
+    now=$(date +%s)
+
+    # 未知（无健康文件）：不提醒。
+    check_monitor_health || return 1
+    assert_absent "$work/sent" || return 1
+    # 监控报告错误：提醒一次，限频期内不重复。
+    printf 'HEALTH=error\nREASON=vnStat 数据过旧\nUPDATED_EPOCH=%s\n' "$now" > "$MONITOR_HEALTH_FILE"
+    check_monitor_health || return 1
+    check_monitor_health || return 1
+    [ "$(grep -c '流量监控异常' "$work/sent")" = 1 ] || return 1
+    grep -q 'vnStat 数据过旧' "$work/sent" || return 1
+    # 限频期过后再次提醒。
+    printf '%s\n' $((now - 21601)) > "$MONITOR_ALERT_STATE_FILE"
+    check_monitor_health || return 1
+    [ "$(grep -c '流量监控异常' "$work/sent")" = 2 ] || return 1
+    # 恢复：发送一次“已恢复”，并清除提醒状态。
+    printf 'HEALTH=ok\nREASON=\nUPDATED_EPOCH=%s\n' "$now" > "$MONITOR_HEALTH_FILE"
+    check_monitor_health || return 1
+    check_monitor_health || return 1
+    [ "$(grep -c '监控已恢复' "$work/sent")" = 1 ] || return 1
+    assert_absent "$MONITOR_ALERT_STATE_FILE" || return 1
+    # 健康状态长时间未更新（cron 停止）：提醒。
+    printf 'HEALTH=ok\nREASON=\nUPDATED_EPOCH=%s\n' $((now - 3600)) > "$MONITOR_HEALTH_FILE"
+    check_monitor_health || return 1
+    grep -q '60 分钟没有运行' "$work/sent" || return 1
+    # 主动禁用：不提醒，且清除提醒状态。
+    : > "$work/sent"
+    printf 'HEALTH=disabled\nREASON=监控已禁用\nUPDATED_EPOCH=%s\n' "$now" > "$MONITOR_HEALTH_FILE"
+    check_monitor_health || return 1
+    [ ! -s "$work/sent" ] || return 1
+    assert_absent "$MONITOR_ALERT_STATE_FILE" || return 1
+    # 日报：实时状态不可用且监控异常时，发送“状态不可用”日报并视为已发送。
+    printf 'HEALTH=error\nREASON=配置文件读取失败\nUPDATED_EPOCH=%s\n' "$now" > "$MONITOR_HEALTH_FILE"
+    daily_report >/dev/null || return 1
+    grep -q '实时流量状态不可用：配置文件读取失败' "$work/sent" || return 1
+    # 健康未知时保持原行为（稍后重试）。
+    rm -f "$MONITOR_HEALTH_FILE"
+    if daily_report >/dev/null; then return 1; fi
+}
+
+# shellcheck disable=SC2034,SC2317,SC2329
+test_monitor_writes_health_state() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/monitor-health.XXXXXX") || return 1
+    HEALTH_STATE_FILE="$work/health"; LOG_FILE="$work/log"
+    load_function "$MONITOR_SCRIPT" write_health_state || return 1
+    load_function "$MONITOR_SCRIPT" last_log_reason || return 1
+    printf '%s\n' '2026-11-15 10:00:00 无法可靠读取当前流量，本轮跳过限速判断并保留现有限速状态。' > "$LOG_FILE"
+    write_health_state error "$(last_log_reason)" || return 1
+    grep -Fxq 'HEALTH=error' "$HEALTH_STATE_FILE" || return 1
+    grep -Fxq 'REASON=无法可靠读取当前流量，本轮跳过限速判断并保留现有限速状态。' "$HEALTH_STATE_FILE" || return 1
+    grep -Eq '^UPDATED_EPOCH=[0-9]+$' "$HEALTH_STATE_FILE" || return 1
+    [ "$(stat -c %a "$HEALTH_STATE_FILE")" = 600 ] || return 1
+    # 多行、超长原因被压成单行并截断。
+    write_health_state error "$(printf 'a\nb%0300d' 0)" || return 1
+    [ "$(wc -l < "$HEALTH_STATE_FILE")" = 3 ] || return 1
+    [ "$(grep '^REASON=' "$HEALTH_STATE_FILE" | wc -c)" -le 208 ]
+}
+
+test_repository_sha256sums_match_scripts() {
+    (cd "$ROOT_DIR" && sha256sum -c --quiet SHA256SUMS) || return 1
+    [ "$(awk '{print $2}' "$ROOT_DIR/SHA256SUMS" | LC_ALL=C sort | paste -sd ' ')" = \
+      'trafficcop-lite-machine-limit.sh trafficcop-lite-monitor.sh trafficcop-lite-telegram.sh trafficcop-lite.sh' ]
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
 test_component_download_rejects_versionless_body() {
     local work
     work=$(mktemp -d "$TEST_ROOT/component-version.XXXXXX") || return 1
@@ -2196,7 +2331,13 @@ test_component_download_rejects_versionless_body() {
     load_function "$ROOT_DIR/trafficcop-lite.sh" version_is_newer || return 1
     load_function "$ROOT_DIR/trafficcop-lite.sh" validate_update_candidate || return 1
     load_function "$ROOT_DIR/trafficcop-lite.sh" download_component || return 1
-    download_url_to_file() { printf '%s\n' 'upstream temporarily unavailable' > "$2"; }
+    # SHA256SUMS 与正文一致，失败只能来自“正文没有版本号”。
+    download_url_to_file() {
+        case "$1" in
+            */SHA256SUMS) printf '%s  trafficcop-lite-monitor.sh\n' "$(printf '%s\n' 'upstream temporarily unavailable' | sha256sum | awk '{print $1}')" > "$2" ;;
+            *) printf '%s\n' 'upstream temporarily unavailable' > "$2" ;;
+        esac
+    }
 
     if download_component trafficcop-lite-monitor.sh >/dev/null; then
         return 1
@@ -2221,7 +2362,10 @@ test_component_download_requires_a_verified_installed_target() {
     load_function "$ROOT_DIR/trafficcop-lite.sh" validate_update_candidate || return 1
     load_function "$ROOT_DIR/trafficcop-lite.sh" download_component || return 1
     download_url_to_file() {
-        printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.0.0"' > "$2"
+        case "$1" in
+            */SHA256SUMS) printf '%s  trafficcop-lite-monitor.sh\n' "$(printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.0.0"' | sha256sum | awk '{print $1}')" > "$2" ;;
+            *) printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="1.0.0"' > "$2" ;;
+        esac
     }
     # 模拟复制工具错误地报告成功但没有生成目标，安装函数仍须自行校验并失败。
     mv() { return 0; }
@@ -3817,6 +3961,10 @@ run_test 'Telegram legacy config is parsed without execution' test_telegram_lega
 run_test 'Telegram plain config round-trips special values' test_telegram_plain_config_round_trip
 run_test 'Telegram token is absent from curl arguments' test_telegram_token_is_not_in_curl_arguments
 run_test 'component download rejects versionless responses' test_component_download_rejects_versionless_body
+run_test 'update rejects checksum mismatch and missing SHA256SUMS' test_update_rejects_checksum_mismatch_and_missing_sums
+run_test 'repository SHA256SUMS matches the four scripts' test_repository_sha256sums_match_scripts
+run_test 'Telegram monitor-health alerts are rate limited and announce recovery' test_telegram_monitor_health_alerts
+run_test 'monitor writes a single-line health state' test_monitor_writes_health_state
 run_test 'component download verifies the installed target' test_component_download_requires_a_verified_installed_target
 run_test 'local component copy failures are reported' test_local_component_copy_failure_is_reported
 run_test 'period date boundaries remain correct' test_period_date_boundaries
@@ -3852,6 +4000,10 @@ run_test 'shortcut conflict does not fail the install' test_shortcut_conflict_do
 run_test 'status line reports an unreadable crontab' test_status_line_reports_unreadable_crontab
 
 run_test 'IFB apply and clear preserve Dog objects in one TC transaction' test_ifb_apply_and_clear
+run_test 'IFB with Dog 2.x manifest: apply and clear preserve Dog objects' test_ifb_v2_apply_and_clear
+run_test 'Dog 2.x manifest missing/orphan/insecure/bad formula fails closed with zero mutation' test_ifb_v2_manifest_problems_fail_closed
+run_test 'manual recovery refuses to delete a root that still has foreign classes (H2)' test_recovery_refuses_root_delete_with_foreign_classes
+run_test 'Dog config schema detection fails closed on unknown formats' test_dog_config_schema_detection
 run_test 'IFB installed after NTC repairs the same-rate fast path' test_ifb_late_install_and_recovery
 run_test 'IFB partial update failure restores exact physical and IFB rates' test_ifb_apply_failure_rolls_back
 run_test 'IFB state commit failure rolls back both directions' test_ifb_state_commit_failure_rolls_back

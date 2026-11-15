@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# TrafficCop 机器限速管理脚本 v2.11
+# TrafficCop 机器限速管理脚本 v2.12
 # 提供完整的启用/禁用/恢复机器限速功能
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -345,16 +345,6 @@ clear_tc_rules() {
     bash "$SCRIPT_PATH" --tc-clear-owned "机器限速管理"
 }
 
-# 停止监控进程
-stop_monitor_process() {
-    echo "停止TrafficCop监控进程..."
-    
-    # 杀死相关进程
-    pkill -f "$SCRIPT_PATH" 2>/dev/null || true
-    
-    echo "✓ 监控进程已停止"
-}
-
 acquire_monitor_cleanup_lock() {
     touch "$MONITOR_LOCK_FILE" || return 1
     chmod 600 "$MONITOR_LOCK_FILE" 2>/dev/null || true
@@ -474,11 +464,11 @@ disable_machine_limit() {
     echo ""
     
     # 1. 先阻止新任务，再等待正在运行的监控退出。
+    # 不再 pkill 监控进程：拿到监控锁即可保证没有实例处于 TC 事务中途（cron 的 --run 用
+    # flock -n，拿不到锁立即退出）；pkill 会在 qdisc 替换与状态写入之间杀掉进程。
     remove_cron_job || has_error=true
-    stop_monitor_process
     if ! $has_error; then
         if acquire_monitor_cleanup_lock; then
-            stop_monitor_process
             clear_tc_rules || has_error=true
             release_monitor_cleanup_lock
         else

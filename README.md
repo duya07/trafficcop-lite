@@ -51,6 +51,15 @@
 35. 清除、宽限、暂停、停止和卸载允许 Dog 已经删除的端口 class 缺失；IFB 上现存端口 class 仍须匹配配置速率和父类，并校验 filter 引用、双栈 redirect 及默认类。现存 class 的速率错误不会按缺失跳过，apply 和自检仍要求配置中的已物化 class 完整。如果 IFB 已删除且物理 root 已回到默认状态，只清理 NTC 自己的残留状态。
 36. 两个项目可先后独立安装；NTC 单独运行或仅有尚未下发的 Dog 配置时只管理出向 HTB，不探测或创建未知 `ifb0`。首次登记 `IFB_INTERFACE=ifb0` 必须由可验证的 Dog owner/config、设备类型、class/filter 和 IPv4/IPv6 redirect 共同证明；登记后可在有效 NTC 状态和 Dog 配置范围内处理 Dog 已删除最后一个端口及 owner 标记的清理。
 
+### 1.2.0（适配 Port Traffic Dog 2.0）
+
+37. 识别 Dog 2.0 的配置格式（schema 2）：端口限速类改从 Dog 写入的类清单 `/etc/port-traffic-dog/tc-interop.json`（`traffic-tools-dog-classes-v1`）读取，逐项核对文件权限、class 编号（`1:4001` 起）、fw mark 公式与掩码，任何一项不符都失败关闭；Dog 1.5.x 配置仍按原 `.ports` 推导。无法识别的配置（包括有 `.monitors` 却没有 `schema`）一律不碰 TC。Dog 2.0 设置限速前会检查已安装的 NTC 是否认识该清单，旧版 NTC 需先升级到 1.2.0。
+38. 手动恢复（`--tc-recover-owned --manual` / 菜单 `9`）删除 `htb 1:` root 前，若其中还有 `1:1`/`1:30` 以外的类或任何过滤器（即仍有 Dog 等其他使用者），拒绝删除，不再因 Dog 配置/清单缺失而误删端口限速。
+39. 停止、卸载和禁用机器限速时不再在加锁前 `pkill -f`；持有监控锁即可排除正在运行的 `--run`，Telegram 只按精确命令行结束本项目的 `-cron` 进程。
+40. 更新与补装组件改为按仓库根目录 `SHA256SUMS` 逐个校验，缺失或不符即取消且不留临时文件（见“更新脚本”）。
+41. 监控每轮写入 `monitor_health`（ok/error/disabled 与最后一条失败原因）。Telegram 在监控报错或超过 10 分钟未运行时提醒（6 小时限频，恢复后发一次“已恢复”）；监控异常导致状态不可用时，日报改发一次“状态不可用”说明，不再静默。
+42. 手动 TC 恢复读取配置后先对齐 vnStat 时区，周期判断与监控一致。
+
 ## 下载方式说明
 
 - 直连（海外网络优先）  
@@ -191,6 +200,7 @@ sudo env RAW_BASE="https://v6.gh-proxy.org/https://raw.githubusercontent.com/duy
 - 旧配置没有 `TC_BOOT_GRACE_MINUTES` 时默认使用 10 分钟开机限速宽限。
 - 旧配置没有 `VNSTAT_MAX_BANDWIDTH` 时默认使用 `0`，即关闭 vnStat 异常速率检查。
 - 旧 Telegram 配置没有 `TG_DISABLED` 时保持原行为，自动通知默认开启。
+- 先下载仓库根目录的 `SHA256SUMS`（优先 `RAW_BASE` 直连；直连失败才用所选镜像线路，并提示镜像只能防传输损坏、不能防镜像本身被篡改），四个脚本逐个比对哈希，缺失或不符即取消。
 - 下载到临时文件并通过 `bash -n` 语法检查后才替换。
 - 校验每个候选脚本的版本，拒绝代理缓存或错误更新源造成的组件降级。
 - 四个脚本全部下载并校验成功后才开始替换；替换后会再次校验整套脚本。
@@ -339,6 +349,8 @@ sudo /usr/sbin/tc qdisc show
 - 需要 vnStat 2.x 或更高版本。脚本兼容 `vnstat --showconfig` 中带分号或井号的默认配置项，会管理 `SaveInterval`、必要时的 `UpdateInterval`、当前接口 `MaxBW`，并按周期需求管理 `DailyDays`；`VNSTAT_MAX_BANDWIDTH=0` 为默认值并表示关闭异常速率检查，非零值必须在 `1-50000` 范围内；vnStat 2.0–2.8 还使用上述兼容设置。守护进程未显式指定 `--config` 时，只有运行中的 `vnstatd`、系统 `vnstatd` 命令和 `vnstat` 客户端能证明来自同一安装前缀，脚本才采用客户端报告的默认配置。每个实际配置路径首次变更前都会单独保留原配置备份，卸载时不会自动恢复全局 vnStat 配置。
 - Debian/Ubuntu、RHEL 系、Alpine 和 Arch 系会按已识别的包管理器尝试安装依赖；无法自动启动 cron 或 vnStat 服务时会给出明确提示，请按系统服务管理方式确认其已运行。
 - 网络受限时，优先使用带 `v6.gh-proxy.org` 的命令。
+- 不要与上游原版 TrafficCop 的 TC 模式同时运行：原版在流量正常时每分钟执行 `tc qdisc del dev <网卡> root`，会清掉 NTC 与 Dog 的整套 HTB（实测 Debian 13 主机上任何 HTB 都保持不到 60 秒）。迁移到 NTC 后请移除原版的 `traffic_monitor.sh --run` 定时任务。
+- 与 Dog 2.0 共存需要 NTC 1.2.0+；Dog 1.5.x 与 NTC 1.2.0 仍可共存。
 
 ## 开发验证
 
@@ -349,6 +361,14 @@ for script in trafficcop-lite*.sh tests/*.sh; do bash -n "$script" || exit; done
 shellcheck trafficcop-lite.sh trafficcop-lite-monitor.sh trafficcop-lite-telegram.sh trafficcop-lite-machine-limit.sh tests/regression.sh
 bash tests/regression.sh
 bash tests/dependencies-regression.sh
+```
+
+修改任何产品脚本后必须运行 `tools/update-sums.sh` 重新生成 `SHA256SUMS` 并与脚本一起提交；`tests/regression.sh` 会核对两者一致，否则已发布的 `ntc --update` 会拒绝新脚本。
+
+真实内核集成测试需要 Dog 2.x 主脚本，只应在可丢弃的测试机上运行（在网络命名空间里创建 ifb/htb/fw 仍会让内核加载全局模块）：
+
+```bash
+sudo DOG_SCRIPT=/path/to/port-traffic-dog.sh bash tests/integration-netns.sh
 ```
 
 `tests/regression.sh` 保留原有回归，并加载 `tests/ifb-regression.sh` 的独立 mock 用例，覆盖 IFB 部分更新失败、两侧回滚、状态提交/删除失败、现存子类速率错误拒绝清理、已删子类仅允许清理、NTC 先安装、未物化组和空字段解析、未知 IFB 零写入和主 CLI 只读权限检查。测试将临时文件放在私有 `mktemp` 目录，支持通过 `TMPDIR` 指定位置；mock 回归不执行真实 TC 修改。`tests/integration-netns.sh` 是单独的真实内核集成入口，不由 mock 回归自动执行。

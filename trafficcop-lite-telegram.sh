@@ -20,7 +20,11 @@ TG_LOCK_FILE="$WORK_DIR/tg_notifier.lock"
 ROOT_CRONTAB_LOCK_FILE="${TRAFFICCOP_ROOT_CRONTAB_LOCK_FILE:-$WORK_DIR/root-crontab.lock}"
 CRON_LOG_MAX_LINES="${CRON_LOG_MAX_LINES:-2000}"
 TG_DEBUG="${TG_DEBUG:-false}"
-SCRIPT_VERSION="1.1.6"
+MONITOR_HEALTH_FILE="$WORK_DIR/monitor_health"
+MONITOR_ALERT_STATE_FILE="$WORK_DIR/last_monitor_alert"
+MONITOR_ALERT_INTERVAL="${MONITOR_ALERT_INTERVAL:-21600}"   # 同一异常最多每 6 小时提醒一次
+MONITOR_STALE_SECONDS="${MONITOR_STALE_SECONDS:-600}"       # 健康状态超过 10 分钟未更新视为监控未运行
+SCRIPT_VERSION="1.2.0"
 
 # Keep this small audit writer identical in the four standalone distribution scripts.
 # Only fixed event/result values are accepted; extra arguments are never recorded.
@@ -868,12 +872,82 @@ update_cron_time() {
     echo "cron任务时间已更新"
 }
 
+# 读取监控健康状态：MONITOR_HEALTH（ok|error|disabled）、MONITOR_HEALTH_REASON、MONITOR_HEALTH_AGE。
+# 文件不存在返回 1（监控尚未以 1.2+ 运行过，无法判断，不提醒）。
+read_monitor_health() {
+    local key value updated="" now
+    MONITOR_HEALTH=""; MONITOR_HEALTH_REASON=""; MONITOR_HEALTH_AGE=""
+    [ -s "$MONITOR_HEALTH_FILE" ] || return 1
+    while IFS='=' read -r key value; do
+        value=${value%$'\r'}
+        case "$key" in
+            HEALTH) MONITOR_HEALTH="$value" ;;
+            REASON) MONITOR_HEALTH_REASON="${value:0:200}" ;;
+            UPDATED_EPOCH) updated="$value" ;;
+        esac
+    done < "$MONITOR_HEALTH_FILE"
+    case "$MONITOR_HEALTH" in ok|error|disabled) ;; *) return 1 ;; esac
+    [[ "$updated" =~ ^[0-9]+$ ]] || return 1
+    now=$(date +%s) || return 1
+    MONITOR_HEALTH_AGE=$((now - updated))
+}
+
+# 监控异常提醒：监控报告错误，或健康状态长时间未更新（cron 未运行、脚本被删等）时提醒，
+# 按 MONITOR_ALERT_INTERVAL 限频；恢复后发送一次“已恢复”。监控被主动禁用时不提醒。
+check_monitor_health() {
+    local reason="" now last_alert=0
+    read_monitor_health || return 0
+    if [ "$MONITOR_HEALTH" = disabled ]; then
+        rm -f "$MONITOR_ALERT_STATE_FILE"
+        return 0
+    fi
+    if [ "$MONITOR_HEALTH_AGE" -gt "$MONITOR_STALE_SECONDS" ]; then
+        reason="监控已 $((MONITOR_HEALTH_AGE / 60)) 分钟没有运行，请检查 cron 与 traffic_monitor.log"
+    elif [ "$MONITOR_HEALTH" = error ]; then
+        reason="${MONITOR_HEALTH_REASON:-监控本轮执行失败，详见 traffic_monitor.log}"
+    fi
+    if [ -z "$reason" ]; then
+        if [ -s "$MONITOR_ALERT_STATE_FILE" ]; then
+            if telegram_send_message "✅ [${MACHINE_NAME}]监控已恢复正常。"; then
+                rm -f "$MONITOR_ALERT_STATE_FILE"
+                log_cron "监控恢复通知发送成功"
+            else
+                log_cron "监控恢复通知发送失败，将在下次任务重试"
+                return 1
+            fi
+        fi
+        return 0
+    fi
+    now=$(date +%s) || return 1
+    last_alert=$(cat "$MONITOR_ALERT_STATE_FILE" 2>/dev/null || echo 0)
+    [[ "$last_alert" =~ ^[0-9]+$ ]] || last_alert=0
+    [ $((now - last_alert)) -ge "$MONITOR_ALERT_INTERVAL" ] || return 0
+    if telegram_send_message "⚠️ [${MACHINE_NAME}]流量监控异常：${reason}%0A限速/关机判断可能未执行，请尽快检查。"; then
+        local tmp_file="${MONITOR_ALERT_STATE_FILE}.tmp.$$"
+        printf '%s\n' "$now" > "$tmp_file" && chmod 600 "$tmp_file" 2>/dev/null; mv -f "$tmp_file" "$MONITOR_ALERT_STATE_FILE"
+        log_cron "监控异常提醒发送成功"
+    else
+        log_cron "监控异常提醒发送失败，将在下次任务重试"
+        return 1
+    fi
+}
+
 # 每日报告
 daily_report() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') : 开始生成每日报告"| tee -a "$CRON_LOG"
     echo "$(date '+%Y-%m-%d %H:%M:%S') : DAILY_REPORT_TIME=$DAILY_REPORT_TIME"| tee -a "$CRON_LOG"
     echo "$(date '+%Y-%m-%d %H:%M:%S') : Telegram 配置已加载"| tee -a "$CRON_LOG"
     if ! read_current_traffic_state; then
+        # 监控已经报告异常时，发一份“状态不可用”的日报并记为已发送，不再每分钟重试；
+        # 健康状态未知时（监控尚未以 1.2+ 运行）保持原行为，稍后重试。
+        if read_monitor_health && [ "$MONITOR_HEALTH" != ok ]; then
+            local why="${MONITOR_HEALTH_REASON:-监控未运行}"
+            [ "$MONITOR_HEALTH" = disabled ] && why="监控已禁用"
+            [ "$MONITOR_HEALTH_AGE" -gt "$MONITOR_STALE_SECONDS" ] && why="监控已 $((MONITOR_HEALTH_AGE / 60)) 分钟没有运行"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') : 实时流量状态不可用（$why），发送状态不可用日报"| tee -a "$CRON_LOG"
+            telegram_send_message "📊 [${MACHINE_NAME}]每日流量报告%0A%0A实时流量状态不可用：${why}"
+            return
+        fi
         echo "$(date '+%Y-%m-%d %H:%M:%S') : 实时流量状态不存在、无效或已过期，稍后重试每日报告"| tee -a "$CRON_LOG"
         return 1
     fi
@@ -912,13 +986,13 @@ main() {
     fi
     debug_log "进入主任务，参数数量=$#，参数=$*"
     
-    if [[ "$*" == *"-cron"* ]]; then
+    if [ "${1:-}" = "-cron" ]; then
         check_runtime_dependencies cron || return 1
     else
         check_runtime_dependencies interactive || return 1
     fi
     
-if [[ "$*" == *"-cron"* ]]; then
+if [ "${1:-}" = "-cron" ]; then
     check_running || return 1
     log_cron "进入cron模式"
     if read_config; then
@@ -929,6 +1003,7 @@ if [[ "$*" == *"-cron"* ]]; then
         fi
         # 继续执行其他操作
         check_and_notify || log_cron "状态检查未完整成功"
+        check_monitor_health || log_cron "监控健康提醒未完整成功"
         
     # 检查是否需要发送每日报告
         current_time=$(TZ="$REPORT_TIMEZONE" date +%H:%M)

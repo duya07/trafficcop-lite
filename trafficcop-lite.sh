@@ -3,7 +3,7 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.1.14"
+SCRIPT_VERSION="1.2.0"
 LAST_UPDATE="2026-10-30"
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -806,7 +806,7 @@ EOF
 
     tc_recovery_systemd_available || return 0
     mkdir -p "$unit_dir" || return 1
-    cat > "$unit_tmp" <<EOF
+    cat > "$unit_tmp" <<EOF || { rm -f "$unit_tmp"; return 1; }
 # traffic-tools-tc-recovery-v1
 [Unit]
 Description=Recover Dog and TrafficCop Lite unified HTB
@@ -1029,6 +1029,39 @@ copy_self_if_needed() {
     fi
 }
 
+# ── 发布文件完整性 ───────────────────────────────────────────────
+# 仓库根目录的 SHA256SUMS 覆盖四个脚本（tools/update-sums.sh 生成，回归测试核对一致性）。
+# 校验文件优先从 RAW_BASE（默认 GitHub 直连）取得；只有直连失败才改用所选线路，此时只能发现
+# 传输损坏，不能防止镜像篡改，会明确提示。
+fetch_release_sums() {
+    local base="$1" dest="$2"
+    local direct="${RAW_BASE:-https://raw.githubusercontent.com/${REPO:-duya07/trafficcop-lite}/${BRANCH:-main}}"
+    if download_url_to_file "$direct/SHA256SUMS" "$dest" 2>/dev/null && [ -s "$dest" ]; then
+        return 0
+    fi
+    if [ "$base" != "$direct" ] && download_url_to_file "$base/SHA256SUMS" "$dest" 2>/dev/null && [ -s "$dest" ]; then
+        echo -e "${YELLOW}! 无法直连取得校验文件，已改用当前线路；这只能发现传输损坏，不能防止镜像篡改。${NC}" >&2
+        return 0
+    fi
+    rm -f "$dest" 2>/dev/null || true
+    echo -e "${RED}无法取得 SHA256SUMS，已取消（不安装未经校验的脚本）。${NC}" >&2
+    return 1
+}
+
+verify_release_file() {
+    local name="$1" file="$2" sums="$3" want got
+    want=$(awk -v n="$name" '$2 == n || $2 == "*" n { print $1; exit }' "$sums" 2>/dev/null)
+    if ! [[ "$want" =~ ^[0-9a-f]{64}$ ]]; then
+        echo -e "${RED}SHA256SUMS 中没有 $name，已取消。${NC}" >&2
+        return 1
+    fi
+    got=$(sha256sum "$file" 2>/dev/null | awk '{print $1}')
+    if [ "$want" != "$got" ]; then
+        echo -e "${RED}$name 校验失败（期望 $want，实际 ${got:-无}）。可能是 CDN 缓存尚未同步，请稍后重试；已取消。${NC}" >&2
+        return 1
+    fi
+}
+
 download_component() {
     local script_name="$1"
     local dest="$WORK_DIR/$script_name"
@@ -1042,6 +1075,13 @@ download_component() {
         rm -f "$tmp_file" 2>/dev/null || true
         return 1
     fi
+    local sums_file="$WORK_DIR/.SHA256SUMS.$$"
+    if ! fetch_release_sums "$RAW_BASE" "$sums_file" ||
+       ! verify_release_file "$script_name" "$tmp_file" "$sums_file"; then
+        rm -f "$tmp_file" "$sums_file" 2>/dev/null || true
+        return 1
+    fi
+    rm -f "$sums_file" 2>/dev/null || true
 
     if [ ! -s "$tmp_file" ]; then
         echo -e "${RED}下载文件为空：$script_name${NC}"
@@ -1326,6 +1366,13 @@ update_scripts() {
     echo -e "${YELLOW}仅覆盖脚本文件；配置、日志、crontab 不会被覆盖。${NC}"
     echo ""
 
+    local sums_file="$WORK_DIR/.SHA256SUMS.new.$$"
+    if ! fetch_release_sums "$update_base" "$sums_file"; then
+        ntc_operation_log update failure
+        return 1
+    fi
+    temp_files+=("$sums_file")
+
     for script_name in "${scripts[@]}"; do
         url="$update_base/$script_name"
         tmp_file="$WORK_DIR/.${script_name}.new.$$"
@@ -1340,6 +1387,12 @@ update_scripts() {
 
         if [ ! -s "$tmp_file" ]; then
             echo -e "${RED}下载文件为空：$script_name${NC}"
+            rm -f "${temp_files[@]}" "$tmp_file" 2>/dev/null || true
+            ntc_operation_log update failure
+            return 1
+        fi
+
+        if ! verify_release_file "$script_name" "$tmp_file" "$sums_file"; then
             rm -f "${temp_files[@]}" "$tmp_file" 2>/dev/null || true
             ntc_operation_log update failure
             return 1
@@ -1426,6 +1479,7 @@ update_scripts() {
         return 1
     fi
 
+    rm -f "$sums_file" 2>/dev/null || true
     # 脚本本体已校验通过，快捷命令装不上不改变“更新成功”这个事实。
     install_shortcut_link || true
     install_tc_recovery_service_files || { ntc_operation_log update failure; return 1; }
@@ -2349,9 +2403,12 @@ remove_lite_cron() {
     return 0
 }
 
+# 只在持有监控锁之后调用。监控进程由该锁排除（cron 的 --run 用 flock -n，拿不到锁立即退出；
+# 已在运行的实例会在锁上排队，不会处于 TC 事务中途），所以不再 pkill 监控脚本——
+# 按命令行子串 pkill 会在 qdisc 替换与状态写入之间杀掉进程，也会误杀开机恢复和编辑器。
+# Telegram 通知有自己的锁，只结束 cron 触发的实例（精确匹配命令行）。
 stop_lite_processes() {
-    pkill -f "$WORK_DIR/$MONITOR_SCRIPT" 2>/dev/null || true
-    pkill -f "$WORK_DIR/$TELEGRAM_SCRIPT" 2>/dev/null || true
+    pkill -f -- "^(/usr)?/bin/bash $WORK_DIR/$TELEGRAM_SCRIPT -cron\$" 2>/dev/null || true
 }
 
 acquire_monitor_cleanup_lock() {
@@ -2488,7 +2545,6 @@ stop_all_services() {
     fi
     echo "✓ 已移除独立版 crontab 条目"
 
-    stop_lite_processes
     if ! acquire_monitor_cleanup_lock; then
         echo -e "${RED}无法取得监控锁，本次未清理 TC 规则。${NC}"
         pause
@@ -2533,7 +2589,6 @@ uninstall_lite() {
         pause
         return 1
     fi
-    stop_lite_processes
     if ! acquire_monitor_cleanup_lock; then
         echo -e "${RED}卸载已中止：无法取得监控锁。${NC}"
         pause

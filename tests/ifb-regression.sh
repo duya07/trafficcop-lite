@@ -18,6 +18,8 @@ setup_ifb_fixture() {
     TC_DEFAULT_CLASS_RATE=1kbit
     TC_STATE_SCHEMA=traffic-tools-unified-htb-v1
     TC_STATE_PROVIDER=trafficcop-lite
+    DOG_TC_MANIFEST_SCHEMA=traffic-tools-dog-classes-v1
+    TC_MARK_MASK=0xfffff000
     DISABLED=false
     LIMIT_MODE=tc
     IFB_LOCK_HELD=false
@@ -55,7 +57,7 @@ EOF
         trafficcop_config_is_disabled normalize_tc_rate_to_bps tc_class_line tc_class_output \
         tc_filter_output tc_class_value tc_class_rate_matches tc_root_is_htb_handle_one \
         tc_root_has_default_30 tc_root_has_parent_class dog_owner_marker_matches \
-        dog_bandwidth_to_tc dog_configured_class_records dog_configured_class_ids \
+        dog_bandwidth_to_tc dog_configured_class_records dog_configured_class_ids dog_port_range_filter_complete \
         dog_live_objects_match_config tc_root_is_recognized_dog_htb tc_root_is_unified_compatible \
         dog_config_reserves_default_class tc_default_class_is_safe tc_has_other_consumers \
         tc_legacy_tbf_is_owned write_tc_state tc_verify_unified_hierarchy tc_replace_base_classes \
@@ -96,10 +98,11 @@ EOF
                 fi
                 ;;
             'class show')
-                local id base
-                for id in 1:1 1:30 1:1000; do
-                    [ -f "$IFB_WORK/$dev-$id" ] || continue
-                    read -r rate ceil < "$IFB_WORK/$dev-$id"
+                local id base class_file
+                for class_file in "$IFB_WORK/$dev-"1:*; do
+                    [ -f "$class_file" ] || continue
+                    id="${class_file##*/"$dev"-}"
+                    read -r rate ceil < "$class_file"
                     if [ "$id" = 1:1 ]; then base=root; else base='parent 1:1'; fi
                     printf 'class htb %s %s rate %s ceil %s\n' "$id" "$base" "$rate" "$ceil"
                 done
@@ -126,6 +129,43 @@ EOF
             *) printf 'unexpected TC mutation: %s\n' "$*" >&2; return 55 ;;
         esac
     }
+}
+
+# Dog 2.x 夹具：schema 2 配置 + tc-interop.json 清单，m1 → 1:4001，出向 fw mark，入向 flower。
+setup_ifb_fixture_v2() {
+    setup_ifb_fixture "$1" || return 1
+    rm -f "$IFB_WORK/eth0-1:1000" "$IFB_WORK/ifb0-1:1000"
+    printf '%s\n' '{"schema":2,"global":{"next_monitor_id":2},"monitors":{"m1":{"ports":["3265"],"bandwidth_limit":{"enabled":true,"rate":"10mbit","class_id":"1:4001","mark_id":1409290240}}}}' > "$DOG_CONFIG_FILE"
+    cat > "$IFB_WORK/tc-interop.json" <<'EOF'
+{"schema":"traffic-tools-dog-classes-v1","dog_version":"2.0.0","interface":"eth0","updated_at":"2026-11-15T00:00:00Z",
+ "classes":[{"id":"m1","class_id":"1:4001","rate":"10mbit","mark":1409290240,"mark_mask":4294963200,"egress":"fw","ingress":"flower","ingress_filters":8}]}
+EOF
+    chmod 644 "$IFB_WORK/tc-interop.json"
+    printf '%s\n' '1kbit 10mbit' > "$IFB_WORK/eth0-1:4001"
+    printf '%s\n' '1kbit 10mbit' > "$IFB_WORK/ifb0-1:4001"
+    printf '%s\n' 'filter parent 1: protocol all pref 1 fw chain 0' \
+        'filter parent 1: protocol all pref 1 fw chain 0 handle 0x54001000/0xfffff000 classid 1:4001' > "$IFB_WORK/filters-eth0"
+    printf '%s\n' 'filter parent 1: protocol ip pref 100 flower chain 0 handle 0x40010001 classid 1:4001' > "$IFB_WORK/filters-ifb0"
+    cp "$IFB_WORK/filters-eth0" "$IFB_WORK/filters-eth0.expected"
+    cp "$IFB_WORK/filters-ifb0" "$IFB_WORK/filters.expected"
+}
+
+# mock tc 只在持有 TC 锁时应答；识别函数在生产中也总是在锁内调用。
+recognized_dog_eth0() {
+    local rc
+    IFB_LOCK_HELD=true
+    tc_root_is_recognized_dog_htb eth0
+    rc=$?
+    IFB_LOCK_HELD=false
+    return "$rc"
+}
+
+assert_ifb_v2_objects_preserved() {
+    assert_file_content '1kbit 10mbit' "$IFB_WORK/eth0-1:4001" &&
+        assert_file_content '1kbit 10mbit' "$IFB_WORK/ifb0-1:4001" &&
+        cmp -s "$IFB_WORK/filters-eth0.expected" "$IFB_WORK/filters-eth0" &&
+        cmp -s "$IFB_WORK/filters.expected" "$IFB_WORK/filters-ifb0" &&
+        cmp -s "$IFB_WORK/redirect.expected" "$IFB_WORK/redirect"
 }
 
 assert_ifb_rates() {
@@ -557,4 +597,75 @@ test_ifb_clear_after_dog_removed_device() {
     assert_absent "$TC_STATE_FILE" || return 1
     cmp -s "$work/old-mutations" "$work/mutations" || return 1
     [ "$IFB_LOCK_HELD" = false ]
+}
+
+# --- Dog 2.x（tc-interop.json 清单）---
+
+# shellcheck disable=SC2034
+test_ifb_v2_apply_and_clear() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/ifb-v2.XXXXXX") || return 1
+    setup_ifb_fixture_v2 "$work" || return 1
+    recognized_dog_eth0 || return 1
+    apply_tc_limit 90 >/dev/null || return 1
+    assert_ifb_rates 90kbit || return 1
+    clear_owned_tc_rules test >/dev/null || return 1
+    assert_ifb_rates 100gbit || return 1
+    assert_ifb_v2_objects_preserved || return 1
+    ! grep -Ev '^class replace dev (eth0|ifb0) parent (1:|1:1) classid 1:(1|30) ' "$work/mutations"
+}
+
+# 清单缺失、清单外的类、清单不安全：都必须零修改地失败。
+# shellcheck disable=SC2034
+test_ifb_v2_manifest_problems_fail_closed() {
+    local work case_name
+    for case_name in missing orphan insecure formula; do
+        work=$(mktemp -d "$TEST_ROOT/ifb-v2-$case_name.XXXXXX") || return 1
+        setup_ifb_fixture_v2 "$work" || return 1
+        # 对照：破坏前同一夹具必须能被识别，保证下面的失败只来自这一项破坏。
+        recognized_dog_eth0 || { echo "v2 $case_name: 对照未通过" >&2; return 1; }
+        case "$case_name" in
+            missing) rm -f "$work/tc-interop.json" ;;
+            orphan) printf '%s\n' '1kbit 5mbit' > "$work/eth0-1:4002" ;;
+            insecure) chmod 666 "$work/tc-interop.json" ;;
+            formula) sed -i 's/"mark":1409290240/"mark":1409294336/' "$work/tc-interop.json" ;;
+        esac
+        if apply_tc_limit 90 >/dev/null 2>&1; then echo "v2 $case_name: apply 未失败" >&2; return 1; fi
+        if [ -s "$work/mutations" ]; then echo "v2 $case_name: 有修改" >&2; return 1; fi
+        if recognized_dog_eth0; then echo "v2 $case_name: 仍被识别" >&2; return 1; fi
+    done
+}
+
+# 审计 H2：Dog 配置与 owner 文件都缺失，但 htb 1: 树里还有 Dog 的类——--manual 恢复不得删除 root。
+# shellcheck disable=SC2034
+test_recovery_refuses_root_delete_with_foreign_classes() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/ifb-h2.XXXXXX") || return 1
+    setup_ifb_fixture_v2 "$work" || return 1
+    rm -f "$DOG_CONFIG_FILE" "$DOG_TC_OWNER_FILE" "$work/tc-interop.json"
+    if recover_owned_tc_hierarchy --manual > "$work/out" 2>&1; then return 1; fi
+    if grep -q 'qdisc del' "$work/mutations" 2>/dev/null; then return 1; fi
+    assert_file_content '1kbit 10mbit' "$work/eth0-1:4001" || return 1
+    [ "$IFB_LOCK_HELD" = false ] || return 1
+    grep -q 'TrafficCop 之外的分类或过滤器' "$work/out"
+}
+
+# 配置格式识别：未知格式失败关闭，1.5.x 空配置为空清单。
+# shellcheck disable=SC2034
+test_dog_config_schema_detection() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/dog-schema.XXXXXX") || return 1
+    setup_ifb_fixture "$work" || return 1
+    printf '%s\n' '{"schema":3,"monitors":{}}' > "$DOG_CONFIG_FILE"
+    if dog_configured_class_records >/dev/null 2>&1; then return 1; fi
+    dog_config_reserves_default_class || return 1
+    printf '%s\n' '{"monitors":{}}' > "$DOG_CONFIG_FILE"
+    if dog_configured_class_records >/dev/null 2>&1; then return 1; fi
+    printf '%s\n' '{}' > "$DOG_CONFIG_FILE"
+    [ "$(dog_config_schema)" = 1 ] || return 1
+    [ -z "$(dog_configured_class_records)" ] || return 1
+    setup_ifb_fixture_v2 "$work" || return 1
+    [ "$(dog_config_schema)" = 2 ] || return 1
+    [ "$(dog_configured_class_records)" = "$(printf 'm1\t1:4001\t10mbit\t1409290240')" ] || return 1
+    if dog_config_reserves_default_class; then return 1; fi
 }

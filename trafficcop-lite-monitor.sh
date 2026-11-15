@@ -41,8 +41,13 @@ VNSTAT_TRANSACTION_HAD_RETENTION=false
 VNSTAT_TRANSACTION_HAD_CONFIG_PATH_FILE=false
 DOG_CONFIG_FILE="/etc/port-traffic-dog/config.json"
 DOG_TC_OWNER_FILE="/etc/port-traffic-dog/tc-root-qdisc.owner"
+# Dog 2.x 写出的 TC 类清单 tc-interop.json（与 config.json 同目录，见 dog_tc_manifest_file）。
+# Dog 用下面的 schema 字符串判断已安装的 NTC 是否理解该清单；旧版 NTC 存在时 Dog 拒绝施加限速，
+# 所以这一行不能删改。
+DOG_TC_MANIFEST_SCHEMA="traffic-tools-dog-classes-v1"
+HEALTH_STATE_FILE="$WORK_DIR/monitor_health"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.1.11"
+SCRIPT_VERSION="1.2.0"
 DEPENDENCY_STATE_DIR="${DEPENDENCY_STATE_DIR:-/var/lib/trafficcop-lite/dependencies}"
 
 dependency_manifest() {
@@ -3264,7 +3269,62 @@ dog_bandwidth_to_tc() {
     esac
 }
 
+# Dog 配置格式：1 = 1.5.x（.ports，无 schema），2 = 2.x（schema 2 + .monitors）。
+# 文件不可读或格式无法识别时返回 1——不能把未知格式当成“没有 Dog 端口类”。
+dog_config_schema() {
+    [ -r "$DOG_CONFIG_FILE" ] && command -v jq >/dev/null 2>&1 || return 1
+    local schema
+    schema=$(jq -r '
+        if type != "object" then "unknown"
+        elif .schema == 2 and (.monitors | type) == "object" then "2"
+        elif (has("schema") | not) and (has("monitors") | not) and ((.ports // {}) | type) == "object" then "1"
+        else "unknown" end' "$DOG_CONFIG_FILE" 2>/dev/null) || return 1
+    case "$schema" in 1|2) printf '%s\n' "$schema" ;; *) return 1 ;; esac
+}
+
+# Dog 2.x：从 tc-interop.json 读取类清单，输出与 1.5.x 相同的四列（第一列为监控项 ID）。
+# 出向统一是 fw mark 过滤器，后续按“区间/组”的 mark 路径校验。清单缺失、不安全或任何一项
+# 不符合确定性公式（minor = 0x4000 + 编号，mark = 0x50000000 | minor<<12）时失败关闭。
+dog_tc_manifest_file() {
+    printf '%s\n' "${DOG_TC_MANIFEST_FILE:-${DOG_CONFIG_FILE%/*}/tc-interop.json}"
+}
+
+dog_manifest_class_records() {
+    local raw id class_id rate mark minor tc_rate manifest
+    manifest=$(dog_tc_manifest_file)
+    tc_file_is_secure "$manifest" || return 1
+    raw=$(jq -r --arg schema "${DOG_TC_MANIFEST_SCHEMA:-traffic-tools-dog-classes-v1}" '
+        if .schema != $schema or (.classes | type) != "array" then error("manifest")
+        elif ([.classes[].class_id] | length) != ([.classes[].class_id] | unique | length) then error("duplicate")
+        else .classes[] |
+            if (.id | type) != "string" or (.class_id | type) != "string" or (.rate | type) != "string" or
+               (.mark | type) != "number" or .mark_mask != 4294963200 or .egress != "fw"
+            then error("class") else [.id, .class_id, .rate, (.mark | tostring)] | @tsv end
+        end' "$manifest" 2>/dev/null) || return 1
+    [ -n "$raw" ] || return 0
+    while IFS=$'\t' read -r id class_id rate mark; do
+        [[ "$id" =~ ^m([1-9][0-9]{0,4})$ ]] || return 1
+        minor=$((0x4000 + BASH_REMATCH[1]))
+        [ "$minor" -le 65535 ] || return 1
+        [ "$class_id" = "$(printf '1:%x' "$minor")" ] || return 1
+        [[ "$mark" =~ ^[0-9]+$ ]] && [ "$mark" -eq $((0x50000000 | (minor << 12))) ] || return 1
+        tc_rate=$(dog_bandwidth_to_tc "$rate") || return 1
+        printf '%s\t%s\t%s\t%s\n' "$id" "$class_id" "$tc_rate" "$mark"
+    done <<< "$raw"
+}
+
 dog_configured_class_records() {
+    local schema
+    schema=$(dog_config_schema) || return 1
+    case "$schema" in
+        1) dog_legacy_class_records ;;
+        2) dog_manifest_class_records ;;
+        *) return 1 ;;
+    esac
+}
+
+# Dog 1.5.x：从 .ports 推导类清单（保持 1.1.x 行为）。
+dog_legacy_class_records() {
     local port class_id rate mark_id start_port end_port generated_mark minor tc_rate raw_records
 
     [ -r "$DOG_CONFIG_FILE" ] && command -v jq >/dev/null 2>&1 || return 1
@@ -3437,6 +3497,7 @@ dog_live_objects_match_config() {
             dog_single_port_filters_complete "$interface" "$port" "$class_id"
             status=$?
         else
+            # 1.5.x 的端口区间/组与 2.x 的全部监控项：出向都是 handle mark/0xfffff000 的 fw 过滤器。
             minor_hex=${class_id#1:}
             [[ "$minor_hex" =~ ^[0-9a-fA-F]+$ ]] || return 1
             minor=$((16#$minor_hex))
@@ -3484,8 +3545,16 @@ tc_root_is_unified_compatible() {
 }
 
 dog_config_reserves_default_class() {
+    local schema records
     [ -f "$DOG_CONFIG_FILE" ] || return 1
     command -v jq >/dev/null 2>&1 || return 0
+    # 格式无法识别或 2.x 清单无法读取时按“占用”处理，让调用方失败关闭。
+    schema=$(dog_config_schema) || return 0
+    if [ "$schema" = 2 ]; then
+        records=$(dog_manifest_class_records) || return 0
+        printf '%s\n' "$records" | awk -F '\t' '$2 == "1:30" { found=1 } END { exit found ? 0 : 1 }'
+        return
+    fi
     jq -e '
         [.ports // {} | to_entries[] |
             select((.value.bandwidth_limit.class_id // "") == "1:30")] |
@@ -4161,6 +4230,24 @@ clear_owned_tc_rules() {
     return "$result"
 }
 
+# 监控健康状态（供 Telegram 判断“监控异常”）：HEALTH=ok|error|disabled，REASON 为单行摘要。
+write_health_state() {
+    local health="$1" reason="${2:-}" tmp_file="${HEALTH_STATE_FILE}.tmp.$$"
+    reason=$(printf '%s' "$reason" | tr -d '\r' | tr '\n\t' '  ' | cut -c1-200)
+    {
+        printf 'HEALTH=%s\n' "$health"
+        printf 'REASON=%s\n' "$reason"
+        printf 'UPDATED_EPOCH=%s\n' "$(date +%s)"
+    } > "$tmp_file" 2>/dev/null || { rm -f "$tmp_file"; return 1; }
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$HEALTH_STATE_FILE" 2>/dev/null || { rm -f "$tmp_file"; return 1; }
+}
+
+# 失败原因取自失败分支刚写入的最后一行日志（去掉时间戳）。
+last_log_reason() {
+    tail -n 1 "$LOG_FILE" 2>/dev/null | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} :? ?//'
+}
+
 write_usage_state() {
     local status="$1"
     local current_usage="$2"
@@ -4745,6 +4832,19 @@ recover_owned_tc_hierarchy() {
         ntc_operation_log tc-recover failure
         return 1
     fi
+    # 即使 Dog 配置/清单/owner 文件缺失，只要 htb 1: 树里还有 1:1、1:30 之外的类或任何过滤器，
+    # 就说明另有使用者（通常是 Dog），删除 root 会连带删掉它们，必须拒绝。
+    local consumer_status=1
+    if tc_root_is_htb_handle_one "$MAIN_INTERFACE"; then
+        tc_has_other_consumers "$MAIN_INTERFACE"
+        consumer_status=$?
+    fi
+    if [ "$consumer_status" -ne 1 ]; then
+        release_tc_hierarchy_lock
+        echo "当前 HTB 树中还有 TrafficCop 之外的分类或过滤器（可能属于 Dog），拒绝删除 root qdisc；请先恢复或清理对应程序的规则。" >&2
+        ntc_operation_log tc-recover failure
+        return 1
+    fi
 
     local recovery_ifb="" recovery_ifb_snapshot=""
     if ! recovery_ifb=$(tc_dog_ifb_device "$MAIN_INTERFACE") ||
@@ -5035,6 +5135,8 @@ main() {
             echo "$(date '+%Y-%m-%d %H:%M:%S') 配置文件读取失败，未修改 TC。" | tee -a "$LOG_FILE"
             return 1
         fi
+        # 与 --run 一致：周期边界按 vnStat 的 UseUTC 计算（只读，不修改 vnStat 配置）。
+        align_timezone_with_vnstat
         recover_owned_tc_hierarchy "${2:---manual}"
         return $?
     fi
@@ -5045,19 +5147,33 @@ main() {
         if read_config; then
             if [ "${DISABLED:-false}" = "true" ]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') 监控已标记为禁用，跳过自动检查" | tee -a "$LOG_FILE"
+                write_health_state disabled "监控已禁用" || true
                 return
             fi
             if ! ensure_vnstat_runtime_config "$MAIN_INTERFACE"; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') vnStat 运行配置或服务校验失败，跳过本轮检查。" | tee -a "$LOG_FILE"
+                write_health_state error "vnStat 运行配置或服务校验失败" || true
                 return 1
             fi
-            check_reset_limit || return 1
-            check_and_limit_traffic
+            if ! check_reset_limit; then
+                # 周期文件未更新，下一轮会重试；记录健康状态，避免 Telegram 静默。
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 新周期的限速/关机计划清理失败，下一轮重试。" | tee -a "$LOG_FILE"
+                write_health_state error "新周期的限速/关机计划清理失败（TC 规则可能被其他程序占用，见 traffic_monitor.log）" || true
+                return 1
+            fi
+            local run_status=0
+            check_and_limit_traffic || run_status=$?
+            if [ "$run_status" -eq 0 ]; then
+                write_health_state ok "" || true
+            else
+                write_health_state error "$(last_log_reason)" || true
+            fi
+            return "$run_status"
         else
             echo "$(date '+%Y-%m-%d %H:%M:%S') 配置文件读取失败，请检查配置" | tee -a "$LOG_FILE"
+            write_health_state error "配置文件读取失败" || true
             return 1
         fi
-        return
     fi
 
  # 非 --run 模式下的操作

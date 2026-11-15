@@ -392,7 +392,7 @@ test_cron_service_start_failure_propagates_to_dependency_check() {
 
 # initial_config 的文件事务由下方定向测试单独覆盖；这些旧用例只隔离验证配置文件回滚语义。
 # These functions are invoked by production functions loaded through eval.
-# shellcheck disable=SC2317
+# shellcheck disable=SC2317,SC2329  # 新版 shellcheck 对间接调用的报告编号
 setup_initial_config_transaction_mocks() {
     begin_initial_vnstat_transaction() { return 0; }
     rollback_initial_vnstat_transaction() { return 0; }

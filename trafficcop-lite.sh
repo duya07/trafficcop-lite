@@ -3,8 +3,8 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.2.0"
-LAST_UPDATE="2026-10-30"
+SCRIPT_VERSION="1.2.1"
+LAST_UPDATE="2026-11-19"
 
 WORK_DIR="/etc/trafficcop-lite"
 DEPENDENCY_STATE_DIR="${DEPENDENCY_STATE_DIR:-/var/lib/trafficcop-lite/dependencies}"
@@ -2253,6 +2253,10 @@ show_enforcement_overview() {
         return
     fi
 
+    # 前导零（如 09）按十进制解释，否则下面的 $(( )) 会按八进制报错，整个菜单打不开。
+    if [[ "$boot_grace_minutes" =~ ^[0-9]{1,4}$ ]]; then
+        boot_grace_minutes=$((10#$boot_grace_minutes))
+    fi
     if [ "$limit_mode" = "tc" ] && [[ "$boot_grace_minutes" =~ ^[0-9]+$ ]] \
         && [ "$boot_grace_minutes" -gt 0 ] && [ "$boot_grace_minutes" -le 1440 ]; then
         uptime_seconds=$(awk '{ printf "%d", $1 }' /proc/uptime 2>/dev/null || echo 0)

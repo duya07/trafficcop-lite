@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# TrafficCop 机器限速管理脚本 v2.12
+# TrafficCop 机器限速管理脚本 v2.13
 # 提供完整的启用/禁用/恢复机器限速功能
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -249,9 +249,10 @@ begin_enable_grace() {
     local enforcement_candidate="${ENFORCEMENT_STATE_FILE}.enable-candidate.$$"
 
     ENABLE_TC_CLEAR_ATTEMPTED=false
-    if ! [[ "$grace_minutes" =~ ^[0-9]+$ ]] || [ "$grace_minutes" -lt 1 ] || [ "$grace_minutes" -gt 1440 ]; then
+    if ! [[ "$grace_minutes" =~ ^[0-9]{1,4}$ ]] || [ $((10#$grace_minutes)) -lt 1 ] || [ $((10#$grace_minutes)) -gt 1440 ]; then
         grace_minutes=10
     fi
+    grace_minutes=$((10#$grace_minutes))
     until_epoch=$(( $(date +%s) + grace_minutes * 60 ))
     rm -f "$enforcement_candidate"
     if ! write_enforcement_state_file "grace" "$until_epoch" "enable" "$enforcement_candidate"; then
@@ -789,10 +790,13 @@ manage_enforcement_control() {
             if [ "$control_choice" = "2" ]; then
                 read -r -p "请输入宽限分钟数 (1-1440，默认为10): " grace_minutes
                 grace_minutes=${grace_minutes:-10}
-                if ! [[ "$grace_minutes" =~ ^[0-9]+$ ]] || [ "$grace_minutes" -lt 1 ] || [ "$grace_minutes" -gt 1440 ]; then
+                # 前导零（如 08）按十进制解释；1.2.0 在此按八进制报错，TC 已清掉而宽限没写上。
+                if ! [[ "$grace_minutes" =~ ^[0-9]{1,4}$ ]] || [ $((10#$grace_minutes)) -lt 1 ] ||
+                   [ $((10#$grace_minutes)) -gt 1440 ]; then
                     echo "输入无效，使用默认值：10 分钟"
                     grace_minutes=10
                 fi
+                grace_minutes=$((10#$grace_minutes))
                 until_epoch=$(( $(date +%s) + grace_minutes * 60 ))
                 write_enforcement_state "grace" "$until_epoch" "manual" || {
                     release_monitor_cleanup_lock
@@ -819,10 +823,11 @@ manage_enforcement_control() {
             fi
             read -r -p "请输入开机后宽限分钟数 (0=立即，0-1440，默认为10): " grace_minutes
             grace_minutes=${grace_minutes:-10}
-            if ! [[ "$grace_minutes" =~ ^[0-9]+$ ]] || [ "$grace_minutes" -gt 1440 ]; then
+            if ! [[ "$grace_minutes" =~ ^[0-9]{1,4}$ ]] || [ $((10#$grace_minutes)) -gt 1440 ]; then
                 echo "输入无效，未修改。"
                 return 1
             fi
+            grace_minutes=$((10#$grace_minutes))
             config_tmp="${CONFIG_FILE}.tmp.$$"
             if ! awk -v value="$grace_minutes" '
                 BEGIN { updated=0 }

@@ -47,7 +47,7 @@ DOG_TC_OWNER_FILE="/etc/port-traffic-dog/tc-root-qdisc.owner"
 DOG_TC_MANIFEST_SCHEMA="traffic-tools-dog-classes-v1"
 HEALTH_STATE_FILE="$WORK_DIR/monitor_health"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 DEPENDENCY_STATE_DIR="${DEPENDENCY_STATE_DIR:-/var/lib/trafficcop-lite/dependencies}"
 
 dependency_manifest() {
@@ -1884,7 +1884,10 @@ validate_config() {
         has_error=true
     fi
     TC_BOOT_GRACE_MINUTES="${TC_BOOT_GRACE_MINUTES:-10}"
-    if ! [[ "$TC_BOOT_GRACE_MINUTES" =~ ^[0-9]+$ ]] || [ "$TC_BOOT_GRACE_MINUTES" -gt 1440 ]; then
+    # 前导零（如 08）按十进制解释；否则 $((08 * 60)) 会按八进制报错并中止整个脚本。
+    if [[ "$TC_BOOT_GRACE_MINUTES" =~ ^[0-9]{1,4}$ ]] && [ $((10#$TC_BOOT_GRACE_MINUTES)) -le 1440 ]; then
+        TC_BOOT_GRACE_MINUTES=$((10#$TC_BOOT_GRACE_MINUTES))
+    else
         echo "$(date '+%Y-%m-%d %H:%M:%S') 配置错误：TC_BOOT_GRACE_MINUTES 必须是 0-1440 的整数。" | tee -a "$LOG_FILE"
         has_error=true
     fi
@@ -2224,7 +2227,11 @@ get_main_interface() {
             echo "$(date '+%Y-%m-%d %H:%M:%S') 无法自动检测主要网络接口。"| tee -a "$LOG_FILE" >&2
             echo "$(date '+%Y-%m-%d %H:%M:%S') 可用的网络接口有："| tee -a "$LOG_FILE" >&2
             ip -o link show | sed -n 's/^[0-9]*: \([^:]*\):.*/\1/p' >&2
-            read -r -p "请从上面的列表中选择一个网络接口: " main_interface
+            if ! read -r -p "请从上面的列表中选择一个网络接口: " main_interface; then
+                echo "" >&2
+                echo "输入已结束，已取消本次配置。" >&2
+                return 1
+            fi
             if [ -z "$main_interface" ]; then
                 echo "$(date '+%Y-%m-%d %H:%M:%S') 请输入一个有效的接口名称。"| tee -a "$LOG_FILE" >&2
             elif ip link show "$main_interface" > /dev/null 2>&1; then
@@ -2234,7 +2241,11 @@ get_main_interface() {
             fi
         done
     else
-        read -r -p "检测到的主要网络接口是: $main_interface, 按Enter使用此接口，或输入新的接口名称: " new_interface
+        if ! read -r -p "检测到的主要网络接口是: $main_interface, 按Enter使用此接口，或输入新的接口名称: " new_interface; then
+            echo "" >&2
+            echo "输入已结束，已取消本次配置。" >&2
+            return 1
+        fi
         if [ -n "$new_interface" ]; then
             if ip link show "$new_interface" > /dev/null 2>&1; then
                 main_interface=$new_interface
@@ -2466,10 +2477,12 @@ configure_post_save_enforcement() {
             1|"")
                 read -r -p "请输入宽限分钟数 (1-1440，默认为10): " grace_minutes || return 1
                 grace_minutes=${grace_minutes:-10}
-                if ! [[ "$grace_minutes" =~ ^[0-9]+$ ]] || [ "$grace_minutes" -lt 1 ] || [ "$grace_minutes" -gt 1440 ]; then
+                if ! [[ "$grace_minutes" =~ ^[0-9]{1,4}$ ]] || [ $((10#$grace_minutes)) -lt 1 ] ||
+                   [ $((10#$grace_minutes)) -gt 1440 ]; then
                     echo "输入无效，使用默认值：10 分钟"
                     grace_minutes=10
                 fi
+                grace_minutes=$((10#$grace_minutes))
                 desired_mode="grace"
                 desired_reason="config"
                 until_epoch=$(( $(date +%s) + grace_minutes * 60 ))
@@ -2508,7 +2521,23 @@ configure_post_save_enforcement() {
         rm -f "$enforcement_candidate"
         return 1
     fi
-    [ -n "$desired_message" ] && echo "$desired_message"
+    # 1.1.10–1.2.0 这里是 `[ -n "$desired_message" ] && echo`：没有提示语（用量低于阈值、或选择立即执行）
+    # 时返回 1，导致首次配置整体回滚。
+    if [ -n "$desired_message" ]; then
+        echo "$desired_message"
+    fi
+    return 0
+}
+
+# 向导输入中途结束（Ctrl-D、stdin 已关闭）：回滚已开始的 vnStat 事务并放弃本次配置。
+# 1.2.0 及更早版本在这里要么死循环（有的还每轮写日志），要么用默认值继续保存。
+cancel_config_on_eof() {
+    echo "" >&2
+    echo "输入已结束，已取消本次配置；原有配置保持不变。" >&2
+    if ! rollback_initial_vnstat_transaction; then
+        echo "vnStat 状态未能完整恢复。" >&2
+    fi
+    return 1
 }
 
 # 初始配置函数
@@ -2523,7 +2552,8 @@ initial_config() {
     CONFIG_SHUTDOWN_CLEAR_ATTEMPTED=false
 
     echo "$(date '+%Y-%m-%d %H:%M:%S') 正在检测主要网络接口..."| tee -a "$LOG_FILE"
-    MAIN_INTERFACE=$(get_main_interface)
+    MAIN_INTERFACE=$(get_main_interface) || return 1
+    [ -n "$MAIN_INTERFACE" ] || return 1
     prompt_vnstat_max_bandwidth || return 1
     begin_initial_vnstat_transaction "$MAIN_INTERFACE" || return 1
     if ! ensure_vnstat_runtime_config "$MAIN_INTERFACE" ||
@@ -2539,7 +2569,7 @@ initial_config() {
         echo "$(date '+%Y-%m-%d %H:%M:%S') 2. 只计算进站流量"| tee -a "$LOG_FILE"
         echo "$(date '+%Y-%m-%d %H:%M:%S') 3. 出进站流量都计算"| tee -a "$LOG_FILE"
         echo "$(date '+%Y-%m-%d %H:%M:%S') 4. 出站和进站流量只取大"| tee -a "$LOG_FILE"
-        read -r -p "请输入选择 (1-4): " mode_choice
+        read -r -p "请输入选择 (1-4): " mode_choice || { cancel_config_on_eof; return 1; }
         case $mode_choice in
             1) TRAFFIC_MODE="out"; break ;;
             2) TRAFFIC_MODE="in"; break ;;
@@ -2549,7 +2579,7 @@ initial_config() {
         esac
     done
 
-    read -r -p "请选择流量统计周期 (m/q/y，默认为m): " period_choice
+    read -r -p "请选择流量统计周期 (m/q/y，默认为m): " period_choice || { cancel_config_on_eof; return 1; }
     case $period_choice in
         q) TRAFFIC_PERIOD="quarterly" ;;
         y) TRAFFIC_PERIOD="yearly" ;;
@@ -2565,7 +2595,7 @@ initial_config() {
     echo "请选择流量单位："
     echo "1. GB（十进制，1 GB = 1000^3 字节，推荐用于服务商配额）"
     echo "2. GiB（二进制，1 GiB = 1024^3 字节，兼容旧版）"
-    read -r -p "请输入选择 (1-2，默认为1): " unit_choice
+    read -r -p "请输入选择 (1-2，默认为1): " unit_choice || { cancel_config_on_eof; return 1; }
     case "$unit_choice" in
         2) TRAFFIC_UNIT="binary" ;;
         1|"") TRAFFIC_UNIT="decimal" ;;
@@ -2574,7 +2604,7 @@ initial_config() {
 
     PERIOD_START_MONTH=1
     if [ "$TRAFFIC_PERIOD" = "yearly" ]; then
-        read -r -p "请输入年度周期起始月份 (1-12，默认为1): " PERIOD_START_MONTH
+        read -r -p "请输入年度周期起始月份 (1-12，默认为1): " PERIOD_START_MONTH || { cancel_config_on_eof; return 1; }
         if [[ -z "$PERIOD_START_MONTH" ]]; then
             PERIOD_START_MONTH=1
         elif ! [[ "$PERIOD_START_MONTH" =~ ^[1-9]$|^1[0-2]$ ]]; then
@@ -2583,7 +2613,7 @@ initial_config() {
         fi
     fi
 
-    read -r -p "请输入周期起始日 (1-31，默认为1): " PERIOD_START_DAY
+    read -r -p "请输入周期起始日 (1-31，默认为1): " PERIOD_START_DAY || { cancel_config_on_eof; return 1; }
     if [[ -z "$PERIOD_START_DAY" ]]; then
         PERIOD_START_DAY=1
     elif ! [[ "$PERIOD_START_DAY" =~ ^[1-9]$|^[12][0-9]$|^3[01]$ ]]; then
@@ -2592,7 +2622,7 @@ initial_config() {
     fi
 
     while true; do
-        read -r -p "请输入流量限制 ($([ "$TRAFFIC_UNIT" = "decimal" ] && echo GB || echo GiB)): " TRAFFIC_LIMIT
+        read -r -p "请输入流量限制 ($([ "$TRAFFIC_UNIT" = "decimal" ] && echo GB || echo GiB)): " TRAFFIC_LIMIT || { cancel_config_on_eof; return 1; }
         if [[ "$TRAFFIC_LIMIT" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(echo "$TRAFFIC_LIMIT > 0" | bc -l 2>/dev/null || echo "0") )); then
             break
         else
@@ -2601,7 +2631,7 @@ initial_config() {
     done
 
     while true; do
-        read -r -p "请输入容错范围 ($([ "$TRAFFIC_UNIT" = "decimal" ] && echo GB || echo GiB)): " TRAFFIC_TOLERANCE
+        read -r -p "请输入容错范围 ($([ "$TRAFFIC_UNIT" = "decimal" ] && echo GB || echo GiB)): " TRAFFIC_TOLERANCE || { cancel_config_on_eof; return 1; }
         if [[ "$TRAFFIC_TOLERANCE" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(echo "$TRAFFIC_TOLERANCE < $TRAFFIC_LIMIT" | bc -l 2>/dev/null || echo "0") )); then
             break
         else
@@ -2613,22 +2643,23 @@ initial_config() {
         echo "$(date '+%Y-%m-%d %H:%M:%S') 请选择限制模式："| tee -a "$LOG_FILE"
         echo "$(date '+%Y-%m-%d %H:%M:%S') 1. TC 模式（更灵活）"| tee -a "$LOG_FILE"
         echo "$(date '+%Y-%m-%d %H:%M:%S') 2. 关机模式（更安全）"| tee -a "$LOG_FILE"
-        read -r -p "请输入选择 (1-2): " limit_mode_choice
+        read -r -p "请输入选择 (1-2): " limit_mode_choice || { cancel_config_on_eof; return 1; }
         case $limit_mode_choice in
             1) 
                 LIMIT_MODE="tc"
-                read -r -p "请输入限速 (kbit/s，默认为20): " LIMIT_SPEED
+                read -r -p "请输入限速 (kbit/s，默认为20): " LIMIT_SPEED || { cancel_config_on_eof; return 1; }
                 LIMIT_SPEED=${LIMIT_SPEED:-20}
                 if ! [[ "$LIMIT_SPEED" =~ ^[1-9][0-9]*$ ]]; then
                     echo "无效输入，使用默认值：20 kbit/s"
                     LIMIT_SPEED=20
                 fi
-                read -r -p "请输入开机后限速宽限时间（防卡死，单位：分钟；0=立即，默认为10）: " TC_BOOT_GRACE_MINUTES
+                read -r -p "请输入开机后限速宽限时间（防卡死，单位：分钟；0=立即，默认为10）: " TC_BOOT_GRACE_MINUTES || { cancel_config_on_eof; return 1; }
                 TC_BOOT_GRACE_MINUTES=${TC_BOOT_GRACE_MINUTES:-10}
-                if ! [[ "$TC_BOOT_GRACE_MINUTES" =~ ^[0-9]+$ ]] || [ "$TC_BOOT_GRACE_MINUTES" -gt 1440 ]; then
+                if ! [[ "$TC_BOOT_GRACE_MINUTES" =~ ^[0-9]{1,4}$ ]] || [ $((10#$TC_BOOT_GRACE_MINUTES)) -gt 1440 ]; then
                     echo "无效输入，使用默认值：10 分钟"
                     TC_BOOT_GRACE_MINUTES=10
                 fi
+                TC_BOOT_GRACE_MINUTES=$((10#$TC_BOOT_GRACE_MINUTES))
                 break 
                 ;;
             2) 
@@ -4434,7 +4465,9 @@ tc_boot_grace_active() {
 
     TC_BOOT_GRACE_REMAINING=0
     grace_minutes="${TC_BOOT_GRACE_MINUTES:-10}"
-    [[ "$grace_minutes" =~ ^[0-9]+$ ]] || grace_minutes=10
+    [[ "$grace_minutes" =~ ^[0-9]{1,4}$ ]] || grace_minutes=10
+    grace_minutes=$((10#$grace_minutes))
+    [ "$grace_minutes" -le 1440 ] || grace_minutes=10
     [ "$grace_minutes" -gt 0 ] || return 1
     owned_tc_limit_active && return 1
     uptime_seconds=$(awk '{ printf "%d", $1 }' /proc/uptime 2>/dev/null) || return 1
@@ -4450,6 +4483,10 @@ tc_boot_grace_active() {
 check_and_limit_traffic() {
     local current_usage limit_threshold unit_label shutdown_guard_status comparison_status
     local limit_reached=false
+    if [ "${DISABLED:-false}" = "true" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 监控已停用，跳过限速判断。" | tee -a "$LOG_FILE"
+        return 0
+    fi
     [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && unit_label="GB" || unit_label="GiB"
 
     if ! current_usage=$(get_traffic_usage); then
@@ -5184,20 +5221,29 @@ main() {
     fi
     if check_existing_setup; then
         read_config || return 1
+        # 已在“机器限速管理”中停用：只展示配置，不重装定时任务、不执行限速或关机
+        # （1.2.0 在这里会重新加上 --run 任务并立即执行一轮限制，而 --run 遇到停用直接跳过，限速无人解除）。
+        if [ "${DISABLED:-false}" = "true" ]; then
+            show_current_config
+            echo ""
+            echo "流量监控已停用：不会安装定时任务，也不会执行限速或关机。"
+            echo "如需继续监控或修改配置，请先在主菜单 3) 机器限速管理 中选择启用。"
+            return 0
+        fi
         ensure_vnstat_runtime_config "$MAIN_INTERFACE" || return 1
         show_current_config
 
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 是否需要修改配置？(y/n): 5秒内按任意键修改配置，否则保持现有配置" | tee -a "$LOG_FILE"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 开始等待用户输入..." | tee -a "$LOG_FILE"
-        
-        if read -r -t 5 -n 1; then
-            echo ""
+        local modify_answer=""
+        echo ""
+        # 只有明确输入 y/Y 才进入向导（1.2.0 是 5 秒内按任意键，按 n 或回车也会进入）。
+        if read -r -t 30 -p "是否修改配置？[y/N]（30 秒内不输入则保持现有配置）: " modify_answer &&
+           [[ "$modify_answer" =~ ^[Yy]$ ]]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 开始修改配置..." | tee -a "$LOG_FILE"
             initial_config || return 1
             echo "$(date '+%Y-%m-%d %H:%M:%S') 配置已更新，脚本将每分钟自动运行一次" | tee -a "$LOG_FILE"
         else
             echo ""
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 等待超时，保持现有配置。" | tee -a "$LOG_FILE"
+            echo "$(date '+%Y-%m-%d %H:%M:%S') 保持现有配置。" | tee -a "$LOG_FILE"
         fi
     else
         echo "$(date '+%Y-%m-%d %H:%M:%S') 开始初始化配置..." | tee -a "$LOG_FILE"

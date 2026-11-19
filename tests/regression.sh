@@ -56,6 +56,12 @@ load_function() {
                 load_function "$1" "$helper" || return 1
             done
             ;;
+        initial_config)
+            # 只有 monitor 的向导有这个辅助函数；Telegram 脚本里的 initial_config 是另一套。
+            if [[ "$1" == *trafficcop-lite-monitor.sh ]]; then
+                load_function "$1" cancel_config_on_eof || return 1
+            fi
+            ;;
         check_and_limit_traffic)
             for helper in shutdown_state_value shutdown_task_token_from_state pending_shutdown_matches_owned_state; do
                 load_function "$1" "$helper" || return 1
@@ -3860,6 +3866,343 @@ test_status_line_reports_unreadable_crontab() {
     fi
 }
 
+# ---- 1.2.1：配置保存、前导零分钟数、停用状态与输入结束（EOF） ----
+
+# 限额减容错只用到减法；kvm 测试机没有 bc，CI 有。统一用 awk 代替，保证两边结果一致。
+# shellcheck disable=SC2317,SC2329
+subtract_bc() { awk '$2 == "-" { print $1 - $3; next } { exit 1 }'; }
+
+# 在后台运行函数，超过期限即强杀（防止死循环拖住测试）。$1=秒数，$2=输入文件，其余为命令。
+run_with_deadline() {
+    local seconds="$1" input="$2" pid ticks=0
+    shift 2
+    # 生产脚本不开 set -u；这里关掉，避免未设置变量让函数提前退出而掩盖真实行为。
+    ( set +u; "$@" ) < "$input" > /dev/null 2>&1 &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if [ "$ticks" -ge $((seconds * 10)) ]; then
+            kill -9 "$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            return 124
+        fi
+        sleep 0.1
+        ticks=$((ticks + 1))
+    done
+    wait "$pid"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+setup_post_save_case() {
+    ENFORCEMENT_STATE_FILE="$1/enforcement"
+    LOG_FILE="$1/log"
+    TRAFFIC_UNIT=decimal
+    TRAFFIC_LIMIT=500
+    TRAFFIC_TOLERANCE=1
+    load_function "$MONITOR_SCRIPT" is_decimal || return 1
+    load_function "$MONITOR_SCRIPT" compare_decimal || return 1
+    load_function "$MONITOR_SCRIPT" configure_post_save_enforcement || return 1
+    bc() { subtract_bc; }
+    clear_owned_tc_rules() { printf '%s\n' called > "$POST_SAVE_WORK/tc-cleared"; }
+    clear_owned_shutdown_schedule() { printf '%s\n' called > "$POST_SAVE_WORK/shutdown-cleared"; }
+    write_enforcement_state_file() {
+        printf 'MODE=%s\nUNTIL_EPOCH=%s\nREASON=%s\n' "$1" "$2" "$3" > "$4"
+    }
+}
+
+# 1.2.0：用量低于阈值时函数末句 `[ -n "" ] && echo` 返回 1，首次配置被整体回滚。
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_post_save_below_threshold_succeeds() {
+    POST_SAVE_WORK=$(mktemp -d "$TEST_ROOT/post-save-below.XXXXXX") || return 1
+    setup_post_save_case "$POST_SAVE_WORK" || return 1
+    printf '%s\n' 'MODE=paused' > "$ENFORCEMENT_STATE_FILE"
+    get_traffic_usage() { printf '%s\n' 55.68; }
+
+    configure_post_save_enforcement < /dev/null > "$POST_SAVE_WORK/out" || return 1
+    assert_file_content called "$POST_SAVE_WORK/tc-cleared" || return 1
+    assert_file_content called "$POST_SAVE_WORK/shutdown-cleared" || return 1
+    assert_absent "$ENFORCEMENT_STATE_FILE"
+}
+
+# 已超额并选择“2) 立即执行”同样没有提示语，1.2.0 也会返回 1。
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_post_save_immediate_choice_succeeds() {
+    POST_SAVE_WORK=$(mktemp -d "$TEST_ROOT/post-save-now.XXXXXX") || return 1
+    setup_post_save_case "$POST_SAVE_WORK" || return 1
+    get_traffic_usage() { printf '%s\n' 600; }
+
+    configure_post_save_enforcement <<< 2 > "$POST_SAVE_WORK/out" || return 1
+    assert_file_content called "$POST_SAVE_WORK/tc-cleared" || return 1
+    assert_absent "$ENFORCEMENT_STATE_FILE"
+}
+
+# 宽限分钟数“08”：1.2.0 在 $((08 * 60)) 处按八进制报错，整个调用链中止。
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_post_save_grace_accepts_leading_zero() {
+    local now until_epoch
+    POST_SAVE_WORK=$(mktemp -d "$TEST_ROOT/post-save-grace.XXXXXX") || return 1
+    setup_post_save_case "$POST_SAVE_WORK" || return 1
+    get_traffic_usage() { printf '%s\n' 600; }
+
+    now=$(date +%s)
+    configure_post_save_enforcement <<< $'1\n08' > "$POST_SAVE_WORK/out" || return 1
+    grep -Fxq 'MODE=grace' "$ENFORCEMENT_STATE_FILE" || return 1
+    until_epoch=$(sed -n 's/^UNTIL_EPOCH=//p' "$ENFORCEMENT_STATE_FILE")
+    [ "$until_epoch" -ge $((now + 480)) ] && [ "$until_epoch" -le $((now + 485)) ] || return 1
+    grep -Fq '8 分钟' "$POST_SAVE_WORK/out"
+}
+
+# 开机宽限“08”：1.2.0 在 tc_boot_grace_active 中崩溃，超额时 TC 永远不会下发。
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_boot_grace_leading_zero_does_not_abort() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/boot-grace-zero.XXXXXX") || return 1
+    load_function "$MONITOR_SCRIPT" tc_boot_grace_active || return 1
+    owned_tc_limit_active() { return 1; }
+    TC_BOOT_GRACE_MINUTES=08
+    ( tc_boot_grace_active; printf 'rc=%s\n' "$?" ) > "$work/out" 2>&1
+    grep -Eq '^rc=[01]$' "$work/out" || return 1
+    ! grep -Fq 'value too great' "$work/out"
+}
+
+# 配置文件里已有的“08”在读取时规范为 8，而不是被当成非法值或八进制。
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_validate_config_normalizes_boot_grace() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/validate-boot-grace.XXXXXX") || return 1
+    LOG_FILE="$work/log"
+    load_function "$MONITOR_SCRIPT" validate_config || return 1
+    load_function "$MONITOR_SCRIPT" is_decimal || return 1
+    load_function "$MONITOR_SCRIPT" compare_decimal || return 1
+    command_exists() { return 1; }
+    vnstat_max_bandwidth_valid() { return 0; }
+    TRAFFIC_MODE=total TRAFFIC_PERIOD=monthly TRAFFIC_LIMIT=500 TRAFFIC_TOLERANCE=1
+    TRAFFIC_UNIT=decimal PERIOD_START_DAY=1 LIMIT_SPEED=50 MAIN_INTERFACE=eth0 LIMIT_MODE=tc
+    TC_BOOT_GRACE_MINUTES=08 VNSTAT_MAX_BANDWIDTH=0 DISABLED=false ALLOW_PARTIAL_HISTORY=false
+    validate_config > /dev/null 2>&1 || return 1
+    [ "$TC_BOOT_GRACE_MINUTES" = 8 ]
+}
+
+# 主菜单“限制执行”状态行：开机宽限“09”时 1.2.0 在打印菜单选项之前崩溃。
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_main_enforcement_overview_leading_zero_boot_grace() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/main-boot-grace-zero.XXXXXX") || return 1
+    WORK_DIR="$work"
+    ENFORCEMENT_STATE_FILE="$work/enforcement_state"
+    CYAN='' YELLOW='' GREEN='' RED='' NC=''
+    printf '%s\n' 'LIMIT_MODE=tc' 'TC_BOOT_GRACE_MINUTES=09' > "$work/traffic_monitor_config.txt"
+    load_function "$ROOT_DIR/trafficcop-lite.sh" lite_state_value || return 1
+    load_function "$ROOT_DIR/trafficcop-lite.sh" show_enforcement_overview || return 1
+    ( show_enforcement_overview; printf 'rc=%s\n' "$?" ) > "$work/out" 2>&1
+    grep -Fq '限制执行:' "$work/out" || return 1
+    grep -Eq '^rc=0$' "$work/out"
+}
+
+# 机器限速“限制执行控制”：宽限“08”在 1.2.0 中先清掉 TC、再崩溃，宽限没写上。
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_machine_grace_and_boot_grace_accept_leading_zero() {
+    local work now until_epoch
+    work=$(mktemp -d "$TEST_ROOT/machine-grace-zero.XXXXXX") || return 1
+    WORK_DIR="$work"
+    CONFIG_FILE="$work/traffic_monitor_config.txt"
+    ENFORCEMENT_STATE_FILE="$work/enforcement_state"
+    CYAN='' NC=''
+    printf '%s\n' 'LIMIT_MODE=tc' 'TC_BOOT_GRACE_MINUTES=10' > "$CONFIG_FILE"
+    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" manage_enforcement_control || return 1
+    acquire_monitor_cleanup_lock() { return 0; }
+    release_monitor_cleanup_lock() { return 0; }
+    clear_tc_rules() { return 0; }
+    cancel_owned_shutdown() { return 0; }
+    write_enforcement_state() {
+        printf 'MODE=%s\nUNTIL_EPOCH=%s\nREASON=%s\n' "$1" "$2" "$3" > "$ENFORCEMENT_STATE_FILE"
+    }
+
+    now=$(date +%s)
+    ( manage_enforcement_control <<< $'2\n08' ) > "$work/out" 2>&1 || return 1
+    until_epoch=$(sed -n 's/^UNTIL_EPOCH=//p' "$ENFORCEMENT_STATE_FILE")
+    [ -n "$until_epoch" ] && [ "$until_epoch" -ge $((now + 480)) ] && [ "$until_epoch" -le $((now + 485)) ] || return 1
+
+    ( manage_enforcement_control <<< $'4\n08' ) > "$work/out" 2>&1 || return 1
+    grep -Fxq 'TC_BOOT_GRACE_MINUTES=8' "$CONFIG_FILE"
+}
+
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+setup_eof_wizard_case() {
+    CONFIG_FILE="$1/config"
+    ENFORCEMENT_STATE_FILE="$1/enforcement"
+    TC_STATE_FILE="$1/tc-state"
+    SHUTDOWN_STATE_FILE="$1/shutdown-state"
+    LOG_FILE="$1/log"
+    load_function "$MONITOR_SCRIPT" restore_file_snapshot || return 1
+    load_function "$MONITOR_SCRIPT" restore_monitor_config_snapshot || return 1
+    load_function "$MONITOR_SCRIPT" initial_config || return 1
+    setup_initial_config_transaction_mocks
+    rollback_initial_vnstat_transaction() { printf '%s\n' rolled-back >> "$EOF_WORK/vnstat-rollback"; }
+    get_main_interface() { printf '%s\n' 'eth0'; }
+    prompt_vnstat_max_bandwidth() { return 0; }
+    ensure_vnstat_runtime_config() { return 0; }
+    ensure_vnstat_interface() { return 0; }
+    ensure_vnstat_daily_retention() { return 0; }
+    configure_history_policy() { return 0; }
+    bc() { mock_bc; }
+    write_config() { printf '%s\n' 'new-config' > "$CONFIG_FILE"; }
+    configure_post_save_enforcement() { return 0; }
+}
+
+# 输入在任何一步结束都应取消本次配置并回滚 vnStat 事务；1.2.0 在 4 个循环里死循环（两处还不停写日志），
+# 在限速/宽限两步则用默认值继续并保存。
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_monitor_config_eof_cancels_without_looping() {
+    local partial rc
+    EOF_WORK=$(mktemp -d "$TEST_ROOT/config-eof.XXXXXX") || return 1
+    setup_eof_wizard_case "$EOF_WORK" || return 1
+    for partial in '' $'3\n' $'3\nm\n1\n1\n' $'3\nm\n1\n1\n100\n' $'3\nm\n1\n1\n100\n10\n' \
+        $'3\nm\n1\n1\n100\n10\n1\n' $'3\nm\n1\n1\n100\n10\n1\n100\n'; do
+        rm -f "$CONFIG_FILE" "$EOF_WORK/vnstat-rollback"
+        printf '%s' "$partial" > "$EOF_WORK/input"
+        rc=0
+        run_with_deadline 5 "$EOF_WORK/input" initial_config || rc=$?
+        [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] || return 1
+        assert_absent "$CONFIG_FILE" || return 1
+        assert_file_content rolled-back "$EOF_WORK/vnstat-rollback" || return 1
+    done
+    # 完整输入仍能保存。
+    printf '%s' $'3\nm\n1\n1\n100\n10\n1\n100\n10\n' > "$EOF_WORK/input"
+    run_with_deadline 5 "$EOF_WORK/input" initial_config || return 1
+    assert_file_content 'new-config' "$CONFIG_FILE"
+}
+
+# 网卡检测失败时的选择循环：EOF 必须返回失败，而不是无限打印“请输入一个有效的接口名称”。
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_interface_prompt_eof_returns_failure() {
+    local work rc=0
+    work=$(mktemp -d "$TEST_ROOT/iface-eof.XXXXXX") || return 1
+    LOG_FILE="$work/log"
+    load_function "$MONITOR_SCRIPT" get_main_interface || return 1
+    ip() { return 0; }
+    : > "$work/input"
+    run_with_deadline 5 "$work/input" get_main_interface || rc=$?
+    [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ]
+}
+
+# Telegram 首次配置：EOF 时 1.2.0 在 Token 等 4 个循环里死循环。
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_telegram_config_eof_cancels() {
+    local work partial rc
+    work=$(mktemp -d "$TEST_ROOT/telegram-eof.XXXXXX") || return 1
+    load_function "$TELEGRAM_SCRIPT" initial_config || return 1
+    load_function "$TELEGRAM_SCRIPT" is_valid_timezone || return 1
+    write_config() { printf '%s\n' written > "$work/written"; }
+    read_config() { return 0; }
+    BOT_TOKEN='' CHAT_ID='' MACHINE_NAME='' DAILY_REPORT_TIME='' REPORT_TIMEZONE='' TG_DISABLED=false
+    for partial in '' $'123:abc\n' $'123:abc\n42\n' $'123:abc\n42\nnode\n' $'123:abc\n42\nnode\n25:00\n' \
+        $'123:abc\n42\nnode\n01:00\n'; do
+        printf '%s' "$partial" > "$work/input"
+        rc=0
+        run_with_deadline 5 "$work/input" initial_config || rc=$?
+        [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] || return 1
+        assert_absent "$work/written" || return 1
+    done
+}
+
+# 停用（DISABLED=true）后从菜单打开流量监控：1.2.0 会重装 cron 并执行一轮限速判断。
+# “是否修改配置”只有 y/Y 才进入向导。
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_monitor_interactive_respects_disabled_and_explicit_yes() {
+    local work answer
+    work=$(mktemp -d "$TEST_ROOT/interactive-disabled.XXXXXX") || return 1
+    (
+        set +u   # monitor main 里有未加默认值的 $1；生产脚本不开 set -u
+        load_function "$MONITOR_SCRIPT" main || exit 1
+        WORK_DIR="$work/runtime"
+        LOCK_FILE="$WORK_DIR/monitor.lock"
+        LOG_FILE="$WORK_DIR/monitor.log"
+        LOG_MAX_LINES=100
+        mkdir -p "$WORK_DIR"
+        migrate_files() { :; }
+        trim_log_file() { :; }
+        flock() { return 0; }
+        check_and_install_packages() { return 0; }
+        check_existing_setup() { return 0; }
+        read_config() { DISABLED=true; return 0; }
+        ensure_vnstat_runtime_config() { return 0; }
+        show_current_config() { :; }
+        initial_config() { printf '%s\n' wizard >> "$work/calls"; }
+        setup_crontab() { printf '%s\n' cron >> "$work/calls"; }
+        get_traffic_usage() { printf '%s\n' 1; }
+        get_period_start_date() { printf '%s\n' 2026-11-01; }
+        check_and_limit_traffic() { printf '%s\n' enforce >> "$work/calls"; }
+        main <<< y > "$work/out-disabled" 2>&1
+    )
+    assert_absent "$work/calls" || return 1
+    grep -Fq '停用' "$work/out-disabled" || return 1
+
+    for answer in n '' x; do
+        rm -f "$work/calls"
+        (
+            set +u   # monitor main 里有未加默认值的 $1；生产脚本不开 set -u
+        load_function "$MONITOR_SCRIPT" main || exit 1
+            WORK_DIR="$work/runtime"
+            LOCK_FILE="$WORK_DIR/monitor.lock"
+            LOG_FILE="$WORK_DIR/monitor.log"
+            LOG_MAX_LINES=100
+            migrate_files() { :; }
+            trim_log_file() { :; }
+            flock() { return 0; }
+            check_and_install_packages() { return 0; }
+            check_existing_setup() { return 0; }
+            read_config() { DISABLED=false; return 0; }
+            ensure_vnstat_runtime_config() { return 0; }
+            show_current_config() { :; }
+            initial_config() { printf '%s\n' wizard >> "$work/calls"; }
+            setup_crontab() { :; }
+            get_traffic_usage() { printf '%s\n' 1; }
+            get_period_start_date() { printf '%s\n' 2026-11-01; }
+            check_and_limit_traffic() { :; }
+            main <<< "$answer" > /dev/null 2>&1
+        )
+        assert_absent "$work/calls" || return 1
+    done
+    (
+        set +u   # monitor main 里有未加默认值的 $1；生产脚本不开 set -u
+        load_function "$MONITOR_SCRIPT" main || exit 1
+        WORK_DIR="$work/runtime"
+        LOCK_FILE="$WORK_DIR/monitor.lock"
+        LOG_FILE="$WORK_DIR/monitor.log"
+        LOG_MAX_LINES=100
+        migrate_files() { :; }
+        trim_log_file() { :; }
+        flock() { return 0; }
+        check_and_install_packages() { return 0; }
+        check_existing_setup() { return 0; }
+        read_config() { DISABLED=false; return 0; }
+        ensure_vnstat_runtime_config() { return 0; }
+        show_current_config() { :; }
+        initial_config() { printf '%s\n' wizard >> "$work/calls"; }
+        setup_crontab() { :; }
+        get_traffic_usage() { printf '%s\n' 1; }
+        get_period_start_date() { printf '%s\n' 2026-11-01; }
+        check_and_limit_traffic() { :; }
+        main <<< Y > /dev/null 2>&1
+    )
+    assert_file_content wizard "$work/calls"
+}
+
+# check_and_limit_traffic 自身也要尊重 DISABLED（纵深防御，避免其他入口绕过）。
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_check_and_limit_respects_disabled() {
+    local work
+    work=$(mktemp -d "$TEST_ROOT/limit-disabled.XXXXXX") || return 1
+    LOG_FILE="$work/log"
+    load_function "$MONITOR_SCRIPT" check_and_limit_traffic || return 1
+    get_traffic_usage() { printf '%s\n' called > "$work/usage"; printf '%s\n' 999; }
+    apply_tc_limit() { printf '%s\n' called > "$work/tc"; }
+    DISABLED=true LIMIT_MODE=tc TRAFFIC_LIMIT=1 TRAFFIC_TOLERANCE=0
+    check_and_limit_traffic > /dev/null 2>&1 || return 1
+    assert_absent "$work/usage" || return 1
+    assert_absent "$work/tc"
+}
+
 # Additional IFB tests share the function extractor and private mock workspace.
 # shellcheck source=tests/ifb-regression.sh
 # shellcheck disable=SC1091
@@ -4041,6 +4384,19 @@ run_root_test 'logs and status preserve absent install and insecure permissions'
 run_test 'IFB operations audit changes but not unchanged apply' test_ifb_operation_audit_and_unchanged_apply
 run_test 'enforcement controls audit success and failure safely' test_enforcement_audit_success_failure_and_no_input_echo
 run_test 'single-port JSON queries isolate unrelated legacy fw output' test_single_port_filter_json_excludes_unrelated_fw_printer
+
+run_test 'post-save enforcement succeeds below the threshold (1.2.1)' test_post_save_below_threshold_succeeds
+run_test 'post-save enforcement succeeds when enforcing immediately (1.2.1)' test_post_save_immediate_choice_succeeds
+run_test 'post-save grace accepts minutes with a leading zero (1.2.1)' test_post_save_grace_accepts_leading_zero
+run_test 'boot grace with a leading zero does not abort the monitor (1.2.1)' test_boot_grace_leading_zero_does_not_abort
+run_test 'config validation normalizes a leading-zero boot grace (1.2.1)' test_validate_config_normalizes_boot_grace
+run_test 'main menu enforcement line survives a leading-zero boot grace (1.2.1)' test_main_enforcement_overview_leading_zero_boot_grace
+run_test 'machine grace and boot grace accept a leading zero (1.2.1)' test_machine_grace_and_boot_grace_accept_leading_zero
+run_test 'monitor wizard cancels on end of input at every prompt (1.2.1)' test_monitor_config_eof_cancels_without_looping
+run_test 'interface prompt returns failure on end of input (1.2.1)' test_interface_prompt_eof_returns_failure
+run_test 'telegram setup cancels on end of input (1.2.1)' test_telegram_config_eof_cancels
+run_test 'interactive monitor respects DISABLED and needs an explicit yes (1.2.1)' test_monitor_interactive_respects_disabled_and_explicit_yes
+run_test 'limit check honours DISABLED (1.2.1)' test_check_and_limit_respects_disabled
 
 printf '\n%d passed, %d failed, %d skipped\n' "$PASSED" "$FAILED" "$SKIPPED"
 [ "$FAILED" -eq 0 ]

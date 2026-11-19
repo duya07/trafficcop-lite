@@ -24,7 +24,7 @@ MONITOR_HEALTH_FILE="$WORK_DIR/monitor_health"
 MONITOR_ALERT_STATE_FILE="$WORK_DIR/last_monitor_alert"
 MONITOR_ALERT_INTERVAL="${MONITOR_ALERT_INTERVAL:-21600}"   # 同一异常最多每 6 小时提醒一次
 MONITOR_STALE_SECONDS="${MONITOR_STALE_SECONDS:-600}"       # 健康状态超过 10 分钟未更新视为监控未运行
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 
 # Keep this small audit writer identical in the four standalone distribution scripts.
 # Only fixed event/result values are accepted; extra arguments are never recorded.
@@ -403,7 +403,7 @@ initial_config() {
     else
         echo "请输入Telegram Bot Token: "
     fi
-    read -r new_token
+    read -r new_token || { echo "输入已结束，Telegram 配置未保存。"; return 1; }
     # 如果输入为空且有原配置，保留原配置
     if [[ -z "$new_token" ]] && [[ -n "$BOT_TOKEN" ]]; then
         new_token="$BOT_TOKEN"
@@ -412,7 +412,7 @@ initial_config() {
     # 如果还是空（首次配置），要求必须输入
     while [[ -z "$new_token" ]]; do
         echo "Bot Token 不能为空。请重新输入: "
-        read -r new_token
+        read -r new_token || { echo "输入已结束，Telegram 配置未保存。"; return 1; }
     done
 
     # Chat ID
@@ -421,14 +421,14 @@ initial_config() {
     else
         echo "请输入Telegram Chat ID: "
     fi
-    read -r new_chat_id
+    read -r new_chat_id || { echo "输入已结束，Telegram 配置未保存。"; return 1; }
     if [[ -z "$new_chat_id" ]] && [[ -n "$CHAT_ID" ]]; then
         new_chat_id="$CHAT_ID"
         echo "  → 保留原配置"
     fi
     while [[ -z "$new_chat_id" ]]; do
         echo "Chat ID 不能为空。请重新输入: "
-        read -r new_chat_id
+        read -r new_chat_id || { echo "输入已结束，Telegram 配置未保存。"; return 1; }
     done
 
     # 机器名称
@@ -437,14 +437,14 @@ initial_config() {
     else
         echo "请输入机器名称: "
     fi
-    read -r new_machine_name
+    read -r new_machine_name || { echo "输入已结束，Telegram 配置未保存。"; return 1; }
     if [[ -z "$new_machine_name" ]] && [[ -n "$MACHINE_NAME" ]]; then
         new_machine_name="$MACHINE_NAME"
         echo "  → 保留原配置"
     fi
     while [[ -z "$new_machine_name" ]]; do
         echo "机器名称不能为空。请重新输入: "
-        read -r new_machine_name
+        read -r new_machine_name || { echo "输入已结束，Telegram 配置未保存。"; return 1; }
     done
 
     # 每日报告时间
@@ -453,23 +453,23 @@ initial_config() {
     else
         echo "请输入每日报告时间 (格式 HH:MM，例如 01:00): "
     fi
-    read -r new_daily_report_time
+    read -r new_daily_report_time || { echo "输入已结束，Telegram 配置未保存。"; return 1; }
     if [[ -z "$new_daily_report_time" ]] && [[ -n "$DAILY_REPORT_TIME" ]]; then
         new_daily_report_time="$DAILY_REPORT_TIME"
         echo "  → 保留原配置"
     fi
     while [[ ! $new_daily_report_time =~ ^([0-1][0-9]|2[0-3]):[0-5][0-9]$ ]]; do
         echo "时间格式不正确。请重新输入 (HH:MM): "
-        read -r new_daily_report_time
+        read -r new_daily_report_time || { echo "输入已结束，Telegram 配置未保存。"; return 1; }
     done
 
     REPORT_TIMEZONE="${REPORT_TIMEZONE:-Asia/Shanghai}"
     echo "请输入每日报告时区 [当前: $REPORT_TIMEZONE，例如 Asia/Shanghai 或 UTC]: "
-    read -r new_report_timezone
+    read -r new_report_timezone || { echo "输入已结束，Telegram 配置未保存。"; return 1; }
     new_report_timezone="${new_report_timezone:-$REPORT_TIMEZONE}"
     while ! is_valid_timezone "$new_report_timezone"; do
         echo "时区无效，请重新输入: "
-        read -r new_report_timezone
+        read -r new_report_timezone || { echo "输入已结束，Telegram 配置未保存。"; return 1; }
     done
 
     # 更新配置文件（使用引号防止空格等特殊字符问题）

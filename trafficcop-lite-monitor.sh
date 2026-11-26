@@ -2942,19 +2942,30 @@ clear_owned_shutdown_schedule() {
     fi
 }
 
+# 保存配置时调用的 1.x 运行函数（读取用量、撤销限速、清理关机记录）会打印带时间戳的说明行，并经 tee 写进日志。
+# 2.0 先把它们的屏幕输出写进临时文件：成功时只留在日志里，失败时去掉时间戳显示原因。$1=临时文件
+config_show_step_output() {
+    [ -s "$1" ] || return 0
+    sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} /  /' "$1" >&2
+}
+
 configure_post_save_enforcement() {
     local current_usage limit_threshold unit_label policy_choice grace_minutes=10 until_epoch
     local comparison_status desired_mode="" desired_reason="" desired_message=""
     local enforcement_candidate="${ENFORCEMENT_STATE_FILE}.config-candidate.$$"
+    local step_output="${ENFORCEMENT_STATE_FILE}.config-output.$$"
 
     CONFIG_TC_CLEAR_ATTEMPTED=false
     CONFIG_SHUTDOWN_CLEAR_ATTEMPTED=false
-    rm -f "$enforcement_candidate"
+    rm -f "$enforcement_candidate" "$step_output"
 
-    if ! current_usage=$(get_traffic_usage); then
+    if ! current_usage=$(get_traffic_usage 2> "$step_output"); then
+        config_show_step_output "$step_output"
+        rm -f "$step_output"
         echo "无法可靠读取当前流量，已取消本次配置；原监控配置不会被覆盖。"
         return 1
     fi
+    rm -f "$step_output"
     if ! is_decimal "$current_usage"; then
         echo "当前流量格式无效，已取消本次配置；现有执行策略保持不变。"
         return 1
@@ -3033,16 +3044,20 @@ configure_post_save_enforcement() {
     fi
 
     # 先撤销 TC；若它失败，计划关机尚未触碰。后续任何失败由外层配置事务补偿旧运行态。
+    # 两个函数都在当前 shell 里执行（不能放进 $(...)），屏幕输出先写进临时文件，见 config_show_step_output。
     CONFIG_TC_CLEAR_ATTEMPTED=true
-    if ! clear_owned_tc_rules "配置已更新"; then
-        rm -f "$enforcement_candidate"
+    if ! clear_owned_tc_rules "配置已更新" > "$step_output"; then
+        config_show_step_output "$step_output"
+        rm -f "$enforcement_candidate" "$step_output"
         return 1
     fi
     CONFIG_SHUTDOWN_CLEAR_ATTEMPTED=true
-    if ! clear_owned_shutdown_schedule; then
-        rm -f "$enforcement_candidate"
+    if ! clear_owned_shutdown_schedule > "$step_output"; then
+        config_show_step_output "$step_output"
+        rm -f "$enforcement_candidate" "$step_output"
         return 1
     fi
+    rm -f "$step_output"
     if [ "$desired_mode" = "none" ]; then
         rm -f "$ENFORCEMENT_STATE_FILE" || return 1
     elif ! mv -f "$enforcement_candidate" "$ENFORCEMENT_STATE_FILE"; then

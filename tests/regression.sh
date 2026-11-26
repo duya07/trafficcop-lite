@@ -110,6 +110,12 @@ load_function() {
                 load_function "$1" disable_restore_cron 2> /dev/null || true
             fi
             ;;
+        configure_post_save_enforcement)
+            # 2.0：保存流程里旧运行函数的说明行先写进临时文件，失败时才显示；换回旧版做红绿对照时没有这个函数，忽略。
+            if [[ "$1" == *trafficcop-lite-monitor.sh ]]; then
+                load_function "$1" config_show_step_output 2> /dev/null || true
+            fi
+            ;;
     esac
 
     function_body=$(extract_function "$1" "$2") || return 1
@@ -4932,6 +4938,37 @@ test_monitor_main_writes_no_log_before_round_buffer() {
     [ "$out" = '  ✓ 检查完成：流量正常。' ] || return 1
     assert_absent "$LOG_FILE"
 }
+
+# 保存配置时屏幕上不出现带时间戳的日志行（2.0）：读取用量、撤销 NTC 限速、清理关机记录这些 1.x 运行函数的说明行
+# 成功时只留在日志里（1.x 会在「保存？」和「配置已保存」之间打出「周期开始日期…」「配置已更新：未发现本脚本 TC
+# 状态标记…」）；某一步失败时把原因去掉时间戳后显示出来。
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_post_save_keeps_log_lines_off_screen() {
+    local out
+    POST_SAVE_WORK=$(mktemp -d "$TEST_ROOT/post-save-quiet.XXXXXX") || return 1
+    setup_post_save_case "$POST_SAVE_WORK" || return 1
+    get_traffic_usage() {
+        echo '2026-01-01 08:00:00 周期开始日期: 2026-01-01, 周期结束日期: 2026-01-31' >&2
+        printf '%s\n' 12.5
+    }
+    clear_owned_tc_rules() { echo "2026-01-01 08:00:01 $1：未发现本脚本 TC 状态标记，保留现有 qdisc。" | tee -a "$LOG_FILE"; }
+    clear_owned_shutdown_schedule() { echo '2026-01-01 08:00:02 已清理上次开机遗留的关机状态。' | tee -a "$LOG_FILE"; }
+
+    out=$(configure_post_save_enforcement < /dev/null 2>&1) || return 1
+    ! grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2} ' <<< "$out" || return 1
+    grep -Fq '未发现本脚本 TC 状态标记' "$LOG_FILE" || return 1
+    grep -Fq '已清理上次开机遗留的关机状态' "$LOG_FILE" || return 1
+
+    clear_owned_tc_rules() { echo "2026-01-01 08:00:01 $1：无法取得统一 TC 层级锁。" | tee -a "$LOG_FILE"; return 1; }
+    if out=$(configure_post_save_enforcement < /dev/null 2>&1); then return 1; fi
+    grep -Fq '配置已更新：无法取得统一 TC 层级锁。' <<< "$out" || return 1
+    ! grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2} ' <<< "$out" || return 1
+
+    get_traffic_usage() { echo '2026-01-01 08:00:00 vnStat 没有这个网卡的数据' >&2; return 1; }
+    if out=$(configure_post_save_enforcement < /dev/null 2>&1); then return 1; fi
+    grep -Fq 'vnStat 没有这个网卡的数据' <<< "$out" || return 1
+    ! grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2} ' <<< "$out"
+}
 # 四个脚本里的共享区块必须与 src/common 一致（CI 也会跑这一条）。
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
 test_common_blocks_are_in_sync() {
@@ -4952,6 +4989,7 @@ run_test 'config set validates arguments and never prompts with --yes (2.0)' tes
 run_test 'status --json is typed and read-only (2.0)' test_monitor_status_json_is_typed_and_read_only
 run_test 'monitor CLI rejects unknown arguments before touching state (2.0)' test_monitor_cli_rejects_unknown_arguments
 run_test 'monitor main writes nothing to the real log before the round buffer (2.0)' test_monitor_main_writes_no_log_before_round_buffer
+run_test 'saving a config keeps timestamped log lines off the screen unless a step fails (2.0)' test_post_save_keeps_log_lines_off_screen
 # ── end 2.0 monitor ──
 
 # ── 2.0 main ──
@@ -5258,6 +5296,47 @@ test_update_recovery_file_failure_only_warns() {
     grep -Fq '共享 TC 自动恢复文件未能更新' <<< "$out"
 }
 
+# 更新只说实话（2.0）：四个脚本仍整组替换（备份与回滚不变），但只有内容确实变化的脚本才显示「已更新」，
+# 没变化的标明「没有变化」（1.x 一律显示「已更新」）。
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_update_reports_only_changed_files() {
+    local work remote_dir out fn name
+    work=$(mktemp -d "$TEST_ROOT/update-changed.XXXXXX") || return 1
+    WORK_DIR="$work/installed"
+    remote_dir="$work/remote"
+    MONITOR_SCRIPT='trafficcop-lite-monitor.sh'
+    TELEGRAM_SCRIPT='trafficcop-lite-telegram.sh'
+    MACHINE_LIMIT_SCRIPT='trafficcop-lite-machine-limit.sh'
+    mkdir -p "$WORK_DIR" "$remote_dir" || return 1
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="2.0.0"' > "$remote_dir/trafficcop-lite.sh"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="2.0.0"' '# 修订' > "$remote_dir/$MONITOR_SCRIPT"
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="2.0.0"' > "$remote_dir/$TELEGRAM_SCRIPT"
+    printf '%s\n' '#!/bin/bash' '# TrafficCop 机器限速管理脚本 v2.13' 'SCRIPT_VERSION="2.0.0"' \
+        > "$remote_dir/$MACHINE_LIMIT_SCRIPT"
+    for name in trafficcop-lite.sh "$TELEGRAM_SCRIPT" "$MACHINE_LIMIT_SCRIPT"; do
+        cp "$remote_dir/$name" "$WORK_DIR/$name" || return 1
+    done
+    printf '%s\n' '#!/bin/bash' 'SCRIPT_VERSION="2.0.0"' > "$WORK_DIR/$MONITOR_SCRIPT"
+    (cd "$remote_dir" && sha256sum trafficcop-lite*.sh > SHA256SUMS) || return 1
+    for fn in script_version_from_file version_is_newer validate_update_candidate verify_installed_scripts \
+        rollback_script_update update_scripts; do
+        load_function "$ROOT_DIR/trafficcop-lite.sh" "$fn" || return 1
+    done
+    ensure_work_dir() { mkdir -p "$WORK_DIR"; }
+    download_url_to_file() { cp "$remote_dir/$(basename "$1")" "$2"; }
+    install_shortcut_link() { :; }
+    install_tc_recovery_service_files() { :; }
+
+    out=$(update_scripts 'https://example.invalid/release' 2>&1) || return 1
+    grep -Fq "✓ 已更新 $MONITOR_SCRIPT" <<< "$out" || return 1
+    for name in trafficcop-lite.sh "$TELEGRAM_SCRIPT" "$MACHINE_LIMIT_SCRIPT"; do
+        ! grep -Fq "已更新 $name" <<< "$out" || return 1
+        grep -Fq "$name 没有变化" <<< "$out" || return 1
+        cmp -s "$remote_dir/$name" "$WORK_DIR/$name" || return 1
+    done
+    cmp -s "$remote_dir/$MONITOR_SCRIPT" "$WORK_DIR/$MONITOR_SCRIPT"
+}
+
 # 主菜单版式：仪表盘与菜单按显示宽度排版，120/80/60/40 列下每行都不超宽；宽屏两栏竖排编号，窄屏改为
 # 分组单列；不在终端时（含 NO_COLOR、TERM=dumb）不输出颜色转义。正常、已限速、宽限、未配置四种状态各渲染一次。
 # shellcheck disable=SC1090,SC1091,SC2034,SC2209,SC2317,SC2329
@@ -5318,6 +5397,7 @@ run_test 'uninstall asks first and removes cron only after cleanup (2.0)' test_u
 run_test 'stop keeps cron until TC and shutdown cleanup succeed (2.0)' test_stop_all_services_keeps_cron_until_cleanup_succeeds
 run_test 'main shutdown cleanup never claims a cancellation or prompts mid-way; uninstall asks first (2.0)' test_main_shutdown_cleanup_is_truthful_and_asks_first
 run_test 'update only warns when shared recovery files cannot be refreshed (2.0)' test_update_recovery_file_failure_only_warns
+run_test 'update marks only changed scripts as updated (2.0)' test_update_reports_only_changed_files
 run_test 'main menu fits 120/80/60/40 columns without colour escapes (2.0)' test_main_menu_fits_terminal_widths
 # ── end 2.0 main ──
 

@@ -4,7 +4,7 @@
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
 SCRIPT_VERSION="2.0.0"
-LAST_UPDATE="2026-11-19"
+LAST_UPDATE="2026-11-26"
 
 WORK_DIR="/etc/trafficcop-lite"
 DEPENDENCY_STATE_DIR="${DEPENDENCY_STATE_DIR:-/var/lib/trafficcop-lite/dependencies}"
@@ -1957,7 +1957,7 @@ update_scripts() {
     local scripts=("trafficcop-lite.sh" "$MONITOR_SCRIPT" "$TELEGRAM_SCRIPT" "$MACHINE_LIMIT_SCRIPT")
     local temp_files=()
     local script_name tmp_file url backup_dir candidate_version
-    local release_changed=false
+    local release_changed=false changed_list=""
 
     UPDATE_PREVIOUS_VERSION=$(script_version_from_file "$WORK_DIR/trafficcop-lite.sh")
     UPDATE_NEW_VERSION=""
@@ -2020,6 +2020,7 @@ update_scripts() {
 
         if [ ! -f "$WORK_DIR/$script_name" ] || ! cmp -s "$tmp_file" "$WORK_DIR/$script_name"; then
             release_changed=true
+            changed_list+=" $script_name"
         fi
 
         temp_files+=("$tmp_file")
@@ -2070,7 +2071,12 @@ update_scripts() {
             ntc_operation_log update failure
             return 1
         fi
-        echo -e "${GREEN}✓ 已更新 $script_name${NC}"
+        # 仍整组替换（备份与回滚按整组处理），但只把内容确实变化的脚本说成「已更新」。
+        if [[ "$changed_list " == *" $script_name "* ]]; then
+            echo -e "${GREEN}✓ 已更新 $script_name${NC}"
+        else
+            echo "  $script_name 没有变化"
+        fi
     done
 
     if ! verify_installed_scripts; then

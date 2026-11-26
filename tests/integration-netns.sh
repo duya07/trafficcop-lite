@@ -133,6 +133,9 @@ source <(sed \
 export TRAFFIC_PERIOD=monthly
 export PERIOD_START_DAY=1
 export MAIN_INTERFACE=eth0
+# 2.0：开机自动恢复在“开机限速宽限”内会推迟重建 NTC 的整机上限。测试机可能刚开机（uptime 小于
+# 默认 10 分钟），这里关掉开机宽限，让 --auto 恢复的断言与开机时长无关；推迟逻辑由 regression.sh 单独覆盖。
+export TC_BOOT_GRACE_MINUTES=0
 
 # ── Dog 先安装：NTC 读取清单接管 1:1，保留 Dog 的端口类、fw 过滤器与 ifb0 入向。
 dog_cli add 3265 >/dev/null

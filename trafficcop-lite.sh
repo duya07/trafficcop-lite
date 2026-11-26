@@ -3,7 +3,7 @@
 # TrafficCop Lite - 独立版流量监控管理器
 # 基于 ypq123456789/TrafficCop 的流量监控、Telegram 通知与机器限速功能整理。
 
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="2.0.0"
 LAST_UPDATE="2026-11-19"
 
 WORK_DIR="/etc/trafficcop-lite"
@@ -15,8 +15,8 @@ TC_STATE_FILE="$WORK_DIR/tc_limit_state"
 ENFORCEMENT_STATE_FILE="$WORK_DIR/enforcement_state"
 SHUTDOWN_STATE_FILE="$WORK_DIR/shutdown_limit_state"
 MONITOR_LOCK_FILE="$WORK_DIR/traffic_monitor.lock"
-VNSTAT_CONFIG_PATH_FILE="$WORK_DIR/vnstat_config_path"
 ROOT_CRONTAB_LOCK_FILE="${TRAFFICCOP_ROOT_CRONTAB_LOCK_FILE:-$WORK_DIR/root-crontab.lock}"
+INSTALL_CHANGED=false
 TC_RECOVERY_RUNNER="${TRAFFIC_TOOLS_TC_RECOVERY_RUNNER:-/usr/local/sbin/traffic-tools-tc-recovery.sh}"
 TC_RECOVERY_UNIT_FILE="${TRAFFIC_TOOLS_TC_RECOVERY_UNIT_FILE:-/etc/systemd/system/traffic-tools-tc-recovery.service}"
 TC_RECOVERY_SERVICE="traffic-tools-tc-recovery.service"
@@ -28,18 +28,663 @@ REPO="${REPO:-duya07/trafficcop-lite}"
 BRANCH="${BRANCH:-main}"
 RAW_BASE="${RAW_BASE:-https://raw.githubusercontent.com/${REPO}/${BRANCH}}"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[0;33m'
-BLUE='\033[0;34m'
-PURPLE='\033[0;35m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-WHITE='\033[0;37m'
-NC='\033[0m'
-if [ ! -t 1 ] || [ -n "${NO_COLOR+x}" ] || [ "${TERM:-dumb}" = dumb ]; then
-    RED='' GREEN='' YELLOW='' BLUE='' PURPLE='' CYAN='' BOLD='' WHITE='' NC=''
-fi
+# >>> ntc-common:ui >>>
+# 本区块由 tools/sync-common.sh 根据 src/common/ui.sh 生成，请改源文件后运行该脚本，勿直接修改。
+# ── 终端界面（与 Port Traffic Dog 2.1 的 src/16-ui.sh 同一套约定）──────────
+# 标题粗体青色，编号青色，分隔线、组标题与提示变暗；状态用绿/黄/红。
+# 只画横线、不画右边框：东亚歧义宽度按双宽显示的终端会把右边框挤乱。
+# 宽度一律按“显示列数”计算（中日韩全角字符占 2 列）；bash 的 printf %-Ns 按字节补齐，不能用于中文。
+# 只有标准输出是终端、没有设置 NO_COLOR、TERM 不是 dumb 时才输出颜色，日志和管道里没有控制序列。
+# 四个脚本共用同一套颜色，并非每个脚本都用到全部颜色（SC2034 对整个代码块关闭）。
+# shellcheck disable=SC2034
+{
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    PURPLE='\033[0;35m'
+    CYAN='\033[0;36m'
+    WHITE='\033[0;37m'
+    BOLD='\033[1m'
+    BOLD_CYAN='\033[1;36m'
+    DIM='\033[2m'
+    NC='\033[0m'
+    if [ ! -t 1 ] || [ -n "${NO_COLOR+x}" ] || [ "${TERM:-dumb}" = dumb ]; then
+        RED='' GREEN='' YELLOW='' BLUE='' PURPLE='' CYAN='' WHITE='' BOLD='' BOLD_CYAN='' DIM='' NC=''
+    fi
+    UI_RULE_MAX=76
+}
+
+# 把 $2 的显示宽度写入变量 $1（不开子进程，供循环里使用）。
+# 双宽：东亚宽/全角字符（Unicode East_Asian_Width 为 W/F），含常见 emoji；组合附加符与变体选择符为 0。
+ui_measure() {
+    local -n __ui_width_out=$1
+    local __ui_text="$2" __ui_i __ui_c __ui_w=0 LC_CTYPE=C.UTF-8
+    for ((__ui_i = 0; __ui_i < ${#__ui_text}; __ui_i++)); do
+        printf -v __ui_c '%d' "'${__ui_text:__ui_i:1}"
+        if (( __ui_c < 0x300 )); then
+            __ui_w=$((__ui_w + 1))
+        elif (( (__ui_c <= 0x36f) || (__ui_c >= 0x200b && __ui_c <= 0x200f) || (__ui_c >= 0xfe00 && __ui_c <= 0xfe0f) )); then
+            continue
+        elif (( (__ui_c >= 0x1100 && __ui_c <= 0x115f) || (__ui_c >= 0x2e80 && __ui_c <= 0xa4cf) ||
+                (__ui_c >= 0xac00 && __ui_c <= 0xd7a3) || (__ui_c >= 0xf900 && __ui_c <= 0xfaff) ||
+                (__ui_c >= 0xfe30 && __ui_c <= 0xfe4f) || (__ui_c >= 0xff00 && __ui_c <= 0xff60) ||
+                (__ui_c >= 0xffe0 && __ui_c <= 0xffe6) || (__ui_c >= 0x1f300 && __ui_c <= 0x1f64f) ||
+                (__ui_c >= 0x1f680 && __ui_c <= 0x1f6ff) || (__ui_c >= 0x1f900 && __ui_c <= 0x1f9ff) ||
+                (__ui_c >= 0x1fa70 && __ui_c <= 0x1faff) || (__ui_c >= 0x20000 && __ui_c <= 0x3fffd) )); then
+            __ui_w=$((__ui_w + 2))
+        elif (( __ui_c >= 0x231a && __ui_c <= 0x2b55 )) &&
+             (( (__ui_c >= 0x231a && __ui_c <= 0x231b) || (__ui_c >= 0x23e9 && __ui_c <= 0x23ec) || __ui_c == 0x23f0 ||
+                __ui_c == 0x23f3 || (__ui_c >= 0x25fd && __ui_c <= 0x25fe) || (__ui_c >= 0x2614 && __ui_c <= 0x2615) ||
+                (__ui_c >= 0x2648 && __ui_c <= 0x2653) || __ui_c == 0x267f || __ui_c == 0x2693 || __ui_c == 0x26a1 ||
+                (__ui_c >= 0x26aa && __ui_c <= 0x26ab) || (__ui_c >= 0x26bd && __ui_c <= 0x26be) ||
+                (__ui_c >= 0x26c4 && __ui_c <= 0x26c5) || __ui_c == 0x26ce || __ui_c == 0x26d4 || __ui_c == 0x26ea ||
+                (__ui_c >= 0x26f2 && __ui_c <= 0x26f3) || __ui_c == 0x26f5 || __ui_c == 0x26fa || __ui_c == 0x26fd ||
+                __ui_c == 0x2705 || (__ui_c >= 0x270a && __ui_c <= 0x270b) || __ui_c == 0x2728 || __ui_c == 0x274c ||
+                __ui_c == 0x274e || (__ui_c >= 0x2753 && __ui_c <= 0x2755) || __ui_c == 0x2757 ||
+                (__ui_c >= 0x2795 && __ui_c <= 0x2797) || __ui_c == 0x27b0 || __ui_c == 0x27bf ||
+                (__ui_c >= 0x2b1b && __ui_c <= 0x2b1c) || __ui_c == 0x2b50 || __ui_c == 0x2b55 )); then
+            __ui_w=$((__ui_w + 2))
+        else
+            __ui_w=$((__ui_w + 1))
+        fi
+    done
+    __ui_width_out=$__ui_w
+}
+
+ui_width() {
+    local w
+    ui_measure w "$1"
+    printf '%s' "$w"
+}
+
+# 左对齐补齐到 $2 列（超出时原样输出，不截断）。
+ui_pad() {
+    local w
+    ui_measure w "$1"
+    if [ "$w" -lt "$2" ]; then printf '%s%*s' "$1" $(($2 - w)) ''; else printf '%s' "$1"; fi
+}
+
+# 超过 $2 列时截断，末尾加“…”。
+ui_truncate() {
+    local text="$1" max="$2" out="" w=0 cw i ch
+    ui_measure w "$text"
+    if [ "$w" -le "$max" ]; then printf '%s' "$text"; return 0; fi
+    w=0
+    local LC_CTYPE=C.UTF-8
+    for ((i = 0; i < ${#text}; i++)); do
+        ch="${text:i:1}"
+        ui_measure cw "$ch"
+        [ $((w + cw)) -le $((max - 1)) ] || break
+        out+="$ch"; w=$((w + cw))
+    done
+    printf '%s…' "$out"
+}
+
+# 终端列数：优先问标准输入/错误所连的终端（菜单里 stdout 常被 $(...) 捕获），其次 $COLUMNS，默认 80。
+ui_columns() {
+    local size="" columns=""
+    if [ -t 0 ]; then size=$(stty size 2>/dev/null) || size=""
+    elif [ -t 2 ]; then size=$(stty size <&2 2>/dev/null) || size=""   # 先把 stdin 指向终端，再丢弃错误输出
+    fi
+    columns="${size##* }"
+    [[ "$columns" =~ ^[0-9]+$ ]] && [ "$columns" -ge 20 ] || columns="${COLUMNS:-80}"
+    [[ "$columns" =~ ^[0-9]+$ ]] && [ "$columns" -ge 20 ] && [ "$columns" -le 500 ] || columns=80
+    printf '%s' "$columns"
+}
+
+ui_rule() {
+    local w line
+    w=$(( $(ui_columns) - 2 ))
+    [ "$w" -le "$UI_RULE_MAX" ] || w=$UI_RULE_MAX
+    printf -v line '%*s' "$w" ''
+    printf ' %b%s%b\n' "$DIM" "${line// /─}" "$NC"
+}
+
+# 小节标题：空一行，标题与可选副标题，下接分隔线。在终端里按宽度截断：先截副标题，放不下时只留标题。
+ui_title() {
+    local max tw
+    max=$(ui_wrap_width)
+    if [ "$max" -gt 0 ]; then max=$((max - 1)); else max=100000; fi
+    ui_measure tw "$1"
+    printf '\n %b%s%b' "$BOLD_CYAN" "$(ui_truncate "$1" "$max")" "$NC"
+    if [ -n "${2:-}" ] && [ $((tw + 4)) -le "$max" ]; then
+        printf ' %b·%b %s' "$DIM" "$NC" "$(ui_truncate "$2" $((max - tw - 3)))"
+    fi
+    printf '\n'
+    ui_rule
+}
+
+# 菜单项：编号 文本 [变暗的附注]
+ui_option() {
+    printf '   %b%2s.%b %s' "$CYAN" "$1" "$NC" "$2"
+    [ -z "${3:-}" ] || printf '  %b%s%b' "$DIM" "$3" "$NC"
+    printf '\n'
+}
+
+# 折行宽度：标准输出（或 $1 指定的文件描述符）是终端、或显式设置了 COLUMNS 时按终端宽度折行；
+# 输出到文件或管道时不折行（输出 0），日志和脚本解析拿到的仍是完整的一行。
+ui_wrap_width() {
+    if [ -t "${1:-1}" ] || [ -n "${COLUMNS:-}" ]; then
+        ui_columns
+    else
+        printf '0'
+    fi
+}
+
+# 把纯文本（不含颜色码）按显示宽度折成多行，每行不超过 $2 列（0 表示不折行），逐行输出。
+# 优先在空格、中文字符之间和标点之后断行；闭合标点不放在行首；没有可断处（如很长的路径）才硬断。
+ui_wrap() {
+    local text="$1" max="${2:-0}" part line head rest w cw i ch brk
+    local LC_CTYPE=C.UTF-8
+    while IFS= read -r part; do
+        if ! [[ "$max" =~ ^[0-9]+$ ]] || [ "$max" -lt 1 ]; then
+            printf '%s\n' "$part"
+            continue
+        fi
+        ui_measure w "$part"
+        if [ "$w" -le "$max" ]; then
+            printf '%s\n' "$part"
+            continue
+        fi
+        line=""
+        w=0
+        brk=0
+        for ((i = 0; i < ${#part}; i++)); do
+            ch="${part:i:1}"
+            ui_measure cw "$ch"
+            if [ $((w + cw)) -gt "$max" ] && [ -n "$line" ]; then
+                case "$ch" in
+                    '，'|'。'|'、'|'；'|'：'|'）'|'」'|'』'|'！'|'？'|')'|','|'.')
+                        # 闭合标点不放在行首：把前一个字一起带到下一行。
+                        if [ "${#line}" -ge 2 ]; then brk=$((${#line} - 1)); fi
+                        ;;
+                esac
+                if [ "$brk" -gt 0 ]; then
+                    head="${line:0:brk}"
+                    rest="${line:brk}"
+                else
+                    head="$line"
+                    rest=""
+                fi
+                head="${head%"${head##*[! ]}"}"
+                rest="${rest#"${rest%%[! ]*}"}"
+                printf '%s\n' "$head"
+                line="$rest"
+                ui_measure w "$line"
+                brk=0
+                if [ -z "$line" ] && [ "$ch" = " " ]; then
+                    continue
+                fi
+            fi
+            if [ "$cw" -ge 2 ] && [ -n "$line" ]; then
+                brk=${#line}
+            fi
+            line+="$ch"
+            w=$((w + cw))
+            case "$ch" in
+                ' '|'，'|'。'|'、'|'；'|'：'|'）'|'」'|'』'|'！'|'？'|'/') brk=${#line} ;;
+                *) if [ "$cw" -ge 2 ]; then brk=${#line}; fi ;;
+            esac
+        done
+        printf '%s\n' "$line"
+    done <<< "$text"
+}
+
+# 键值行：键补齐到 $5 列（默认 8），$1 为键的颜色，$4 为值的颜色（可空）；值过长时折行，续行与值对齐。
+ui_row() {
+    local key_color="$1" key="$2" value="$3" value_color="${4:-}" kw="${5:-8}" max pad line first=true
+    max=$(ui_wrap_width)
+    if [ "$max" -gt 0 ]; then
+        max=$((max - kw - 4))
+        [ "$max" -ge 10 ] || max=10
+    fi
+    printf -v pad '%*s' $((kw + 4)) ''
+    while IFS= read -r line; do
+        if $first; then
+            printf '  %b%s%b  %b%s%b\n' "$key_color" "$(ui_pad "$key" "$kw")" "$NC" "$value_color" "$line" \
+                "${value_color:+$NC}"
+            first=false
+        else
+            printf '%s%b%s%b\n' "$pad" "$value_color" "$line" "${value_color:+$NC}"
+        fi
+    done < <(ui_wrap "$value" "$max")
+}
+
+# 键值行：键变暗并补齐到 $3 列（默认 8）。
+ui_kv() {
+    ui_row "$DIM" "$1" "$2" "" "${3:-8}"
+}
+
+# 用量行：「已用 / 限额  进度条  百分比  附注」。放不下时先去掉进度条，附注（如「（12 分钟前）」）换到下一行。
+ui_usage_kv() {
+    local key="$1" text="$2" pct="$3" note="${4:-}" kw="${5:-8}" max w wn pad
+    max=$(ui_wrap_width)
+    if [ "$max" -gt 0 ]; then max=$((max - kw - 4)); else max=100000; fi
+    ui_measure w "$text  ${pct}%"
+    printf '  %b%s%b  %s' "$DIM" "$(ui_pad "$key" "$kw")" "$NC" "$text"
+    if [ $((w + 12)) -le "$max" ]; then
+        printf '  %s' "$(ui_bar "$pct")"
+        w=$((w + 12))
+    fi
+    printf '  %s%%' "$pct"
+    if [ -n "$note" ]; then
+        ui_measure wn "$note"
+        if [ $((w + 2 + wn)) -le "$max" ]; then
+            printf '  %b%s%b' "$DIM" "$note" "$NC"
+        else
+            printf -v pad '%*s' $((kw + 4)) ''
+            printf '\n%s%b%s%b' "$pad" "$DIM" "$note" "$NC"
+        fi
+    fi
+    printf '\n'
+}
+
+# 提示与结果行：$1 文件描述符（决定是否折行），$2 前缀（可含颜色），$3 前缀显示宽度，$4 文字颜色（可空），
+# $5 文字；文字按终端宽度折行，续行与文字对齐。
+ui_message() {
+    local fd="$1" prefix="$2" indent="$3" color="$4" text="$5" max pad line
+    max=$(ui_wrap_width "$fd")
+    if [ "$max" -gt 0 ]; then
+        max=$((max - indent))
+        [ "$max" -ge 10 ] || max=10
+    fi
+    printf -v pad '%*s' "$indent" ''
+    while IFS= read -r line; do
+        printf '%b%b%s%b\n' "$prefix" "$color" "$line" "${color:+$NC}"
+        prefix="$pad"
+    done < <(ui_wrap "$text" "$max")
+}
+
+ui_note() {
+    ui_message 1 '  ' 2 "$DIM" "$1"
+}
+
+# 结果行：✓ 成功、! 提醒、✗ 失败（失败写到标准错误）。
+ui_ok() {
+    ui_message 1 "  ${GREEN}✓${NC} " 4 '' "$*"
+}
+
+ui_warn() {
+    ui_message 1 "  ${YELLOW}!${NC} " 4 '' "$*"
+}
+
+ui_err() {
+    ui_message 2 "  ${RED}✗${NC} " 4 '' "$*" >&2
+}
+
+# 读取菜单选择写入变量 $2，提示统一为“请选择 [0-N]”，$3 为附加说明。
+# 读到 EOF 返回 1，调用方据此返回上一级。
+ui_prompt() {
+    local __ui_hint="0-$1"
+    [ -z "${3:-}" ] || __ui_hint+="，$3"
+    read -r -p " 请选择 [${__ui_hint}]: " "$2"
+}
+
+# 等用户按回车；读到 EOF 直接返回。
+ui_pause() {
+    local __ui_pause_answer
+    read -r -p " 按回车继续…" __ui_pause_answer || printf '\n'
+}
+
+# 用量条：$1=百分比（整数，可超过 100），$2=格数（默认 10）。不足 75% 绿色，75%–89% 黄色，90% 起红色。
+ui_bar() {
+    local pct="${1:-0}" cells="${2:-10}" filled i full="" empty="" color
+    [[ "$pct" =~ ^[0-9]{1,9}$ ]] || pct=0
+    pct=$((10#$pct))
+    if [ "$pct" -ge 90 ]; then color="$RED"; elif [ "$pct" -ge 75 ]; then color="$YELLOW"; else color="$GREEN"; fi
+    filled=$(( (pct * cells + 50) / 100 ))
+    [ "$filled" -le "$cells" ] || filled=$cells
+    [ "$pct" -eq 0 ] || [ "$filled" -ge 1 ] || filled=1
+    for ((i = 0; i < cells; i++)); do
+        if [ "$i" -lt "$filled" ]; then full+="█"; else empty+="░"; fi
+    done
+    printf '%b%s%b%b%s%b' "$color" "$full" "$NC" "$DIM" "$empty" "$NC"
+}
+
+# 两组菜单，编号竖排：$1=左组标题 $2=右组标题 $3=左组项数，其后是全部菜单文字（编号从 1 起）。
+# 两列放得下时左右并排（左组 1..k，右组 k+1..n），否则分组单列。“0. 退出/返回”由调用方输出。
+ui_menu_groups() {
+    local left="$1" right="$2" split="$3" columns n rows i lw=0 rw=0 w cell
+    shift 3
+    local -a labels=("$@")
+    n=${#labels[@]}
+    columns=$(ui_columns)
+    for ((i = 0; i < n; i++)); do
+        ui_measure w "${labels[i]}"
+        if [ "$i" -lt "$split" ]; then [ "$w" -le "$lw" ] || lw=$w; else [ "$w" -le "$rw" ] || rw=$w; fi
+    done
+    cell=$((4 + lw + 4))   # 左列：编号“ 1. ”4 列 + 最长文字 + 列间距
+    if [ $((3 + cell + 4 + rw)) -le "$columns" ]; then
+        printf '   %b%s%s%b\n' "$DIM" "$(ui_pad "$left" "$cell")" "$right" "$NC"
+        rows=$(( split > n - split ? split : n - split ))
+        for ((i = 0; i < rows; i++)); do
+            printf '   '
+            if [ "$i" -lt "$split" ]; then
+                printf '%b%2d.%b ' "$CYAN" $((i + 1)) "$NC"
+                if [ $((split + i)) -lt "$n" ]; then
+                    printf '%s' "$(ui_pad "${labels[i]}" $((lw + 4)))"
+                else
+                    printf '%s' "${labels[i]}"
+                fi
+            else
+                printf '%*s' "$cell" ''
+            fi
+            [ $((split + i)) -ge "$n" ] || printf '%b%2d.%b %s' "$CYAN" $((split + i + 1)) "$NC" "${labels[split + i]}"
+            printf '\n'
+        done
+    else
+        printf '   %b%s%b\n' "$DIM" "$left" "$NC"
+        for ((i = 0; i < split; i++)); do ui_option $((i + 1)) "${labels[i]}"; done
+        printf '   %b%s%b\n' "$DIM" "$right" "$NC"
+        for ((i = split; i < n; i++)); do ui_option $((i + 1)) "${labels[i]}"; done
+    fi
+}
+
+# 清屏只在交互终端、非 dumb、未设置 NO_COLOR 时进行（clear 输出的是控制序列）。
+menu_clear() {
+    if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR+x}" ]; then clear 2>/dev/null || true; fi
+}
+
+# 状态级别对应的颜色（与 ntc_overall_status 的级别一致）：ok 绿、warn 黄、err 红，其余变暗。
+ui_level_color() {
+    case "${1:-}" in
+        ok) printf '%s' "$GREEN" ;;
+        warn) printf '%s' "$YELLOW" ;;
+        err) printf '%s' "$RED" ;;
+        *) printf '%s' "$DIM" ;;
+    esac
+}
+# <<< ntc-common:ui <<<
+
+# >>> ntc-common:input >>>
+# 本区块由 tools/sync-common.sh 根据 src/common/input.sh 生成，请改源文件后运行该脚本，勿直接修改。
+# ── 输入：读到 EOF 一律视为取消（返回 1），数字一律按十进制解析（允许前导零）─────────
+# 去掉首尾空白。
+ntc_trim() {
+    local __trim_v="$1"
+    __trim_v="${__trim_v#"${__trim_v%%[![:space:]]*}"}"
+    __trim_v="${__trim_v%"${__trim_v##*[![:space:]]}"}"
+    printf '%s' "$__trim_v"
+}
+
+# 整数，范围 [$2, $3]；输出规范值（08 → 8），不合法返回 1。
+ntc_int() {
+    local __int_v
+    [[ "${1:-}" =~ ^[0-9]{1,9}$ ]] || return 1
+    __int_v=$((10#$1))
+    [ "$__int_v" -ge "$2" ] && [ "$__int_v" -le "$3" ] || return 1
+    printf '%s' "$__int_v"
+}
+
+# 非负数（整数部分最多 9 位、小数最多 6 位）；输出去掉多余前导零的值，不合法返回 1。
+ntc_decimal() {
+    local __dec_int __dec_frac
+    [[ "${1:-}" =~ ^([0-9]{1,9})(\.([0-9]{1,6}))?$ ]] || return 1
+    __dec_int=$((10#${BASH_REMATCH[1]}))
+    __dec_frac="${BASH_REMATCH[3]}"
+    if [ -n "$__dec_frac" ]; then printf '%s.%s' "$__dec_int" "$__dec_frac"; else printf '%s' "$__dec_int"; fi
+}
+
+# ui_read 变量名 提示 [默认值]：显示“ 提示 [默认值]: ”，回车取默认值；EOF 返回 1。
+ui_read() {
+    local -n __ui_read_out="$1"
+    local __ui_read_prompt="$2" __ui_read_value=""
+    [ -z "${3:-}" ] || __ui_read_prompt+=" [$3]"
+    if ! read -r -p " ${__ui_read_prompt}: " __ui_read_value; then
+        printf '\n'
+        return 1
+    fi
+    __ui_read_value=$(ntc_trim "$__ui_read_value")
+    [ -n "$__ui_read_value" ] || __ui_read_value="${3:-}"
+    __ui_read_out="$__ui_read_value"
+}
+
+# ui_confirm 问题 [y|n]：只认 y/yes/n/no（不分大小写），回车取默认值（缺省 n）；EOF 视为否。
+ui_confirm() {
+    local __ui_answer __ui_default="${2:-n}" __ui_hint='[y/N]'
+    [ "$__ui_default" != y ] || __ui_hint='[Y/n]'
+    while true; do
+        if ! read -r -p " $1 $__ui_hint: " __ui_answer; then
+            printf '\n'
+            return 1
+        fi
+        __ui_answer=$(ntc_trim "$__ui_answer")
+        [ -n "$__ui_answer" ] || __ui_answer="$__ui_default"
+        case "${__ui_answer,,}" in
+            y|yes) return 0 ;;
+            n|no) return 1 ;;
+        esac
+        printf '  请输入 y 或 n。\n'
+    done
+}
+
+# ui_read_int 变量名 提示 默认值 最小 最大：直到输入合法为止；EOF 返回 1。
+ui_read_int() {
+    local -n __ui_int_out="$1"
+    local __ui_int_raw __ui_int_norm
+    while true; do
+        ui_read __ui_int_raw "$2" "$3" || return 1
+        if __ui_int_norm=$(ntc_int "$__ui_int_raw" "$4" "$5"); then
+            __ui_int_out="$__ui_int_norm"
+            return 0
+        fi
+        printf '  %b请输入 %s–%s 的整数。%b\n' "$YELLOW" "$4" "$5" "$NC"
+    done
+}
+
+# ui_read_decimal 变量名 提示 默认值：非负数，直到输入合法为止；EOF 返回 1。取值范围由调用方再检查。
+ui_read_decimal() {
+    local -n __ui_dec_out="$1"
+    local __ui_dec_raw __ui_dec_norm
+    while true; do
+        ui_read __ui_dec_raw "$2" "$3" || return 1
+        if __ui_dec_norm=$(ntc_decimal "$__ui_dec_raw"); then
+            __ui_dec_out="$__ui_dec_norm"
+            return 0
+        fi
+        printf '  %b请输入数字，例如 500 或 1.5。%b\n' "$YELLOW" "$NC"
+    done
+}
+# <<< ntc-common:input <<<
+
+# >>> ntc-common:report >>>
+# 本区块由 tools/sync-common.sh 根据 src/common/report.sh 生成，请改源文件后运行该脚本，勿直接修改。
+# ── 状态文件读取与本期预测（主菜单仪表盘、ntc status、Telegram 日报共用同一套算法）──────
+# 读取 KEY=VALUE 文件中最后一个 KEY 的值；文件不可读或没有该键时返回 1。
+ntc_kv() {
+    local __kv_line __kv_value="" __kv_found=1
+    [ -r "$1" ] || return 1
+    while IFS= read -r __kv_line || [ -n "$__kv_line" ]; do
+        case "$__kv_line" in
+            "$2="*) __kv_value="${__kv_line#*=}"; __kv_found=0 ;;
+        esac
+    done < "$1"
+    printf '%s' "${__kv_value%$'\r'}"
+    return "$__kv_found"
+}
+
+# 本地日期 YYYY-MM-DD 当天 00:00 的 epoch。
+ntc_date_epoch() {
+    [[ "${1:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    date -d "$1 00:00:00" +%s 2>/dev/null
+}
+
+# 本期预测。$1=已用 $2=执行阈值 $3=周期起始日 $4=周期最后一天（含） [$5=当前 epoch]
+# 输出一行：已过天数 总天数 剩余天数 日均 预计期末用量 预计到达阈值的 epoch（0=已达到，-1=本期不会达到）。
+# 期初不足 6 小时按 6 小时折算，避免刚开始几个小时的日均被放大。
+ntc_forecast() {
+    local start_epoch end_epoch now="${5:-}"
+    [ -n "$now" ] || now=$(date +%s)
+    start_epoch=$(ntc_date_epoch "$3") || return 1
+    end_epoch=$(ntc_date_epoch "$4") || return 1
+    end_epoch=$((end_epoch + 86400))
+    [ "$end_epoch" -gt "$start_epoch" ] || return 1
+    awk -v u="$1" -v t="$2" -v s="$start_epoch" -v e="$end_epoch" -v n="$now" 'BEGIN {
+        if (u !~ /^[0-9]+(\.[0-9]+)?$/ || t !~ /^[0-9]+(\.[0-9]+)?$/ || n !~ /^[0-9]+$/) exit 1
+        total = (e - s) / 86400
+        elapsed = (n - s) / 86400
+        if (elapsed < 0.25) elapsed = 0.25
+        if (elapsed > total) elapsed = total
+        left = (e - n) / 86400
+        if (left < 0) left = 0
+        avg = u / elapsed
+        projected = avg * total
+        hit = -1
+        if (u + 0 >= t + 0) hit = 0
+        else if (avg > 0 && projected > t + 0) hit = s + (t / avg) * 86400
+        printf "%.2f %d %.2f %.3f %.2f %.0f\n", elapsed, int(total + 0.5), left, avg, projected, hit
+    }'
+}
+
+# 百分比（向下取整）：$1=已用 $2=限额。
+ntc_percent() {
+    awk -v u="$1" -v l="$2" 'BEGIN {
+        if (u !~ /^[0-9]+(\.[0-9]+)?$/ || l !~ /^[0-9]+(\.[0-9]+)?$/ || l + 0 <= 0) exit 1
+        printf "%d\n", u * 100 / l
+    }'
+}
+
+# 最多保留两位小数并去掉末尾的 0：12.3456 → 12.35，500.00 → 500。
+ntc_num() {
+    awk -v v="$1" 'BEGIN {
+        if (v !~ /^-?[0-9]+(\.[0-9]+)?$/) exit 1
+        s = sprintf("%.2f", v)
+        sub(/\.?0+$/, "", s)
+        if (s == "" || s == "-") s = "0"
+        print s
+    }'
+}
+
+# 字节换算成配置单位（decimal=GB，binary=GiB），保留两位小数。
+ntc_bytes_to_unit() {
+    awk -v b="$1" -v u="$2" 'BEGIN {
+        if (b !~ /^[0-9]+$/) exit 1
+        d = (u == "binary") ? 1073741824 : 1000000000
+        printf "%.2f\n", b / d
+    }'
+}
+
+ntc_unit_label() {
+    if [ "${1:-binary}" = decimal ]; then printf 'GB'; else printf 'GiB'; fi
+}
+
+ntc_mode_label() {
+    case "$1" in
+        out) printf '出站' ;;
+        in) printf '入站' ;;
+        total) printf '出+入' ;;
+        max) printf '出入取较大' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# 周期说明：$1=monthly|quarterly|yearly $2=起始日 $3=年度起始月
+ntc_period_label() {
+    case "$1" in
+        monthly) printf '每月 %s 日重置' "$2" ;;
+        quarterly) printf '每季度（1/4/7/10 月 %s 日）重置' "$2" ;;
+        yearly) printf '每年 %s 月 %s 日重置' "${3:-1}" "$2" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# 剩余天数的说法：$1=剩余天数（可带小数）。
+ntc_days_left_text() {
+    awk -v d="$1" 'BEGIN { if (d + 0 < 1) print "不到 1 天"; else printf "%d 天\n", d }'
+}
+
+# 敏感值的显示形式（Telegram Token、Chat ID 等）：只露首尾各 4 个字符，8 个字符以内全部遮住。
+ntc_mask() {
+    local v="${1:-}"
+    if [ -z "$v" ]; then printf '未设置'
+    elif [ "${#v}" -le 8 ]; then printf '****'
+    else printf '%s…%s' "${v:0:4}" "${v: -4}"
+    fi
+}
+
+# 监控健康状况（读 monitor_health）：输出“级别<TAB>说明”，级别为 ok|error|off|unknown。
+# $1=健康文件 [$2=当前 epoch] [$3=多少秒没更新算停摆，默认 600]
+ntc_health_summary() {
+    local file="$1" now="${2:-}" stale="${3:-600}" health reason updated age
+    [ -n "$now" ] || now=$(date +%s)
+    if ! health=$(ntc_kv "$file" HEALTH); then
+        printf 'unknown\t还没有运行记录\n'
+        return 0
+    fi
+    reason=$(ntc_kv "$file" REASON) || reason=""
+    updated=$(ntc_kv "$file" UPDATED_EPOCH) || updated=""
+    [[ "$updated" =~ ^[0-9]+$ ]] || updated=0
+    age=$((now - updated))
+    [ "$age" -ge 0 ] || age=0
+    case "$health" in
+        disabled) printf 'off\t监控已停用\n' ;;
+        ok|error)
+            if [ "$age" -gt "$stale" ]; then
+                printf 'error\t已 %d 分钟没有运行，请检查 cron\n' $((age / 60))
+            elif [ "$health" = ok ]; then
+                printf 'ok\t运行正常（%d 分钟前检查过）\n' $((age / 60))
+            else
+                printf 'error\t%s\n' "${reason:-最近一次检查失败}"
+            fi
+            ;;
+        *) printf 'unknown\t状态文件无法识别\n' ;;
+    esac
+}
+
+# crontab 文本 $1 里是否有未注释、包含 $2 的条目。
+ntc_cron_has_entry() {
+    awk -v needle="$2" '!/^[[:space:]]*#/ && index($0, needle) { found = 1 } END { exit !found }' <<< "$1"
+}
+
+# Telegram 预警档位的实际取值，$1 为 Telegram 配置文件。规则与 Telegram 组件的 read_config 一致：
+# 没有 WARN_PERCENTS 键 → 80,90（默认）；空或 off → off（关闭）；不是 1–99 的整数列表 → 按 80,90 执行。
+ntc_tg_warn_percents() {
+    local value
+    if ! value=$(ntc_kv "$1" WARN_PERCENTS); then
+        printf '80,90'
+    elif [ -z "$value" ] || [ "${value,,}" = off ]; then
+        printf 'off'
+    elif [[ ! "$value" =~ ^[0-9]{1,2}(,[0-9]{1,2})*$ ]] || [[ ",$value," =~ ,0{1,2}, ]]; then
+        printf '80,90'
+    else
+        printf '%s' "$value"
+    fi
+}
+
+# 综合状态（主菜单仪表盘与「状态详情」共用，按优先级取第一条）。
+# $1=已停用 $2=能读取 root crontab $3=监控定时任务存在（三者取 true/false） $4=健康文件
+# $5=用量状态（current_traffic_state 的 STATUS） $6=限速 kbit/s $7=宽限截止 epoch [$8=当前 epoch]
+# 输出一行：级别<TAB>状态词<TAB>说明。级别为 ok|warn|err|off（调用方据此选颜色），说明可能为空。
+ntc_overall_status() {
+    local kind text hhmm
+    if [ "$1" = true ]; then
+        printf 'off\t○ 已停用\t不统计也不限速（在「限制执行」里启用）\n'
+    elif [ "$2" != true ]; then
+        printf 'warn\t! 状态未知\t无法读取 root crontab，不能确认监控是否在运行\n'
+    elif [ "$3" != true ]; then
+        printf 'warn\t! 未运行\t定时任务缺失（在「限制执行」里启用流量监控）\n'
+    else
+        IFS=$'\t' read -r kind text < <(ntc_health_summary "$4" "${8:-}")
+        case "$kind:$5" in
+            error:*) printf 'err\t✗ 异常\t%s\n' "$text" ;;
+            unknown:*) printf 'warn\t… 等待首次检查\t定时任务每分钟检查一次\n' ;;
+            *:limited) printf 'err\t● 已限速\t整机限速 %s kbit/s，进入新周期后自动解除\n' "${6:-?}" ;;
+            *:shutdown) printf 'err\t● 已安排关机\t已达到阈值，按配置关机\n' ;;
+            *:shutdown_external) printf 'warn\t! 已有关机计划\t系统里已有其他程序安排的关机\n' ;;
+            *:grace)
+                if [[ "${7:-}" =~ ^[1-9][0-9]*$ ]] && hhmm=$(date -d "@$7" '+%m-%d %H:%M' 2>/dev/null); then
+                    printf 'warn\t● 宽限中\t到 %s，期间只统计、不限速\n' "$hhmm"
+                else
+                    printf 'warn\t● 宽限中\t期间只统计、不限速\n'
+                fi
+                ;;
+            *:paused) printf 'warn\t● 已暂停限制\t流量照常统计（在「限制执行」里恢复）\n' ;;
+            *) printf 'ok\t● 监控中\t\n' ;;
+        esac
+    fi
+}
+# <<< ntc-common:report <<<
 
 SOURCE_PATH="${BASH_SOURCE[0]}"
 while [ -L "$SOURCE_PATH" ]; do
@@ -49,6 +694,8 @@ while [ -L "$SOURCE_PATH" ]; do
 done
 SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE_PATH")" && pwd)"
 
+# >>> ntc-common:tc-bin >>>
+# 本区块由 tools/sync-common.sh 根据 src/common/tc-bin.sh 生成，请改源文件后运行该脚本，勿直接修改。
 find_tc_bin() {
     local candidate
     for candidate in /usr/sbin/tc /sbin/tc /usr/bin/tc /bin/tc; do
@@ -59,10 +706,12 @@ find_tc_bin() {
     done
     command -v tc 2>/dev/null || true
 }
+# <<< ntc-common:tc-bin <<<
 
 TC_BIN="$(find_tc_bin)"
 
-# Keep this small audit writer identical in the four standalone distribution scripts.
+# >>> ntc-common:audit >>>
+# 本区块由 tools/sync-common.sh 根据 src/common/audit.sh 生成，请改源文件后运行该脚本，勿直接修改。
 # Only fixed event/result values are accepted; extra arguments are never recorded.
 ntc_operation_log() {
     local event="${1:-}" result="${2:-}"
@@ -126,6 +775,7 @@ ntc_operation_log() {
     # Logging failures must never change the business result or the caller's shell options.
     return 0
 }
+# <<< ntc-common:audit <<<
 
 # Debian package names and the commands actually used by the four components.
 dependency_manifest() {
@@ -188,6 +838,8 @@ dependency_removal_is_safe() {
 # Dependency changes are displayed directly; do not recreate the removed NTC config directory.
 dependency_audit() { :; }
 
+# >>> ntc-common:deps >>>
+# 本区块由 tools/sync-common.sh 根据 src/common/deps.sh 生成，请改源文件后运行该脚本，勿直接修改。
 # BEGIN MANAGED DEPENDENCIES
 # Shared reference implementation embedded into each standalone product; not sourced at runtime.
 # Adapted from duya07/easy_Caddy dependency lifecycle, commit 843e7b4b686d5d191c9cd7dac7066a96fcbef5c1.
@@ -616,6 +1268,7 @@ dependency_menu() {
 }
 
 # END MANAGED DEPENDENCIES
+# <<< ntc-common:deps <<<
 
 # Other package managers retain command-based installation without pretending to own packages.
 dependency_package_manager() {
@@ -697,11 +1350,6 @@ dependency_host_menu() {
         read -r -p '请选择 [0-1]：' choice || return 0
         case "$choice" in 1) dependency_install_for_host false || true ;; 0) return 0 ;; *) printf '无效选择。\n' ;; esac
     done
-}
-
-pause() {
-    echo ""
-    read -r -p "按回车键继续..."
 }
 
 run_tc_self_check() {
@@ -800,6 +1448,7 @@ EOF
     chmod 755 "$runner_tmp" || { rm -f "$runner_tmp"; return 1; }
     if ! cmp -s "$runner_tmp" "$TC_RECOVERY_RUNNER"; then
         mv -f "$runner_tmp" "$TC_RECOVERY_RUNNER" || { rm -f "$runner_tmp"; return 1; }
+        INSTALL_CHANGED=true
     else
         rm -f "$runner_tmp"
     fi
@@ -823,10 +1472,13 @@ EOF
     chmod 644 "$unit_tmp" || { rm -f "$unit_tmp"; return 1; }
     if ! cmp -s "$unit_tmp" "$TC_RECOVERY_UNIT_FILE"; then
         mv -f "$unit_tmp" "$TC_RECOVERY_UNIT_FILE" || { rm -f "$unit_tmp"; return 1; }
+        INSTALL_CHANGED=true
+        # 只有 unit 文件变化时才需要 daemon-reload（1.x 每次打开菜单都会执行一次）。
+        "$TC_RECOVERY_SYSTEMCTL" daemon-reload >/dev/null 2>&1 || return 1
     else
         rm -f "$unit_tmp"
     fi
-    "$TC_RECOVERY_SYSTEMCTL" daemon-reload >/dev/null 2>&1
+    return 0
 }
 
 tc_auto_recovery_state() {
@@ -922,6 +1574,8 @@ read_current_crontab() {
     return 1
 }
 
+# >>> ntc-common:crontab-lock >>>
+# 本区块由 tools/sync-common.sh 根据 src/common/crontab-lock.sh 生成，请改源文件后运行该脚本，勿直接修改。
 acquire_root_crontab_lock() {
     mkdir -p "$(dirname "$ROOT_CRONTAB_LOCK_FILE")" || return 1
     exec 7>"$ROOT_CRONTAB_LOCK_FILE" || return 1
@@ -935,6 +1589,7 @@ release_root_crontab_lock() {
     flock -u 7 2>/dev/null || true
     exec 7>&-
 }
+# <<< ntc-common:crontab-lock <<<
 
 read_root_crontab_locked() {
     # Crontab installs are atomic; a status snapshot needs no writer lock or files.
@@ -1157,6 +1812,11 @@ ensure_component() {
             echo -e "${YELLOW}! 已安装 $script_name 版本 $installed_version 高于当前副本 $source_version，已阻止降级。${NC}"
             return 0
         fi
+        # 与已安装文件完全相同时不复制、不提示。
+        if [ -f "$dest" ] && cmp -s "$src" "$dest"; then
+            chmod +x "$dest" 2>/dev/null || true
+            return 0
+        fi
         tmp_file="$WORK_DIR/.${script_name}.install.$$"
         if ! cp "$src" "$tmp_file" || ! chmod +x "$tmp_file" ||
            ! bash -n "$tmp_file" 2>/dev/null ||
@@ -1172,7 +1832,8 @@ ensure_component() {
             echo -e "${RED}本地脚本安装失败：$script_name，目标文件校验失败。${NC}"
             return 1
         fi
-        echo -e "${GREEN}✓ 已安装/更新 $script_name${NC}"
+        INSTALL_CHANGED=true
+        ui_ok "已安装/更新 $script_name"
         return 0
     fi
 
@@ -1188,7 +1849,8 @@ ensure_component() {
         echo -e "${YELLOW}! 已存在的 $script_name 语法或版本检查失败，将重新下载。${NC}"
     fi
 
-    download_component "$script_name"
+    download_component "$script_name" || return 1
+    INSTALL_CHANGED=true
 }
 
 install_all_components() {
@@ -1210,27 +1872,31 @@ install_shortcut_link() {
         return 1
     fi
 
-    if ! mkdir -p "$(dirname "$SHORTCUT_PATH")" \
-        || ! ln -sfn "$WORK_DIR/trafficcop-lite.sh" "$SHORTCUT_PATH" \
-        || ! chmod +x "$WORK_DIR/trafficcop-lite.sh"; then
-        echo -e "${RED}快捷命令安装失败，请使用：sudo bash $WORK_DIR/trafficcop-lite.sh${NC}"
-        return 1
+    if [ "$(readlink "$SHORTCUT_PATH" 2>/dev/null)" != "$WORK_DIR/trafficcop-lite.sh" ]; then
+        if ! mkdir -p "$(dirname "$SHORTCUT_PATH")" \
+            || ! ln -sfn "$WORK_DIR/trafficcop-lite.sh" "$SHORTCUT_PATH" \
+            || ! chmod +x "$WORK_DIR/trafficcop-lite.sh"; then
+            echo -e "${RED}快捷命令安装失败，请使用：sudo bash $WORK_DIR/trafficcop-lite.sh${NC}"
+            return 1
+        fi
+        INSTALL_CHANGED=true
+        ui_ok "快捷命令已安装：sudo ntc"
     fi
-    echo -e "${GREEN}✓ 快捷命令已安装：sudo ntc${NC}"
     if [ "$(readlink "$LEGACY_NCL_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
         rm -f "$LEGACY_NCL_SHORTCUT_PATH"
-        echo -e "${GREEN}✓ 已清理旧快捷命令：$LEGACY_NCL_SHORTCUT_PATH${NC}"
+        INSTALL_CHANGED=true
+        ui_ok "已清理旧快捷命令：$LEGACY_NCL_SHORTCUT_PATH"
     fi
     if [ "$(readlink "$LEGACY_TC_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
         rm -f "$LEGACY_TC_SHORTCUT_PATH"
-        echo -e "${GREEN}✓ 已清理旧快捷命令：$LEGACY_TC_SHORTCUT_PATH${NC}"
+        INSTALL_CHANGED=true
+        ui_ok "已清理旧快捷命令：$LEGACY_TC_SHORTCUT_PATH（系统 tc 命令：${TC_BIN:-未找到}）"
     fi
-    if [ -n "$TC_BIN" ]; then
-        echo -e "${CYAN}系统原 tc 命令路径：$TC_BIN${NC}"
-    fi
+    return 0
 }
 
 install_shortcut() {
+    INSTALL_CHANGED=false
     if ! install_all_components; then
         ntc_operation_log install failure
         return 1
@@ -1238,7 +1904,11 @@ install_shortcut() {
     # 快捷命令只是便捷入口：被外部文件占用或装不上都不影响本项目可用，
     # 因此不能算作安装失败（否则主入口会在这里把用户挡在菜单外）。
     install_shortcut_link || true
-    ntc_operation_log install success
+    # 只有真的装了或换了文件才记一条安装审计（1.x 每次打开菜单都写一条“安装 NTC：成功”）。
+    if [ "$INSTALL_CHANGED" = true ]; then
+        ntc_operation_log install success
+    fi
+    return 0
 }
 
 source_has_complete_bundle() {
@@ -1257,74 +1927,6 @@ install_from_entrypoint() {
     fi
 
     install_shortcut
-}
-
-run_component() {
-    local script_name="$1"
-    ensure_component "$script_name" || {
-        pause
-        return 1
-    }
-    bash "$WORK_DIR/$script_name"
-}
-
-manage_monitor() {
-    echo -e "${CYAN}正在打开流量监控管理...${NC}"
-    install_all_components || {
-        pause
-        return
-    }
-    bash "$WORK_DIR/$MONITOR_SCRIPT"
-    pause
-}
-
-manage_telegram() {
-    echo -e "${CYAN}正在打开 Telegram 通知管理...${NC}"
-    install_all_components || {
-        pause
-        return
-    }
-    bash "$WORK_DIR/$TELEGRAM_SCRIPT"
-    pause
-}
-
-manage_machine_limit() {
-    echo -e "${CYAN}正在打开机器限速管理...${NC}"
-    install_all_components || {
-        pause
-        return
-    }
-    bash "$WORK_DIR/$MACHINE_LIMIT_SCRIPT"
-    pause
-}
-
-choose_update_base() {
-    local direct_base="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
-    local proxy_base="https://v6.gh-proxy.org/https://raw.githubusercontent.com/${REPO}/${BRANCH}"
-    local source_choice
-
-    echo -e "${CYAN}请选择更新线路${NC}" >&2
-    menu_item "1" "直连" >&2
-    menu_item "2" "国内优先" >&2
-    menu_item "0" "返回" >&2
-    echo "" >&2
-    read -r -p "请输入选项: " source_choice
-
-    case "$source_choice" in
-        1|"")
-            echo "$direct_base"
-            ;;
-        2)
-            echo "$proxy_base"
-            ;;
-        0)
-            return 1
-            ;;
-        *)
-            echo -e "${RED}无效选择${NC}" >&2
-            return 1
-            ;;
-    esac
 }
 
 rollback_script_update() {
@@ -1427,7 +2029,8 @@ update_scripts() {
         rm -f "${temp_files[@]}" 2>/dev/null || true
         verify_installed_scripts || { ntc_operation_log update failure; return 1; }
         install_shortcut_link || true
-        install_tc_recovery_service_files || { ntc_operation_log update failure; return 1; }
+        # 脚本本体已校验通过；共享恢复文件写不进去只影响开机自动恢复，不能把更新判为失败（L2）。
+        install_tc_recovery_service_files || ui_warn "共享 TC 自动恢复文件未能更新，开机自动恢复可能暂不可用。"
         echo ""
         echo -e "${GREEN}当前已是最新版本：${UPDATE_NEW_VERSION:-未知}${NC}"
         ntc_operation_log update unchanged
@@ -1482,42 +2085,14 @@ update_scripts() {
     rm -f "$sums_file" 2>/dev/null || true
     # 脚本本体已校验通过，快捷命令装不上不改变“更新成功”这个事实。
     install_shortcut_link || true
-    install_tc_recovery_service_files || { ntc_operation_log update failure; return 1; }
+    # 四个脚本都已替换并校验通过：共享恢复文件写不进去只是警告，不能把更新判为失败（L2）。
+    install_tc_recovery_service_files || ui_warn "共享 TC 自动恢复文件未能更新，开机自动恢复可能暂不可用。"
 
     echo ""
-    echo -e "${GREEN}脚本更新完成：${UPDATE_PREVIOUS_VERSION:-未安装} → ${UPDATE_NEW_VERSION:-未知}${NC}"
-    echo -e "${GREEN}旧脚本已备份到：$backup_dir${NC}"
-    echo -e "${YELLOW}命令行更新后请重新执行 sudo ntc；交互更新将自动载入新版菜单。${NC}"
+    ui_ok "NTC 已更新：${UPDATE_PREVIOUS_VERSION:-未安装} → ${UPDATE_NEW_VERSION:-未知}"
+    ui_note "旧脚本已备份到：$backup_dir"
+    ui_note "命令行更新后请重新执行 sudo ntc；在菜单里更新会自动载入新版菜单。"
     ntc_operation_log update success
-}
-
-update_scripts_interactive() {
-    local selected_base
-
-    selected_base=$(choose_update_base) || {
-        echo "已取消更新。"
-        pause
-        return
-    }
-
-    if update_scripts "$selected_base"; then
-        echo -e "${GREEN}正在载入新版菜单...${NC}"
-        exec bash "$WORK_DIR/trafficcop-lite.sh"
-        echo -e "${RED}新版菜单载入失败，请重新执行 sudo ntc。${NC}"
-    fi
-    pause
-}
-
-ntc_tc_status_label() {
-    local status_output=""
-    status_output=$(run_tc_self_check 2>/dev/null || true)
-    case "$status_output" in
-        *"TC_SELF_CHECK=OK"*"MODEL=absent"*) echo "空闲" ;;
-        *"TC_SELF_CHECK=OK"*) echo "正常" ;;
-        *"TC_SELF_CHECK=CONFLICT"*) echo "冲突（外部/未知 TC）" ;;
-        *"TC_SELF_CHECK=DRIFT"*) echo "异常（自身规则已失效）" ;;
-        *) echo "无法检测" ;;
-    esac
 }
 
 ntc_tc_status_kind() {
@@ -1529,845 +2104,10 @@ ntc_tc_status_kind() {
     esac
 }
 
-show_tc_takeover_warning() {
-    echo -e "${RED}检测到当前 TC 配置可能已被其他程序修改。${NC}"
-    echo "继续操作将删除当前冲突的 TC/qdisc 配置，"
-    echo "并只重新建立 Dog/NTC 体系自身管理的规则。"
-    echo "其他程序创建的 TC 配置不会被保留。"
-    echo ""
-    echo -e "${YELLOW}如果其他 TC 管理脚本或服务仍然存在，其之后再次启动或重启时，"
-    echo -e "仍可能覆盖 Dog/NTC。建议卸载、关闭或禁用这些冲突程序。${NC}"
-}
-
-show_tc_auto_recovery_notice() {
-    echo "启用后，恢复服务会在开机网络就绪时检查 Dog/NTC TC 规则。"
-    echo "规则正常或当前没有需要恢复的规则时，不会修改 TC。"
-    echo "默认 qdisc 缺失或已识别的 Dog/NTC 统一层级失效时，才会按现有状态重建。"
-    echo "检测到外部或未知 root qdisc 时会拒绝自动接管，须由主菜单 9 手动确认。"
-}
-
-confirm_enable_tc_auto_recovery() {
-    local confirm=""
-
-    show_tc_auto_recovery_notice
-    echo ""
-    read -r -p "确认启用请输入 ENABLE: " confirm
-    if [ "$confirm" != "ENABLE" ]; then
-        echo "未启用。"
-        return 0
-    fi
-    if enable_tc_auto_recovery; then
-        echo -e "${GREEN}开机自动恢复已启用。${NC}"
-    else
-        echo -e "${RED}开机自动恢复启用失败。${NC}"
-        return 1
-    fi
-}
-
 run_shared_tc_recovery() {
     local mode="${1:---manual}"
     install_tc_recovery_service_files || return 1
     bash "$TC_RECOVERY_RUNNER" "$mode"
-}
-
-manage_tc_recovery() {
-    local tc_choice=""
-    local confirm=""
-    local status_output=""
-    local status_kind=""
-
-    if [ -t 1 ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-dumb}" != dumb ]; then clear; fi
-    echo -e "${BLUE}${BOLD}TC 冲突处理 / 自动恢复${NC}"
-    echo ""
-    echo "TC 状态: $(ntc_tc_status_label)"
-    echo "自动恢复: $(tc_auto_recovery_state)"
-    echo "恢复方式: 单一 systemd oneshot；启用后在网络就绪时执行一次"
-    echo ""
-    menu_item "1" "检测并按需重建 Dog/NTC 规则"
-    menu_item "2" "检测并按需重建，同时启用开机自动恢复"
-    menu_item "3" "启用开机自动恢复"
-    menu_item "4" "关闭开机自动恢复"
-    menu_item "0" "返回主菜单"
-    echo ""
-    read -r -p "请输入选项: " tc_choice
-    case "$tc_choice" in
-        1|2)
-            status_output=$(run_tc_self_check 2>/dev/null || true)
-            status_kind=$(ntc_tc_status_kind "$status_output")
-            case "$status_kind" in
-                ok)
-                    echo -e "${GREEN}当前 TC 状态正常，无需强制重建。${NC}"
-                    if [ "$tc_choice" = "2" ]; then
-                        echo ""
-                        confirm_enable_tc_auto_recovery || true
-                    fi
-                    ;;
-                idle)
-                    echo -e "${YELLOW}当前没有需要恢复的 Dog/NTC TC 规则。${NC}"
-                    if [ "$tc_choice" = "2" ]; then
-                        echo ""
-                        confirm_enable_tc_auto_recovery || true
-                    fi
-                    ;;
-                conflict)
-                    show_tc_takeover_warning
-                    echo ""
-                    read -r -p "确认继续请输入 REBUILD: " confirm
-                    if [ "$confirm" = "REBUILD" ] && run_shared_tc_recovery --manual; then
-                        echo -e "${GREEN}TC 检测/重建完成。${NC}"
-                        if [ "$tc_choice" = "2" ]; then
-                            if enable_tc_auto_recovery; then
-                                echo -e "${GREEN}开机自动恢复已启用。${NC}"
-                            else
-                                echo -e "${RED}TC 已重建，但开机自动恢复启用失败。${NC}"
-                            fi
-                        fi
-                    elif [ "$confirm" != "REBUILD" ]; then
-                        echo "已取消。"
-                    else
-                        echo -e "${RED}TC 重建失败，请运行 sudo ntc --self-check 查看详情。${NC}"
-                    fi
-                    ;;
-                *)
-                    echo -e "${RED}无法确认当前 TC 状态，未修改 qdisc。请先运行 sudo ntc --self-check。${NC}"
-                    ;;
-            esac
-            ;;
-        3)
-            confirm_enable_tc_auto_recovery || true
-            ;;
-        4)
-            if disable_tc_auto_recovery; then
-                echo -e "${GREEN}开机自动恢复已关闭。${NC}"
-            else
-                echo -e "${RED}开机自动恢复关闭失败；现有启用状态未被确认改变。${NC}"
-            fi
-            ;;
-        0) return ;;
-        *) echo -e "${RED}无效选择。${NC}" ;;
-    esac
-    pause
-}
-
-show_status_line() {
-    local monitor_cron="未设置"
-    local telegram_cron="未设置"
-    local config_state="未配置"
-    local root_crontab=""
-    local crontab_status=0
-
-    root_crontab=$(read_root_crontab_locked 2>/dev/null) || crontab_status=$?
-    if [ "$crontab_status" -ne 0 ]; then
-        # 读不出来和“没设置”是两回事：如实显示，别让用户以为定时任务掉了。
-        monitor_cron="读取失败"
-        telegram_cron="读取失败"
-    fi
-    if printf '%s\n' "$root_crontab" | grep -F -q "$WORK_DIR/$MONITOR_SCRIPT"; then
-        monitor_cron="已设置"
-    fi
-    if printf '%s\n' "$root_crontab" | grep -F -q "$WORK_DIR/$TELEGRAM_SCRIPT"; then
-        telegram_cron="已设置"
-    fi
-    if [ -f "$WORK_DIR/traffic_monitor_config.txt" ]; then
-        config_state="已配置"
-    fi
-
-    local config_color="$YELLOW"
-    local monitor_color="$YELLOW"
-    local telegram_color="$YELLOW"
-
-    [ "$config_state" = "已配置" ] && config_color="$GREEN"
-    [ "$monitor_cron" = "已设置" ] && monitor_color="$GREEN"
-    [ "$telegram_cron" = "已设置" ] && telegram_color="$GREEN"
-
-    echo -e "${CYAN}工作目录:${NC} $WORK_DIR"
-    echo -e "${CYAN}监控配置:${NC} ${config_color}${config_state}${NC}"
-    echo -e "${CYAN}监控任务:${NC} ${monitor_color}${monitor_cron}${NC}"
-    echo -e "${CYAN}TG任务:${NC} ${telegram_color}${telegram_cron}${NC}"
-    echo -e "${CYAN}TC 状态:${NC} $(ntc_tc_status_label)"
-    echo -e "${CYAN}自动恢复:${NC} $(tc_auto_recovery_state)"
-}
-
-lite_is_leap_year() {
-    local year="$1"
-    if { [ $((year % 4)) -eq 0 ] && [ $((year % 100)) -ne 0 ]; } || [ $((year % 400)) -eq 0 ]; then
-        return 0
-    fi
-    return 1
-}
-
-lite_days_in_month() {
-    local year="$1"
-    local month="$2"
-
-    if ! [[ "$month" =~ ^[0-9]+$ ]]; then
-        month=1
-    fi
-    month=$((10#$month))
-
-    case "$month" in
-        1|3|5|7|8|10|12) echo 31 ;;
-        4|6|9|11) echo 30 ;;
-        2)
-            if lite_is_leap_year "$year"; then
-                echo 29
-            else
-                echo 28
-            fi
-            ;;
-        *) echo 31 ;;
-    esac
-}
-
-lite_anchor_date() {
-    local year="$1"
-    local month="$2"
-    local day="$3"
-    local max_day
-
-    if ! [[ "$month" =~ ^[0-9]+$ ]]; then
-        month=1
-    fi
-    month=$((10#$month))
-    if [ "$month" -lt 1 ] || [ "$month" -gt 12 ]; then
-        month=1
-    fi
-
-    if ! [[ "$day" =~ ^[0-9]+$ ]]; then
-        day=1
-    fi
-    day=$((10#$day))
-    if [ "$day" -lt 1 ]; then
-        day=1
-    fi
-
-    max_day=$(lite_days_in_month "$year" "$month")
-    if [ "$day" -gt "$max_day" ]; then
-        day="$max_day"
-    fi
-
-    printf "%04d-%02d-%02d\n" "$year" "$month" "$day"
-}
-
-lite_date_num() {
-    echo "$1" | tr -d '-'
-}
-
-lite_shift_month() {
-    local year="$1"
-    local month="$2"
-    local offset="$3"
-    local total shifted_year shifted_month
-
-    month=$((10#$month))
-    total=$((year * 12 + month - 1 + offset))
-    shifted_year=$((total / 12))
-    shifted_month=$((total % 12 + 1))
-
-    printf "%04d %02d\n" "$shifted_year" "$shifted_month"
-}
-
-lite_previous_day() {
-    local date_value="$1"
-    local year rest month day prev_year prev_month prev_day
-
-    year=${date_value%%-*}
-    rest=${date_value#*-}
-    month=${rest%%-*}
-    day=${date_value##*-}
-
-    year=$((10#$year))
-    month=$((10#$month))
-    day=$((10#$day))
-
-    if [ "$day" -gt 1 ]; then
-        printf "%04d-%02d-%02d\n" "$year" "$month" "$((day - 1))"
-    else
-        read -r prev_year prev_month <<< "$(lite_shift_month "$year" "$month" -1)"
-        prev_day=$(lite_days_in_month "$prev_year" "$prev_month")
-        printf "%04d-%02d-%02d\n" "$prev_year" "$((10#$prev_month))" "$prev_day"
-    fi
-}
-
-lite_period_start_date() {
-    local current_date current_month current_year current_num
-    local anchor_this anchor_num period_year period_month quarter_month start_month
-
-    current_date=$(date +%Y-%m-%d)
-    current_month=$(date +%m)
-    current_year=$(date +%Y)
-    current_num=$(lite_date_num "$current_date")
-
-    case "${TRAFFIC_PERIOD:-monthly}" in
-        quarterly)
-            quarter_month=$(( ((10#$current_month - 1) / 3) * 3 + 1 ))
-            anchor_this=$(lite_anchor_date "$current_year" "$quarter_month" "${PERIOD_START_DAY:-1}")
-            anchor_num=$(lite_date_num "$anchor_this")
-            if [ "$current_num" -lt "$anchor_num" ]; then
-                read -r period_year period_month <<< "$(lite_shift_month "$current_year" "$quarter_month" -3)"
-                lite_anchor_date "$period_year" "$period_month" "${PERIOD_START_DAY:-1}"
-            else
-                echo "$anchor_this"
-            fi
-            ;;
-        yearly)
-            start_month="${PERIOD_START_MONTH:-1}"
-            if [[ "$start_month" =~ ^[0-9]+$ ]]; then
-                start_month=$((10#$start_month))
-            else
-                start_month=1
-            fi
-            if [ "$start_month" -lt 1 ] || [ "$start_month" -gt 12 ]; then
-                start_month=1
-            fi
-            anchor_this=$(lite_anchor_date "$current_year" "$start_month" "${PERIOD_START_DAY:-1}")
-            anchor_num=$(lite_date_num "$anchor_this")
-            if [ "$current_num" -lt "$anchor_num" ]; then
-                read -r period_year period_month <<< "$(lite_shift_month "$current_year" "$start_month" -12)"
-                lite_anchor_date "$period_year" "$period_month" "${PERIOD_START_DAY:-1}"
-            else
-                echo "$anchor_this"
-            fi
-            ;;
-        monthly|*)
-            anchor_this=$(lite_anchor_date "$current_year" "$current_month" "${PERIOD_START_DAY:-1}")
-            anchor_num=$(lite_date_num "$anchor_this")
-            if [ "$current_num" -lt "$anchor_num" ]; then
-                read -r period_year period_month <<< "$(lite_shift_month "$current_year" "$current_month" -1)"
-                lite_anchor_date "$period_year" "$period_month" "${PERIOD_START_DAY:-1}"
-            else
-                echo "$anchor_this"
-            fi
-            ;;
-    esac
-}
-
-lite_period_end_date() {
-    local start_date start_year start_month next_year next_month next_anchor offset
-
-    start_date=$(lite_period_start_date)
-    start_year=${start_date%%-*}
-    start_month=${start_date#*-}
-    start_month=${start_month%%-*}
-
-    case "${TRAFFIC_PERIOD:-monthly}" in
-        quarterly) offset=3 ;;
-        yearly) offset=12 ;;
-        monthly|*) offset=1 ;;
-    esac
-
-    read -r next_year next_month <<< "$(lite_shift_month "$start_year" "$start_month" "$offset")"
-    next_anchor=$(lite_anchor_date "$next_year" "$next_month" "${PERIOD_START_DAY:-1}")
-    lite_previous_day "$next_anchor"
-}
-
-lite_period_label() {
-    case "${1:-monthly}" in
-        monthly) echo "月度" ;;
-        quarterly) echo "季度" ;;
-        yearly) echo "年度" ;;
-        *) echo "未知周期" ;;
-    esac
-}
-
-lite_mode_label() {
-    case "${1:-total}" in
-        out) echo "出站" ;;
-        in) echo "进站" ;;
-        total) echo "进站+出站" ;;
-        max) echo "进出取大" ;;
-        *) echo "未知模式" ;;
-    esac
-}
-
-lite_compare_ge() {
-    awk -v left="$1" -v right="$2" 'BEGIN { exit !(left >= right) }'
-}
-
-lite_vnstat_config_value() {
-    local target="$1"
-    lite_vnstat_cmd --showconfig 2>/dev/null | awk -v target="$target" '
-        {
-            key=$1
-            sub(/^[;#]/, "", key)
-            if (key == target) {
-                print $NF
-                exit
-            }
-        }
-    '
-}
-
-lite_vnstat_cmd() {
-    local config_path=""
-    config_path=$(cat "$VNSTAT_CONFIG_PATH_FILE" 2>/dev/null || true)
-    if [ -n "$config_path" ] && [ "${config_path#/}" != "$config_path" ] && [ -f "$config_path" ]; then
-        vnstat --config "$config_path" "$@"
-    else
-        vnstat "$@"
-    fi
-}
-
-lite_vnstat_daemon_is_running() {
-    local comm_file
-    for comm_file in /proc/[0-9]*/comm; do
-        [ -r "$comm_file" ] || continue
-        [ "$(cat "$comm_file" 2>/dev/null)" = "vnstatd" ] && return 0
-    done
-    return 1
-}
-
-lite_normalize_vnstat_json_for_interface() {
-    local vnstat_json="$1"
-    local expected_interface="$2"
-
-    [[ "$expected_interface" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || return 1
-    printf '%s' "$vnstat_json" | jq -ce --arg expected "$expected_interface" '
-        def uint: type == "number" and . >= 0 and floor == .;
-        def leap_year($year):
-            ($year % 400 == 0) or (($year % 4 == 0) and ($year % 100 != 0));
-        def month_days($year; $month):
-            if $month == 2 then (if leap_year($year) then 29 else 28 end)
-            elif $month == 4 or $month == 6 or $month == 9 or $month == 11 then 30
-            else 31 end;
-        def valid_date:
-            type == "object" and
-            (.year | uint) and .year >= 1970 and .year <= 9999 and
-            (.month | uint) and .month >= 1 and .month <= 12 and
-            (.day | uint) and .day >= 1 and .day <= month_days(.year; .month);
-        select(.jsonversion == "2" or .jsonversion == 2) |
-        select((.interfaces | type) == "array") |
-        [.interfaces[] | select(.name == $expected)] as $matches |
-        select(($matches | length) == 1) |
-        $matches[0] as $interface |
-        select(($interface | type) == "object") |
-        select($interface.created.date | valid_date) |
-        select(($interface.updated | type) == "object") |
-        select(($interface.traffic | type) == "object") |
-        select(($interface.traffic.day | type) == "array") |
-        select(all($interface.traffic.day[];
-            (.date | valid_date) and (.rx | uint) and (.tx | uint))) |
-        {jsonversion: "2", interfaces: [$interface]}
-    ' 2>/dev/null
-}
-
-lite_vnstat_data_is_fresh() {
-    local vnstat_json="$1"
-    local updated_epoch updated_text now age save_interval update_interval max_age use_utc
-
-    lite_vnstat_daemon_is_running || return 1
-    updated_epoch=$(printf '%s' "$vnstat_json" |
-        jq -r '.interfaces[0].updated.timestamp // empty' 2>/dev/null) || return 1
-    if ! [[ "$updated_epoch" =~ ^[0-9]+$ ]]; then
-        updated_text=$(printf '%s' "$vnstat_json" | jq -r '
-            .interfaces[0].updated as $u |
-            if ($u.date.year == null or $u.date.month == null or $u.date.day == null or
-                $u.time.hour == null or $u.time.minute == null) then empty
-            else "\($u.date.year)-\($u.date.month)-\($u.date.day) \($u.time.hour):\($u.time.minute):\($u.time.second // 0)" end
-        ' 2>/dev/null) || return 1
-        [ -n "$updated_text" ] || return 1
-        use_utc=$(lite_vnstat_config_value "UseUTC")
-        if [ "$use_utc" = "1" ]; then
-            updated_epoch=$(TZ=UTC date -d "$updated_text" +%s 2>/dev/null) || return 1
-        else
-            updated_epoch=$(date -d "$updated_text" +%s 2>/dev/null) || return 1
-        fi
-    fi
-    now=$(date +%s) || return 1
-    save_interval=$(lite_vnstat_config_value "SaveInterval")
-    update_interval=$(lite_vnstat_config_value "UpdateInterval")
-    [[ "$save_interval" =~ ^[1-9][0-9]*$ && "$update_interval" =~ ^[1-9][0-9]*$ ]] || return 1
-    max_age=$((save_interval * 60 + update_interval + 90))
-    age=$((now - updated_epoch))
-    [ "$age" -ge -300 ] && [ "$age" -le "$max_age" ]
-}
-
-lite_vnstat_available_start() {
-    local vnstat_json created_num earliest_num available_num trafficless_entries
-
-    [ -n "${MAIN_INTERFACE:-}" ] || return 1
-    vnstat_json=$(lite_vnstat_cmd -i "$MAIN_INTERFACE" --json 2>/dev/null) || return 1
-    vnstat_json=$(lite_normalize_vnstat_json_for_interface "$vnstat_json" "$MAIN_INTERFACE") || return 1
-    lite_vnstat_data_is_fresh "$vnstat_json" || return 1
-    created_num=$(printf '%s' "$vnstat_json" | jq -r \
-        '.interfaces[0].created.date | (.year * 10000 + .month * 100 + .day)' 2>/dev/null) || return 1
-    earliest_num=$(printf '%s' "$vnstat_json" | jq -r \
-        '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day)] | min // 0' 2>/dev/null) || return 1
-    [[ "$created_num" =~ ^[0-9]{8}$ ]] || return 1
-
-    trafficless_entries=$(lite_vnstat_config_value "TrafficlessEntries")
-    trafficless_entries=${trafficless_entries:-1}
-    available_num="$created_num"
-    if [ "$trafficless_entries" != "0" ] \
-        && [[ "$earliest_num" =~ ^[0-9]{8}$ ]] && [ "$earliest_num" -gt "$available_num" ]; then
-        available_num="$earliest_num"
-    fi
-    printf '%s-%s-%s\n' "${available_num:0:4}" "${available_num:4:2}" "${available_num:6:2}"
-}
-
-lite_usage_bar() {
-    local percent="$1"
-    local color="$2"
-    local width=18
-    local filled empty filled_part empty_part
-
-    filled=$(awk -v p="$percent" -v w="$width" 'BEGIN { if (p < 0) p = 0; if (p > 100) p = 100; printf "%d", (p * w + 50) / 100 }')
-    empty=$((width - filled))
-    printf -v filled_part '%*s' "$filled" ''
-    printf -v empty_part '%*s' "$empty" ''
-    filled_part=${filled_part// /#}
-    empty_part=${empty_part// /-}
-
-    printf "%b[%b%s%b%s%b]" "$WHITE" "$color" "$filled_part" "$WHITE" "$empty_part" "$NC"
-}
-
-lite_current_usage_gb() {
-    local start_date="$1"
-    local end_date="$2"
-    local start_num end_num vnstat_json usage_bytes rx_bytes tx_bytes divisor
-    local created_num earliest_num daily_days required_days trafficless_entries retention_start retention_num
-
-    if [ -z "${MAIN_INTERFACE:-}" ]; then
-        return 1
-    fi
-    if ! command -v vnstat >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1 || ! command -v awk >/dev/null 2>&1; then
-        return 1
-    fi
-
-    vnstat_json=$(lite_vnstat_cmd -i "$MAIN_INTERFACE" --json 2>/dev/null) || return 1
-    if [ -z "$vnstat_json" ]; then
-        return 1
-    fi
-    vnstat_json=$(lite_normalize_vnstat_json_for_interface "$vnstat_json" "$MAIN_INTERFACE") || return 1
-    lite_vnstat_data_is_fresh "$vnstat_json" || return 1
-
-    start_num=$(lite_date_num "$start_date")
-    end_num=$(lite_date_num "$end_date")
-
-    created_num=$(printf '%s' "$vnstat_json" | jq -r '.interfaces[0].created.date | (.year * 10000 + .month * 100 + .day)' 2>/dev/null) || return 1
-    earliest_num=$(printf '%s' "$vnstat_json" | jq -r '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day)] | min // 0' 2>/dev/null) || return 1
-    case "${TRAFFIC_PERIOD:-monthly}" in
-        monthly) required_days=40 ;;
-        quarterly) required_days=100 ;;
-        yearly) required_days=400 ;;
-    esac
-    daily_days=$(lite_vnstat_config_value "DailyDays")
-    trafficless_entries=$(lite_vnstat_config_value "TrafficlessEntries")
-    trafficless_entries=${trafficless_entries:-1}
-    retention_start=$(cat "$WORK_DIR/vnstat_daily_coverage_start" 2>/dev/null || true)
-    retention_num=${retention_start//-/}
-    if [ -z "$retention_start" ] && [ -f "$WORK_DIR/vnstat.conf.before-trafficcop-lite" ] \
-        && [[ "$earliest_num" =~ ^[0-9]{8}$ ]] && [ "$earliest_num" -ne 0 ]; then
-        retention_start="$earliest_num"
-        retention_num="$earliest_num"
-    fi
-    if ! [[ "$created_num" =~ ^[0-9]{8}$ ]] \
-        || { [ "$daily_days" != "-1" ] && { ! [[ "$daily_days" =~ ^[0-9]+$ ]] || [ "$daily_days" -lt "$required_days" ]; }; }; then
-        return 2
-    fi
-    if [ "$created_num" -gt "$start_num" ] \
-        || { [ "$trafficless_entries" = "0" ] && [ -n "$retention_start" ] && { ! [[ "$retention_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$start_num" ]; }; } \
-        || { [ "$trafficless_entries" != "0" ] && { ! [[ "$earliest_num" =~ ^[0-9]+$ ]] || [ "$earliest_num" -eq 0 ] || [ "$earliest_num" -gt "$start_num" ]; }; }; then
-        [ "${ALLOW_PARTIAL_HISTORY:-false}" = "true" ] || return 2
-    fi
-
-    case "${TRAFFIC_MODE:-total}" in
-        out)
-            usage_bytes=$(printf '%s' "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
-                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .tx] | add // 0' 2>/dev/null) || return 1
-            ;;
-        in)
-            usage_bytes=$(printf '%s' "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
-                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .rx] | add // 0' 2>/dev/null) || return 1
-            ;;
-        max)
-            rx_bytes=$(printf '%s' "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
-                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .rx] | add // 0' 2>/dev/null) || return 1
-            tx_bytes=$(printf '%s' "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
-                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | .tx] | add // 0' 2>/dev/null) || return 1
-            usage_bytes=$(awk -v rx="$rx_bytes" -v tx="$tx_bytes" 'BEGIN { if (rx >= tx) print rx; else print tx }')
-            ;;
-        total|*)
-            usage_bytes=$(printf '%s' "$vnstat_json" | jq --argjson start_num "$start_num" --argjson end_num "$end_num" \
-                '[.interfaces[0].traffic.day[]? | (.date.year * 10000 + .date.month * 100 + .date.day) as $date_num | select($date_num >= $start_num and $date_num <= $end_num) | (.rx + .tx)] | add // 0' 2>/dev/null) || return 1
-            ;;
-    esac
-
-    if ! [[ "$usage_bytes" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-        return 1
-    fi
-
-    [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && divisor=1000000000 || divisor=1073741824
-    awk -v bytes="$usage_bytes" -v divisor="$divisor" 'BEGIN { printf "%.3f", bytes / divisor }'
-}
-
-show_traffic_overview() {
-    local config_file="$WORK_DIR/traffic_monitor_config.txt"
-    local start_date end_date period_label mode_label usage_gb percent usage_color bar limit_text unit_label usage_status
-    local available_start available_num start_num retention_start retention_num trafficless_entries
-
-    if [ ! -s "$config_file" ]; then
-        echo -e "${CYAN}流量概览:${NC} ${YELLOW}未配置${NC}"
-        return
-    fi
-
-    if command -v vnstat >/dev/null 2>&1 && [ "$(lite_vnstat_config_value "UseUTC")" = "1" ]; then
-        export TZ=UTC
-    else
-        unset TZ
-    fi
-
-    local TRAFFIC_MODE="total"
-    local TRAFFIC_PERIOD="monthly"
-    local TRAFFIC_LIMIT=""
-    local TRAFFIC_UNIT="binary"
-    local PERIOD_START_DAY="1"
-    local PERIOD_START_MONTH="1"
-    local MAIN_INTERFACE=""
-    local ALLOW_PARTIAL_HISTORY="false"
-    local key value
-
-    while IFS='=' read -r key value; do
-        value=${value%$'\r'}
-        case "$key" in
-            TRAFFIC_MODE|TRAFFIC_PERIOD|TRAFFIC_LIMIT|TRAFFIC_UNIT|PERIOD_START_DAY|PERIOD_START_MONTH|MAIN_INTERFACE|ALLOW_PARTIAL_HISTORY)
-                printf -v "$key" '%s' "$value"
-                ;;
-        esac
-    done < "$config_file"
-
-    case "$TRAFFIC_PERIOD" in
-        monthly|quarterly|yearly) ;;
-        *) TRAFFIC_PERIOD="monthly" ;;
-    esac
-    if ! [[ "$TRAFFIC_MODE" =~ ^(out|in|total|max)$ ]]; then
-        TRAFFIC_MODE="total"
-    fi
-    if ! [[ "$TRAFFIC_LIMIT" =~ ^[0-9]+([.][0-9]+)?$ ]] || ! lite_compare_ge "$TRAFFIC_LIMIT" "0.000001"; then
-        TRAFFIC_LIMIT=""
-    fi
-    if ! [[ "$PERIOD_START_DAY" =~ ^(0?[1-9]|[12][0-9]|3[01])$ ]]; then
-        echo -e "${CYAN}流量概览:${NC} ${YELLOW}配置异常（周期起始日必须为 1-31）${NC}"
-        return
-    fi
-    PERIOD_START_DAY=$((10#$PERIOD_START_DAY))
-
-    start_date=$(lite_period_start_date)
-    end_date=$(lite_period_end_date)
-    period_label=$(lite_period_label "$TRAFFIC_PERIOD")
-    mode_label=$(lite_mode_label "$TRAFFIC_MODE")
-    [ "$TRAFFIC_UNIT" = "decimal" ] && unit_label="GB" || unit_label="GiB"
-
-    echo -e "${CYAN}流量周期:${NC} ${WHITE}${period_label} · ${mode_label}${NC}  ${WHITE}${start_date} ~ ${end_date}${NC}"
-    if [ "$ALLOW_PARTIAL_HISTORY" = "true" ]; then
-        available_start=$(lite_vnstat_available_start 2>/dev/null || true)
-        retention_start=$(cat "$WORK_DIR/vnstat_daily_coverage_start" 2>/dev/null || true)
-        trafficless_entries=$(lite_vnstat_config_value "TrafficlessEntries")
-        trafficless_entries=${trafficless_entries:-1}
-        available_num=${available_start//-/}
-        retention_num=${retention_start//-/}
-        start_num=${start_date//-/}
-        if [ "$trafficless_entries" = "0" ] && [[ "$retention_num" =~ ^[0-9]{8}$ ]] \
-            && { ! [[ "$available_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$available_num" ]; }; then
-            available_start="$retention_start"
-            available_num="$retention_num"
-        fi
-        if { [[ "$available_num" =~ ^[0-9]{8}$ ]] && [ "$available_num" -gt "$start_num" ]; } \
-            || { [ -n "$retention_start" ] && [[ "$retention_num" =~ ^[0-9]{8}$ ]] && [ "$retention_num" -gt "$start_num" ]; }; then
-            echo -e "${YELLOW}历史提示:${NC} ${YELLOW}仅统计 ${available_start:-现有记录} 以来数据，周期早段流量未计入${NC}"
-        fi
-    fi
-
-    if [ -z "$TRAFFIC_LIMIT" ]; then
-        echo -e "${CYAN}已用/总量:${NC} ${YELLOW}总量配置异常${NC}"
-        return
-    fi
-
-    limit_text=$(awk -v limit="$TRAFFIC_LIMIT" 'BEGIN { printf "%.3f", limit }')
-    usage_gb=$(lite_current_usage_gb "$start_date" "$end_date")
-    usage_status=$?
-    if [ "$usage_status" -ne 0 ]; then
-        if [ "$usage_status" -eq 2 ]; then
-            echo -e "${CYAN}已用/总量:${NC} ${YELLOW}历史日数据覆盖不足${NC} / ${WHITE}${limit_text} $unit_label${NC}"
-        else
-            echo -e "${CYAN}已用/总量:${NC} ${YELLOW}暂无法读取${NC} / ${WHITE}${limit_text} $unit_label${NC}"
-        fi
-        return
-    fi
-
-    percent=$(awk -v used="$usage_gb" -v limit="$TRAFFIC_LIMIT" 'BEGIN { if (limit > 0) printf "%.1f", used / limit * 100; else printf "0.0" }')
-    usage_color="$GREEN"
-    if lite_compare_ge "$percent" "90"; then
-        usage_color="$RED"
-    elif lite_compare_ge "$percent" "75"; then
-        usage_color="$YELLOW"
-    fi
-    bar=$(lite_usage_bar "$percent" "$usage_color")
-
-    echo -e "${CYAN}已用/总量:${NC} ${usage_color}${usage_gb} $unit_label${NC} / ${WHITE}${limit_text} $unit_label${NC}  ${usage_color}${percent}%${NC} ${bar}"
-}
-
-lite_state_value() {
-    local file="$1"
-    local key="$2"
-    if [ -f "$file" ]; then
-        grep "^${key}=" "$file" 2>/dev/null | tail -n 1 | cut -d'=' -f2-
-    fi
-}
-
-show_enforcement_overview() {
-    local config_file="$WORK_DIR/traffic_monitor_config.txt"
-    local mode until_epoch reason now remaining
-    local limit_mode="" boot_grace_minutes=10 disabled=false key value uptime_seconds
-
-    [ -s "$config_file" ] || return
-    while IFS='=' read -r key value; do
-        value=${value%$'\r'}
-        case "$key" in
-            LIMIT_MODE) limit_mode="$value" ;;
-            TC_BOOT_GRACE_MINUTES) boot_grace_minutes="$value" ;;
-            DISABLED) disabled="$value" ;;
-        esac
-    done < "$config_file"
-
-    if [ "$disabled" = "true" ]; then
-        echo -e "${CYAN}限制执行:${NC} ${RED}已禁用${NC}"
-        return
-    fi
-
-    mode=$(lite_state_value "$ENFORCEMENT_STATE_FILE" "MODE")
-    until_epoch=$(lite_state_value "$ENFORCEMENT_STATE_FILE" "UNTIL_EPOCH")
-    reason=$(lite_state_value "$ENFORCEMENT_STATE_FILE" "REASON")
-    now=$(date +%s)
-    if [ "$mode" = "grace" ] && [[ "$until_epoch" =~ ^[0-9]+$ ]] && [ "$until_epoch" -gt "$now" ]; then
-        remaining=$(( (until_epoch - now + 59) / 60 ))
-        echo -e "${CYAN}限制执行:${NC} ${YELLOW}宽限中，约剩余 $remaining 分钟${NC}"
-        return
-    fi
-    if [ "$mode" = "paused" ]; then
-        if [ "$reason" = "shutdown_reboot" ]; then
-            echo -e "${CYAN}限制执行:${NC} ${RED}关机后重启保护，已暂停再次关机${NC}"
-        else
-            echo -e "${CYAN}限制执行:${NC} ${YELLOW}已暂停，仅监控流量${NC}"
-        fi
-        return
-    fi
-
-    # 前导零（如 09）按十进制解释，否则下面的 $(( )) 会按八进制报错，整个菜单打不开。
-    if [[ "$boot_grace_minutes" =~ ^[0-9]{1,4}$ ]]; then
-        boot_grace_minutes=$((10#$boot_grace_minutes))
-    fi
-    if [ "$limit_mode" = "tc" ] && [[ "$boot_grace_minutes" =~ ^[0-9]+$ ]] \
-        && [ "$boot_grace_minutes" -gt 0 ] && [ "$boot_grace_minutes" -le 1440 ]; then
-        uptime_seconds=$(awk '{ printf "%d", $1 }' /proc/uptime 2>/dev/null || echo 0)
-        if [[ "$uptime_seconds" =~ ^[0-9]+$ ]] && [ "$uptime_seconds" -lt $((boot_grace_minutes * 60)) ]; then
-            remaining=$(( (boot_grace_minutes * 60 - uptime_seconds + 59) / 60 ))
-            echo -e "${CYAN}限制执行:${NC} ${YELLOW}开机宽限中，约剩余 $remaining 分钟${NC}"
-            return
-        fi
-    fi
-    echo -e "${CYAN}限制执行:${NC} ${GREEN}正常${NC}"
-}
-
-menu_item() {
-    local number="$1"
-    local label="$2"
-    local number_color="${3:-$PURPLE}"
-    local label_color="${4:-$WHITE}"
-    printf "${number_color}%2s)${NC} ${label_color}%s${NC}\n" "$number" "$label"
-}
-
-tail_file() {
-    local file="$1"
-    local title="$2"
-    echo -e "${CYAN}${title}${NC}"
-    if [ -f "$file" ]; then
-        tail -80 "$file"
-    else
-        echo -e "${YELLOW}文件不存在：$file${NC}"
-    fi
-}
-
-view_logs() {
-    while true; do
-        if [ -t 1 ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-dumb}" != dumb ]; then clear; fi
-        if [[ "${COLUMNS:-80}" =~ ^[0-9]+$ ]] && [ "${COLUMNS:-80}" -lt 42 ]; then
-            echo -e "${BLUE}查看日志${NC}"
-        else
-            echo -e "${BLUE}╔════════════════════════════════════════╗${NC}"
-            echo -e "${BLUE}║              查看日志                  ║${NC}"
-            echo -e "${BLUE}╚════════════════════════════════════════╝${NC}"
-        fi
-        echo "1) 流量监控日志"
-        echo "2) Telegram 通知日志"
-        echo "3) 当前 crontab 相关条目"
-        echo "4) 操作审计日志（安装、配置、限速与恢复）"
-        echo "0) 返回主菜单"
-        echo ""
-        if ! read -r -p "请输入选项: " choice; then
-            echo ""
-            return
-        fi
-
-        case "$choice" in
-            1) tail_file "$WORK_DIR/traffic_monitor.log" "流量监控日志"; pause ;;
-            2) tail_file "$WORK_DIR/tg_notifier_cron.log" "Telegram 通知日志"; pause ;;
-            4) tail_file "$WORK_DIR/operations.log" "操作审计日志"; pause ;;
-            3)
-                echo -e "${CYAN}TrafficCop-Lite 定时任务:${NC}"
-                local cron_list=""
-                if ! cron_list=$(read_current_crontab 2>/dev/null); then
-                    echo -e "${YELLOW}无法读取 root crontab，无法列出定时任务。${NC}"
-                else
-                    printf '%s\n' "$cron_list" | grep -F "$WORK_DIR" || echo "无相关定时任务"
-                fi
-                pause
-                ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${NC}"; sleep 1 ;;
-        esac
-    done
-}
-
-print_config_file() {
-    local file="$1"
-    local title="$2"
-    echo -e "${CYAN}${title}${NC}"
-    if [ -f "$file" ]; then
-        sed -E 's/^(BOT_TOKEN=).*/\1********/; s/^(CHAT_ID=).*/\1********/' "$file"
-    else
-        echo -e "${YELLOW}配置不存在：$file${NC}"
-    fi
-}
-
-view_config() {
-    while true; do
-        if [ -t 1 ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-dumb}" != dumb ]; then clear; fi
-        if [[ "${COLUMNS:-80}" =~ ^[0-9]+$ ]] && [ "${COLUMNS:-80}" -lt 42 ]; then
-            echo -e "${BLUE}当前配置${NC}"
-        else
-            echo -e "${BLUE}╔════════════════════════════════════════╗${NC}"
-            echo -e "${BLUE}║             当前配置                   ║${NC}"
-            echo -e "${BLUE}╚════════════════════════════════════════╝${NC}"
-        fi
-        echo "1) 流量监控配置"
-        echo "2) Telegram 通知配置"
-        echo "3) 独立版安装状态"
-        echo "0) 返回主菜单"
-        echo ""
-        if ! read -r -p "请输入选项: " choice; then
-            echo ""
-            return
-        fi
-
-        case "$choice" in
-            1) print_config_file "$WORK_DIR/traffic_monitor_config.txt" "流量监控配置"; pause ;;
-            2) print_config_file "$WORK_DIR/tg_notifier_config.txt" "Telegram 通知配置"; pause ;;
-            3) show_status_line; pause ;;
-            0) return ;;
-            *) echo -e "${RED}无效选择${NC}"; sleep 1 ;;
-        esac
-    done
 }
 
 remove_lite_cron() {
@@ -2415,6 +2155,8 @@ stop_lite_processes() {
     pkill -f -- "^(/usr)?/bin/bash $WORK_DIR/$TELEGRAM_SCRIPT -cron\$" 2>/dev/null || true
 }
 
+# >>> ntc-common:cleanup-lock >>>
+# 本区块由 tools/sync-common.sh 根据 src/common/cleanup-lock.sh 生成，请改源文件后运行该脚本，勿直接修改。
 acquire_monitor_cleanup_lock() {
     touch "$MONITOR_LOCK_FILE" || return 1
     chmod 600 "$MONITOR_LOCK_FILE" 2>/dev/null || true
@@ -2429,6 +2171,7 @@ release_monitor_cleanup_lock() {
     flock -u 9 2>/dev/null || true
     exec 9>&-
 }
+# <<< ntc-common:cleanup-lock <<<
 
 clear_lite_tc_rules_interactive() {
     local config="$WORK_DIR/traffic_monitor_config.txt"
@@ -2454,7 +2197,11 @@ clear_lite_tc_rules_interactive() {
     bash "$monitor_path" --tc-clear-owned "停止或卸载 TrafficCop-Lite"
 }
 
+# 系统里是否有待执行的计划关机。systemd-logind 安排的关机会写 /run/systemd/shutdown/scheduled（取消时删除），
+# 各个 systemd 版本都有；shutdown --show 要 systemd 250 起才有，logind 的计划关机也没有常驻进程，
+# 只看 --show 或 pgrep 会漏掉它（monitor 会每分钟重新安排关机，暂停/停用会误删 NTC 的关机记录），所以先看这个文件。
 lite_has_pending_shutdown() {
+    [ ! -e "${SYSTEMD_SHUTDOWN_SCHEDULED_FILE:-/run/systemd/shutdown/scheduled}" ] || return 0
     if shutdown --help 2>&1 | grep -q -- '--show'; then
         shutdown --show >/dev/null 2>&1
     elif command -v pgrep >/dev/null 2>&1; then
@@ -2483,8 +2230,8 @@ lite_pending_shutdown_matches_owned_state() {
             return 0
         fi
     fi
-    if [ -r /run/systemd/shutdown/scheduled ] &&
-       grep -Fq "$task_token" /run/systemd/shutdown/scheduled 2>/dev/null; then
+    if [ -r "${SYSTEMD_SHUTDOWN_SCHEDULED_FILE:-/run/systemd/shutdown/scheduled}" ] &&
+       grep -Fq "$task_token" "${SYSTEMD_SHUTDOWN_SCHEDULED_FILE:-/run/systemd/shutdown/scheduled}" 2>/dev/null; then
         return 0
     fi
     return 1
@@ -2506,316 +2253,820 @@ cancel_shutdown_interactive() {
             echo -e "${RED}无法确认计划关机是否属于本脚本，已保留系统任务和状态文件。${NC}"
             return 1
         fi
-        if lite_has_pending_shutdown; then
-            if ! lite_pending_shutdown_matches_owned_state; then
-                echo -e "${RED}当前计划关机无法与本脚本任务标识匹配，已保留系统任务和状态文件。${NC}"
-                return 1
-            fi
-            if ! shutdown -c 2>/dev/null || lite_has_pending_shutdown; then
-                echo -e "${RED}无法取消本脚本记录的计划关机，已保留状态文件。${NC}"
-                return 1
-            fi
+        if ! lite_has_pending_shutdown; then
+            rm -f "$SHUTDOWN_STATE_FILE" || return 1
+            echo "✓ 已清理 NTC 的关机记录（当前没有待执行的计划关机）"
+            return 0
+        fi
+        if ! lite_pending_shutdown_matches_owned_state; then
+            echo -e "${RED}当前计划关机无法与本脚本任务标识匹配，已保留系统任务和状态文件。${NC}"
+            return 1
+        fi
+        if ! shutdown -c 2>/dev/null || lite_has_pending_shutdown; then
+            echo -e "${RED}无法取消本脚本记录的计划关机，已保留状态文件。${NC}"
+            return 1
         fi
         rm -f "$SHUTDOWN_STATE_FILE" || return 1
         echo "✓ 已取消本脚本记录的计划关机"
-        return
+        return 0
     fi
-    if grep -q '^LIMIT_MODE=shutdown' "$config" 2>/dev/null; then
-        echo -e "${YELLOW}检测到独立版曾配置关机模式。${NC}"
-        read -r -p "是否取消当前系统计划关机？[y/N]: " confirm
-        if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            if ! shutdown -c 2>/dev/null; then
-                echo -e "${RED}取消计划关机失败，请先手动确认系统关机任务。${NC}"
-                return 1
-            fi
-            if lite_has_pending_shutdown; then
-                echo -e "${RED}取消命令执行后仍检测到计划关机，请先手动处理。${NC}"
-                return 1
-            fi
-            echo "✓ 已取消计划关机"
-        fi
+    # 没有 NTC 的关机记录、配置是关机模式：系统里的计划关机可能是旧版本安排的，也可能来自其他程序，无法确认归属。
+    # 这里不提问、不读标准输入（卸载已在取锁前问过，--stop 不问）：只有 LITE_UNOWNED_SHUTDOWN_ANSWER=y 才取消，
+    # 否则保留并说明；系统里没有待执行的关机时什么都不做，也不说「已取消」。
+    grep -q '^LIMIT_MODE=shutdown' "$config" 2>/dev/null || return 0
+    lite_has_pending_shutdown || return 0
+    if [ "${LITE_UNOWNED_SHUTDOWN_ANSWER:-n}" != y ]; then
+        echo -e "${YELLOW}系统里有一个计划关机，NTC 没有它的记录（可能是旧版本或其他程序安排的），已保留。${NC}"
+        return 0
     fi
+    if ! shutdown -c 2>/dev/null; then
+        echo -e "${RED}取消计划关机失败，请先手动确认系统关机任务。${NC}"
+        return 1
+    fi
+    if lite_has_pending_shutdown; then
+        echo -e "${RED}取消命令执行后仍检测到计划关机，请先手动处理。${NC}"
+        return 1
+    fi
+    echo "✓ 已取消计划关机"
 }
 
-stop_all_services() {
-    local has_error=false
+# ── 2.0 界面：仪表盘、主菜单、子菜单与命令行 ───────────────────────────────
+UPDATE_DIRECT_BASE="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
+UPDATE_PROXY_BASE="https://v6.gh-proxy.org/https://raw.githubusercontent.com/${REPO}/${BRANCH}"
+# 主菜单：1–5 流量监控，6–10 系统维护（两列时编号竖排）。
+MAIN_MENU_LABELS=(状态详情 修改监控配置 限制执行 "Telegram 通知" 立即检查一次 查看日志 "更新 NTC" 依赖管理 "TC 冲突处理 / 自动恢复" "卸载 NTC")
+MAIN_MENU_SPLIT=5
 
-    echo -e "${CYAN}正在停止 TrafficCop-Lite 服务...${NC}"
-    if ! remove_lite_cron; then
-        echo -e "${RED}无法安全移除定时任务，本次未清理 TC 规则。${NC}"
-        pause
-        ntc_operation_log stop failure
-        return 1
-    fi
-    echo "✓ 已移除独立版 crontab 条目"
-
-    if ! acquire_monitor_cleanup_lock; then
-        echo -e "${RED}无法取得监控锁，本次未清理 TC 规则。${NC}"
-        pause
-        ntc_operation_log stop failure
-        return 1
-    fi
-    stop_lite_processes
-    echo "✓ 已停止独立版监控/通知进程"
-
-    clear_lite_tc_rules_interactive || has_error=true
-    cancel_shutdown_interactive || has_error=true
-    release_monitor_cleanup_lock
-
-    if $has_error; then
-        echo -e "${RED}停止流程未完全成功；安装目录和状态文件已保留，请查看上方错误。${NC}"
-        ntc_operation_log stop failure
-    else
-        echo -e "${GREEN}独立版服务停止流程完成。${NC}"
-        ntc_operation_log stop success
-    fi
-    pause
-    $has_error && return 1
-    return 0
+pause() {
+    ui_pause
 }
 
-uninstall_lite() {
-    if [ -t 1 ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-dumb}" != dumb ]; then clear; fi
-    echo -e "${RED}${BOLD}卸载 TrafficCop-Lite${NC}"
-    echo ""
-    echo "只会处理独立版目录：$WORK_DIR"
-    echo "不会删除 /root/TrafficCop，也不会卸载 vnstat/jq/bc/cron/iproute2 等系统软件包。"
-    echo ""
-    read -r -p "确认卸载？请输入 UNINSTALL 继续: " confirm
-    if [ "$confirm" != "UNINSTALL" ]; then
-        echo "已取消卸载。"
-        pause || true
-        return 1
-    fi
+ntc_hostname() {
+    local name=""
+    name=$(hostname -s 2>/dev/null) || name=""
+    [ -n "$name" ] || name=$(uname -n 2>/dev/null) || name=""
+    printf '%s' "${name:-本机}"
+}
 
-    if ! remove_lite_cron; then
-        echo -e "${RED}卸载已中止：无法移除独立版 crontab 条目。${NC}"
-        pause
-        return 1
-    fi
-    if ! acquire_monitor_cleanup_lock; then
-        echo -e "${RED}卸载已中止：无法取得监控锁。${NC}"
-        pause
-        return 1
-    fi
-    stop_lite_processes
-    if ! clear_lite_tc_rules_interactive; then
-        release_monitor_cleanup_lock
-        echo -e "${RED}卸载已中止：TC 限速未能安全清理，状态文件已保留。${NC}"
-        pause
-        return 1
-    fi
-    if ! cancel_shutdown_interactive; then
-        release_monitor_cleanup_lock
-        echo -e "${RED}卸载已中止：本脚本记录的计划关机未能安全取消，状态文件已保留。${NC}"
-        pause
-        return 1
-    fi
+# 只用 command -v 检查核心依赖命令（不调用 dpkg，菜单每次重绘都可以用）；缺失时输出包名并返回 1。
+ntc_missing_tools() {
+    local package tools missing=""
+    while IFS='|' read -r package tools _; do
+        [ -n "$package" ] || continue
+        dependency_tools_available "$package" "$tools" >/dev/null 2>&1 || missing+="${missing:+ }$package"
+    done < <(dependency_manifest core)
+    [ -z "$missing" ] && return 0
+    printf '%s' "$missing"
+    return 1
+}
 
-    if [ -d "$WORK_DIR" ]; then
-        read -r -p "是否先备份配置和日志？[Y/n]: " keep_backup
-        if [[ ! "$keep_backup" =~ ^[Nn]$ ]]; then
-            local backup_dir
-            backup_dir="/etc/trafficcop-lite-backup-$(date +%Y%m%d-%H%M%S)"
-            mkdir -m 700 "$backup_dir" || {
-                release_monitor_cleanup_lock
-                echo -e "${RED}创建备份目录失败，卸载已中止。${NC}"
-                pause
-                return 1
-            }
-            if ! cp -a "$WORK_DIR/." "$backup_dir/"; then
-                release_monitor_cleanup_lock
-                echo -e "${RED}配置和日志备份失败，卸载已中止；未删除工作目录。${NC}"
-                pause
-                return 1
-            fi
-            chmod 700 "$backup_dir" 2>/dev/null || true
-            echo "✓ 已备份到 $backup_dir"
+dashboard_default_interface() {
+    ip route show default 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }'
+}
+
+# 未配置时仪表盘唯一的一次 vnStat 调用：本自然月的收发合计（字节，仅 vnStat 2.x 的 JSON）。
+dashboard_month_bytes() {
+    local iface="$1" json year month
+    command -v vnstat >/dev/null 2>&1 && command -v jq >/dev/null 2>&1 || return 1
+    json=$(timeout 5 vnstat -i "$iface" --json m 2 2>/dev/null) || return 1
+    year=$(date +%Y)
+    month=$((10#$(date +%m)))
+    jq -er --arg i "$iface" --argjson y "$year" --argjson m "$month" '
+        [.interfaces[]? | select(.name == $i) | .traffic.month[]?
+         | select(.date.year == $y and .date.month == $m) | (.rx + .tx)] | first // empty
+    ' <<< "$json" 2>/dev/null
+}
+
+# 仪表盘：只读状态文件（未配置时外加一次 vnstat），不跑 TC 自检、不等任何锁。
+show_dashboard() {
+    local config="$WORK_DIR/traffic_monitor_config.txt" usage_file="$WORK_DIR/current_traffic_state"
+    local tg_config="$WORK_DIR/tg_notifier_config.txt" now cron="" cron_ok=true
+    local iface mode period day month unit limit tolerance lmode speed disabled partial
+    local status usage threshold pstart pend updated pct age summary left_text
+    local level word color detail cron_entry text until fc elapsed avg projected hit missing report_time warn
+    now=$(date +%s)
+    ui_title "TrafficCop Lite v$SCRIPT_VERSION" "$(ntc_hostname)"
+    cron=$(read_current_crontab 2>/dev/null) || cron_ok=false
+
+    if [ ! -f "$config" ]; then
+        ui_row "$YELLOW" "○ 未配置" "流量监控尚未配置，输入 2 开始（约 1 分钟）"
+        iface=$(dashboard_default_interface)
+        if [ -n "$iface" ] && usage=$(dashboard_month_bytes "$iface") && usage=$(ntc_bytes_to_unit "$usage" decimal); then
+            ui_kv "本月已用" "$(ntc_num "$usage") GB（$iface，vnStat 按自然月统计）"
         fi
-        if ! rm -rf "$WORK_DIR"; then
-            release_monitor_cleanup_lock
-            echo -e "${RED}删除 $WORK_DIR 失败，请检查文件系统状态。${NC}"
-            pause
-            return 1
-        fi
-        echo "✓ 已删除 $WORK_DIR"
     else
-        echo "独立版工作目录不存在，无需删除。"
+        iface=$(ntc_kv "$config" MAIN_INTERFACE) || iface="?"
+        mode=$(ntc_kv "$config" TRAFFIC_MODE) || mode=total
+        period=$(ntc_kv "$config" TRAFFIC_PERIOD) || period=monthly
+        day=$(ntc_int "$(ntc_kv "$config" PERIOD_START_DAY)" 1 31) || day=""
+        month=$(ntc_int "$(ntc_kv "$config" PERIOD_START_MONTH)" 1 12) || month=1
+        unit=$(ntc_unit_label "$(ntc_kv "$config" TRAFFIC_UNIT)")
+        limit=$(ntc_kv "$config" TRAFFIC_LIMIT) || limit=""
+        tolerance=$(ntc_kv "$config" TRAFFIC_TOLERANCE) || tolerance=0
+        lmode=$(ntc_kv "$config" LIMIT_MODE) || lmode=tc
+        speed=$(ntc_kv "$config" LIMIT_SPEED) || speed=""
+        disabled=$(ntc_kv "$config" DISABLED) || disabled=false
+        partial=$(ntc_kv "$config" ALLOW_PARTIAL_HISTORY) || partial=false
+        status=$(ntc_kv "$usage_file" STATUS) || status=""
+        usage=$(ntc_kv "$usage_file" USAGE) || usage=""
+        threshold=$(ntc_kv "$usage_file" LIMIT_THRESHOLD) || threshold=""
+        pstart=$(ntc_kv "$usage_file" PERIOD_START) || pstart=""
+        pend=$(ntc_kv "$usage_file" PERIOD_END) || pend=""
+        updated=$(ntc_kv "$usage_file" UPDATED_EPOCH) || updated=""
+        [ -n "$threshold" ] || threshold=$(awk -v l="$limit" -v t="$tolerance" \
+            'BEGIN { if (l ~ /^[0-9]+(\.[0-9]+)?$/ && t ~ /^[0-9]+(\.[0-9]+)?$/) print l - t }')
+
+        if [ -n "$day" ]; then
+            summary="$iface · $(ntc_mode_label "$mode") · $(ntc_period_label "$period" "$day" "$month")"
+        else
+            summary="$iface · $(ntc_mode_label "$mode") · 配置异常：周期起始日必须为 1–31"
+        fi
+        if until=$(ntc_date_epoch "$pend"); then
+            left_text=$(awk -v e="$((until + 86400))" -v n="$now" 'BEGIN { printf "%.2f", (e - n) / 86400 }')
+            summary+="，还剩 $(ntc_days_left_text "$left_text")"
+        fi
+
+        cron_entry=false
+        if $cron_ok && ntc_cron_has_entry "$cron" "$WORK_DIR/$MONITOR_SCRIPT"; then
+            cron_entry=true
+        fi
+        until=$(ntc_kv "$ENFORCEMENT_STATE_FILE" UNTIL_EPOCH) || until=""
+        IFS=$'\t' read -r level word detail < <(ntc_overall_status "$disabled" "$cron_ok" "$cron_entry" \
+            "$WORK_DIR/monitor_health" "$status" "$speed" "$until" "$now")
+        color=$(ui_level_color "$level")
+        if [ -z "$detail" ]; then
+            ui_row "$color" "$word" "$summary"
+        else
+            ui_row "$color" "$word" "$detail"
+            ui_kv "周期" "$summary"
+        fi
+
+        if [ -n "$usage" ] && pct=$(ntc_percent "$usage" "$limit"); then
+            text=""
+            if [[ "$updated" =~ ^[0-9]+$ ]] && age=$(( (now - updated) / 60 )) && [ "$age" -ge 10 ]; then
+                text="（${age} 分钟前）"
+            fi
+            ui_usage_kv "本期已用" "$(ntc_num "$usage") $unit / $(ntc_num "$limit") $unit" "$pct" "$text"
+        else
+            ui_kv "本期已用" "尚未统计（定时任务每分钟更新）"
+        fi
+        if [ "$lmode" = shutdown ]; then
+            ui_kv "超额处理" "达到 $(ntc_num "$threshold" 2>/dev/null || printf '%s' "$threshold") $unit 后关机"
+        else
+            ui_kv "超额处理" "达到 $(ntc_num "$threshold" 2>/dev/null || printf '%s' "$threshold") $unit 后整机限速 ${speed:-?} kbit/s"
+        fi
+        if [ -n "$usage" ] && fc=$(ntc_forecast "$usage" "$threshold" "$pstart" "$pend" "$now"); then
+            read -r elapsed _ _ avg projected hit <<< "$fc"
+            if [ "$hit" = 0 ]; then
+                :
+            elif awk -v e="$elapsed" 'BEGIN { exit !(e < 1) }'; then
+                ui_kv "本期预计" "本期刚开始，满一天后显示预计用量"
+            elif [ "$hit" != -1 ]; then
+                ui_row "$DIM" "本期预计" "约 $(ntc_num "$projected") $unit，按目前速度 $(date -d "@$hit" '+%m-%d' 2>/dev/null || echo '?') 达到阈值" "$YELLOW"
+            else
+                ui_kv "本期预计" "约 $(ntc_num "$projected") $unit（按本期日均 $(ntc_num "$avg") $unit）"
+            fi
+        fi
+        [ "$partial" != true ] || ui_note "本期 vnStat 历史不完整，已用量可能偏低；进入新周期后恢复正常。"
     fi
 
-    release_monitor_cleanup_lock
-
-    if [ "$(readlink "$SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
-        rm -f "$SHORTCUT_PATH"
-        echo "✓ 已删除快捷命令 $SHORTCUT_PATH"
+    if [ ! -f "$tg_config" ]; then
+        ui_kv "Telegram" "未配置（选 4 设置）"
+    elif [ "$(ntc_kv "$tg_config" TG_DISABLED)" = true ]; then
+        ui_kv "Telegram" "已停用"
+    elif ! $cron_ok; then
+        ui_kv "Telegram" "已配置（读不出 root crontab，不能确认是否在发送）"
+    elif ! ntc_cron_has_entry "$cron" "$WORK_DIR/$TELEGRAM_SCRIPT"; then
+        ui_kv "Telegram" "定时任务缺失，不会发送（选 4 打开时会自动补上）"
+    else
+        report_time=$(ntc_kv "$tg_config" DAILY_REPORT_TIME) || report_time=""
+        warn=$(ntc_tg_warn_percents "$tg_config")
+        if [ "$warn" = off ]; then warn="预警已关闭"; else warn="预警 ${warn//,/%、}%"; fi
+        ui_kv "Telegram" "已启用${report_time:+，每日 $report_time 日报}；$warn"
     fi
-    if [ "$(readlink "$LEGACY_NCL_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
-        rm -f "$LEGACY_NCL_SHORTCUT_PATH"
-        echo "✓ 已删除旧快捷命令 $LEGACY_NCL_SHORTCUT_PATH"
+    if ! missing=$(ntc_missing_tools); then
+        ui_warn "缺少依赖：$missing（选 8 安装）"
     fi
-    if [ "$(readlink "$LEGACY_TC_SHORTCUT_PATH" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
-        rm -f "$LEGACY_TC_SHORTCUT_PATH"
-        echo "✓ 已删除旧快捷命令 $LEGACY_TC_SHORTCUT_PATH"
-    fi
-    if ! cleanup_tc_recovery_files_if_unused; then
-        echo -e "${RED}TrafficCop Lite 主体已删除，但共享 TC 自动恢复文件未能安全清理；卸载未完整完成。${NC}"
-        pause
-        return 1
-    fi
-
-    echo -e "${GREEN}卸载完成。${NC}"
-    pause || true
-    return 0
+    ui_rule
 }
 
 show_main_menu() {
-    if [ -t 1 ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-dumb}" != dumb ]; then clear; fi
-    if [[ "${COLUMNS:-80}" =~ ^[0-9]+$ ]] && [ "${COLUMNS:-80}" -lt 46 ]; then
-        echo -e "${BOLD}TrafficCop Lite 独立管理工具${NC}"
-    else
-        echo -e "${BLUE}╔════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║${BOLD}        TrafficCop Lite 独立管理工具        ${NC}${BLUE}║${NC}"
-        echo -e "${BLUE}╚════════════════════════════════════════════╝${NC}"
-    fi
-    echo -e "${PURPLE}版本: ${SCRIPT_VERSION}    更新: ${LAST_UPDATE}${NC}"
-    echo ""
-    show_status_line
-    if dependency_host_cli check >/dev/null 2>&1; then
-        echo -e "${CYAN}依赖:${NC} ${GREEN}可用${NC}"
-    else
-        echo -e "${CYAN}依赖:${NC} ${YELLOW}缺失或异常（选择 10 检查）${NC}"
-    fi
-    echo -e "${CYAN}快捷命令:${NC} sudo ntc"
-    show_traffic_overview
-    show_enforcement_overview
-    echo ""
-    menu_item "1" "安装/管理流量监控"
-    menu_item "2" "安装/管理 Telegram 通知"
-    menu_item "3" "机器限速管理 (启用/禁用)"
-    menu_item "4" "查看日志"
-    menu_item "5" "查看当前配置"
-    menu_item "6" "停止所有服务"
-    menu_item "7" "更新脚本"
-    menu_item "8" "卸载 TrafficCop-Lite" "$RED" "$RED"
-    menu_item "9" "TC 冲突处理/自动恢复"
-    menu_item "10" "依赖检测、安装与卸载"
-    menu_item "0" "退出"
-    echo ""
+    menu_clear
+    show_dashboard
+    ui_menu_groups 流量监控 系统维护 "$MAIN_MENU_SPLIT" "${MAIN_MENU_LABELS[@]}"
+    ui_rule
+    ui_option 0 退出
 }
 
-main() {
-    local _
-    if [ -z "${COLUMNS:-}" ] && [ -t 0 ] && command -v stty >/dev/null 2>&1; then
-        read -r _ COLUMNS < <(stty size 2>/dev/null) || true
-    fi
-    if [ "${1:-}" = --dependencies ]; then
-        shift
-        dependency_host_cli "$@"
-        exit $?
-    fi
-    check_root
-    # 自检先于安装目录初始化，保留原始权限和空安装现场。
-    case "${1:-}" in
-        --self-check|--tc-self-check)
-            run_tc_self_check "${2:-}"
-            exit $?
-            ;;
-        --logs)
-            if [ -n "${2:-}" ] || [ ! -t 0 ]; then
-                show_logs_cli "${2:-all}"
-                exit $?
-            fi
-            view_logs
-            exit $?
-            ;;
-        --config) view_config; exit $? ;;
-    esac
-    ensure_work_dir
+# 菜单动作放进子 shell：动作里的 exit、cd 或变量改动不会影响主菜单本身。
+menu_run() {
+    ( "$@" )
+    return 0
+}
 
-    case "${1:-}" in
-        --install)
-            case "${2:-}" in '') [ "$#" -eq 1 ] || exit 2; dependency_install_for_host false || exit $? ;;
-                --yes) [ "$#" -eq 2 ] || exit 2; dependency_install_for_host true || exit $? ;;
-                *) exit 2 ;;
-            esac
-            install_from_entrypoint
-            install_status=$?
-            [ "$install_status" -eq 0 ] || exit "$install_status"
-            echo -e "${GREEN}安装完成。以后可执行：sudo ntc${NC}"
-            exit 0
-            ;;
-        --uninstall)
-            uninstall_lite
-            exit $?
-            ;;
-        --stop)
-            stop_all_services
-            exit $?
-            ;;
-        --recover-tc)
-            local recovery_mode="${2:---manual}"
-            run_shared_tc_recovery "$recovery_mode"
-            exit $?
-            ;;
-        --update)
-            update_scripts "$RAW_BASE"
-            exit $?
-            ;;
-        --help|-h)
-            echo "TrafficCop Lite"
-            echo "用法: sudo ntc [--install [--yes]|--dependencies check|install [--yes]|remove [--all] [--yes]|owned|--update|--uninstall|--stop|--logs|--config|--self-check [INTERFACE]|--recover-tc [--auto|--manual]]"
-            echo "无参数运行进入交互菜单。"
-            exit 0
-            ;;
-    esac
-
-    if dependency_host_cli check >/dev/null 2>&1; then
-        if [ "$(dependency_package_manager)" != apt-get ] || dependency_no_pending; then
-            install_shortcut || exit 1
-        fi
-    fi
-
+main_menu() {
+    local choice n
     while true; do
         show_main_menu
-        if ! read -r -p "请输入选项: " choice; then
-            echo ""
-            echo -e "${GREEN}输入已结束，退出 TrafficCop-Lite。${NC}"
-            exit 0
+        if ! ui_prompt 10 choice; then
+            printf '\n'
+            return 0
         fi
-        case "$choice" in
-            1) dependency_install_for_host false && install_shortcut && manage_monitor ;;
-            2) dependency_install_for_host false && install_shortcut && manage_telegram ;;
-            3) dependency_install_for_host false && install_shortcut && manage_machine_limit ;;
-            4) view_logs ;;
-            5) view_config ;;
-            6) stop_all_services ;;
+        if ! n=$(ntc_int "$(ntc_trim "$choice")" 0 10); then
+            ui_warn "无效选择，请输入 0–10。"
+            sleep 1
+            continue
+        fi
+        case "$n" in
+            0) return 0 ;;
+            1) menu_run show_status_detail ;;
+            2) menu_run open_configure ;;
+            3) menu_run open_component "$MACHINE_LIMIT_SCRIPT" ;;
+            4) menu_run open_component "$TELEGRAM_SCRIPT" ;;
+            5) menu_run run_check_now ;;
+            6) menu_run view_logs ;;
+            # 更新成功后要 exec 新版菜单，必须在当前 shell 里执行。
             7) update_scripts_interactive ;;
-            8)
-                if uninstall_lite && [ -t 0 ]; then
-                    read -r -p '是否进入依赖卸载菜单？[y/N]: ' choice || choice=''
-                    case "$choice" in y|Y|yes|YES) dependency_host_menu ;; esac
-                fi
-                ;;
-            9) manage_tc_recovery ;;
-            10) dependency_host_menu ;;
-            0) echo -e "${GREEN}已退出 TrafficCop-Lite。${NC}"; exit 0 ;;
-            *) echo -e "${RED}无效选择，请重新输入。${NC}"; sleep 1 ;;
+            8) menu_run dependency_host_menu ;;
+            9) menu_run manage_tc_recovery ;;
+            10) if uninstall_interactive; then return 0; fi ;;
         esac
     done
 }
 
+# 组件齐全时不输出任何内容；从安装目录以外运行（新下载或仓库副本）时才完整安装。
+ensure_components_installed() {
+    local name
+    if [ "$SOURCE_PATH" = "$WORK_DIR/trafficcop-lite.sh" ]; then
+        for name in "$MONITOR_SCRIPT" "$TELEGRAM_SCRIPT" "$MACHINE_LIMIT_SCRIPT"; do
+            if [ ! -s "$WORK_DIR/$name" ] || [ ! -x "$WORK_DIR/$name" ]; then
+                install_shortcut
+                return $?
+            fi
+        done
+        if [ "$(readlink "$SHORTCUT_PATH" 2>/dev/null)" != "$WORK_DIR/trafficcop-lite.sh" ]; then
+            install_shortcut_link || true
+        fi
+        return 0
+    fi
+    install_from_entrypoint
+}
+
+# 打开配置、限制执行、Telegram 之前：依赖命令齐全、组件已安装时什么也不输出。
+ensure_runtime_ready() {
+    if ! ntc_missing_tools >/dev/null; then
+        dependency_install_for_host false || return 1
+    fi
+    ensure_components_installed
+}
+
+open_component() {
+    local script_name="$1"
+    shift
+    if ! ensure_runtime_ready; then
+        pause
+        return 1
+    fi
+    bash "$WORK_DIR/$script_name" "$@"
+}
+
+# 已配置时 monitor 显示子菜单，每个动作后自己会停；未配置或已停用时它会在 NTC_MENU_PAUSE=1 下停一下再返回。
+open_configure() {
+    NTC_MENU_PAUSE=1 open_component "$MONITOR_SCRIPT" --configure
+}
+
+# 只读入口（状态、立即检查）只要求组件已安装，不触发依赖安装。
+run_installed_component() {
+    local script_name="$1"
+    shift
+    if [ ! -s "$WORK_DIR/$script_name" ]; then
+        printf '%s\n' "NTC 尚未安装：运行 sudo ntc 后选择「修改监控配置」开始。" >&2
+        return 1
+    fi
+    bash "$WORK_DIR/$script_name" "$@"
+}
+
+show_status_detail() {
+    run_installed_component "$MONITOR_SCRIPT" --status
+    pause
+}
+
+run_check_now() {
+    run_installed_component "$MONITOR_SCRIPT" --check
+    pause
+}
+
+tail_file() {
+    local file="$1" title="$2" lines="${3:-40}"
+    ui_title "$title" "最近 $lines 条，最新的在最下面"
+    if [ -s "$file" ]; then
+        tail -n "$lines" "$file"
+    else
+        ui_note "还没有记录（$file）"
+    fi
+}
+
 show_logs_cli() {
     case "${1:-all}" in
-        operations) tail_file "$WORK_DIR/operations.log" "操作审计日志" ;;
-        monitor) tail_file "$WORK_DIR/traffic_monitor.log" "流量监控日志" ;;
+        events|monitor) tail_file "$WORK_DIR/traffic_monitor.log" "事件日志" ;;
         telegram) tail_file "$WORK_DIR/tg_notifier_cron.log" "Telegram 通知日志" ;;
+        operations) tail_file "$WORK_DIR/operations.log" "操作记录" ;;
         all)
-            tail_file "$WORK_DIR/operations.log" "操作审计日志"
-            tail_file "$WORK_DIR/traffic_monitor.log" "流量监控日志"
+            tail_file "$WORK_DIR/traffic_monitor.log" "事件日志"
             tail_file "$WORK_DIR/tg_notifier_cron.log" "Telegram 通知日志"
+            tail_file "$WORK_DIR/operations.log" "操作记录"
             ;;
-        *) printf '%s\n' '日志类型须为 operations、monitor、telegram 或 all。' >&2; return 1 ;;
+        *) printf '%s\n' '日志类型须为 events、telegram、operations 或 all。' >&2; return 2 ;;
     esac
+}
+
+view_logs() {
+    local choice n cron
+    while true; do
+        menu_clear
+        ui_title "查看日志"
+        ui_option 1 "事件日志" "限速与解除、新周期、错误；正常时每小时一条"
+        ui_option 2 "Telegram 通知日志"
+        ui_option 3 "操作记录" "安装、更新、配置、启停"
+        ui_option 4 "NTC 定时任务"
+        ui_rule
+        ui_option 0 返回
+        ui_prompt 4 choice || return 0
+        if ! n=$(ntc_int "$(ntc_trim "$choice")" 0 4); then
+            ui_warn "无效选择，请输入 0–4。"
+            sleep 1
+            continue
+        fi
+        case "$n" in
+            0) return 0 ;;
+            1) show_logs_cli events ;;
+            2) show_logs_cli telegram ;;
+            3) show_logs_cli operations ;;
+            4)
+                ui_title "NTC 定时任务"
+                if ! cron=$(read_current_crontab 2>/dev/null); then
+                    ui_warn "无法读取 root crontab。"
+                elif ! awk -v d="$WORK_DIR/" 'index($0, d)' <<< "$cron" | grep .; then
+                    ui_note "没有 NTC 的定时任务。"
+                fi
+                ;;
+        esac
+        pause
+    done
+}
+
+choose_update_base() {
+    local choice n
+    {
+        ui_title "更新 NTC" "当前版本 $SCRIPT_VERSION"
+        ui_option 1 "直连 GitHub"
+        ui_option 2 "国内优先" "经 gh-proxy 镜像"
+        ui_rule
+        ui_option 0 返回
+    } >&2
+    # 读到 EOF 视为取消（1.x 会当作直连继续更新）。
+    ui_prompt 2 choice "回车=1" || { printf '\n' >&2; return 1; }
+    choice=$(ntc_trim "$choice")
+    [ -n "$choice" ] || choice=1
+    if ! n=$(ntc_int "$choice" 0 2); then
+        ui_warn "无效选择。" >&2
+        return 1
+    fi
+    case "$n" in
+        1) printf '%s\n' "$UPDATE_DIRECT_BASE" ;;
+        2) printf '%s\n' "$UPDATE_PROXY_BASE" ;;
+        *) return 1 ;;
+    esac
+}
+
+update_scripts_interactive() {
+    local selected_base
+    menu_clear
+    if ! selected_base=$(choose_update_base); then
+        ui_note "已取消更新。"
+        pause
+        return 0
+    fi
+    if update_scripts "$selected_base"; then
+        ui_ok "正在载入新版菜单…"
+        # exec 成功后不会回到这里；下一行只在 exec 失败时执行。
+        # shellcheck disable=SC2093
+        exec bash "$WORK_DIR/trafficcop-lite.sh"
+        ui_err "新版菜单载入失败，请重新执行 sudo ntc。"
+    fi
+    pause
+}
+
+ntc_tc_status_label() {
+    local status_output=""
+    status_output=$(run_tc_self_check 2>/dev/null || true)
+    case "$status_output" in
+        *"TC_SELF_CHECK=OK"*"MODEL=absent"*) echo "未限速（没有 Dog/NTC 的 TC 规则）" ;;
+        *"TC_SELF_CHECK=OK"*) echo "正常" ;;
+        *"TC_SELF_CHECK=CONFLICT"*) echo "冲突（有外部或未知的 TC 配置）" ;;
+        *"TC_SELF_CHECK=DRIFT"*) echo "异常（Dog/NTC 自己的规则已失效）" ;;
+        *) echo "无法检测" ;;
+    esac
+}
+
+show_tc_takeover_warning() {
+    ui_err "当前 TC 配置可能已被其他程序修改。"
+    printf '%s\n' "  继续会删除当前冲突的 TC/qdisc 配置，只重新建立 Dog/NTC 自己管理的规则；" \
+        "  其他程序创建的 TC 配置不会保留。"
+    ui_warn "如果其他 TC 管理脚本或服务还在，它们下次启动时仍可能覆盖 Dog/NTC，建议先卸载或停用。"
+}
+
+show_tc_auto_recovery_notice() {
+    printf '%s\n' "  开启后，开机网络就绪时会检查一次 Dog/NTC 的 TC 规则：" \
+        "  规则正常或当前没有需要恢复的规则时，不会修改 TC。" \
+        "  只有默认 qdisc 缺失、或已识别的 Dog/NTC 统一层级失效时，才按现有状态重建；" \
+        "  遇到外部或未知的 root qdisc 时不会自动接管，须在「TC 冲突处理 / 自动恢复」里手动确认。"
+}
+
+confirm_enable_tc_auto_recovery() {
+    show_tc_auto_recovery_notice
+    printf '\n'
+    if ! ui_confirm "启用开机自动恢复？" n; then
+        ui_note "未启用。"
+        return 0
+    fi
+    if enable_tc_auto_recovery; then
+        ui_ok "开机自动恢复已启用。"
+    else
+        ui_err "开机自动恢复启用失败。"
+        return 1
+    fi
+}
+
+tc_recovery_action() {
+    local choice="$1" status_output status_kind confirm=""
+    case "$choice" in
+        1|2)
+            status_output=$(run_tc_self_check 2>/dev/null || true)
+            status_kind=$(ntc_tc_status_kind "$status_output")
+            case "$status_kind" in
+                ok|idle)
+                    if [ "$status_kind" = ok ]; then
+                        ui_ok "当前 TC 状态正常，无需强制重建。"
+                    else
+                        ui_note "当前没有需要恢复的 Dog/NTC TC 规则。"
+                    fi
+                    if [ "$choice" = 2 ]; then
+                        printf '\n'
+                        confirm_enable_tc_auto_recovery || true
+                    fi
+                    ;;
+                conflict)
+                    show_tc_takeover_warning
+                    printf '\n'
+                    if ! read -r -p " 确认接管并重建请输入 REBUILD: " confirm || [ "$confirm" != REBUILD ]; then
+                        printf '\n'
+                        ui_note "已取消。"
+                    elif run_shared_tc_recovery --manual; then
+                        ui_ok "TC 检测/重建完成。"
+                        if [ "$choice" = 2 ]; then
+                            if enable_tc_auto_recovery; then
+                                ui_ok "开机自动恢复已启用。"
+                            else
+                                ui_err "TC 已重建，但开机自动恢复启用失败。"
+                            fi
+                        fi
+                    else
+                        ui_err "TC 重建失败，请运行 sudo ntc self-check 查看详情。"
+                    fi
+                    ;;
+                *) ui_err "无法确认当前 TC 状态，未修改 qdisc。请先运行 sudo ntc self-check。" ;;
+            esac
+            ;;
+        3) confirm_enable_tc_auto_recovery || true ;;
+        4)
+            if disable_tc_auto_recovery; then
+                ui_ok "开机自动恢复已关闭。"
+            else
+                ui_err "开机自动恢复关闭失败；现有启用状态未被确认改变。"
+            fi
+            ;;
+    esac
+}
+
+manage_tc_recovery() {
+    local choice n
+    while true; do
+        menu_clear
+        ui_title "TC 冲突处理 / 自动恢复"
+        ui_kv "TC 状态" "$(ntc_tc_status_label)"
+        ui_kv "自动恢复" "$(tc_auto_recovery_state)"
+        ui_note "自动恢复是一个 systemd oneshot 服务，开机网络就绪后执行一次（与 Port Traffic Dog 共用）。"
+        printf '\n'
+        ui_option 1 "检测并按需重建 Dog/NTC 规则"
+        ui_option 2 "检测并按需重建，同时启用开机自动恢复"
+        ui_option 3 "启用开机自动恢复"
+        ui_option 4 "关闭开机自动恢复"
+        ui_rule
+        ui_option 0 返回
+        ui_prompt 4 choice || return 0
+        if ! n=$(ntc_int "$(ntc_trim "$choice")" 0 4); then
+            ui_warn "无效选择，请输入 0–4。"
+            sleep 1
+            continue
+        fi
+        [ "$n" -ne 0 ] || return 0
+        printf '\n'
+        tc_recovery_action "$n"
+        pause
+    done
+}
+
+# 停止监控和通知（旧参数 --stop）。先在监控锁内解除限速、取消计划关机，最后才删定时任务：
+# 中途失败时监控仍在运行，不会出现“监控停了、限速却没人解除”的状态。
+stop_all_services() {
+    local has_error=false
+    ui_title "停止 NTC 监控和通知"
+    if ! acquire_monitor_cleanup_lock; then
+        ui_err "无法取得监控锁，未作任何修改。"
+        ntc_operation_log stop failure
+        return 1
+    fi
+    stop_lite_processes
+    clear_lite_tc_rules_interactive || has_error=true
+    # --stop 不提问：NTC 没有记录的计划关机一律保留（只说明）。
+    LITE_UNOWNED_SHUTDOWN_ANSWER=n cancel_shutdown_interactive || has_error=true
+    if $has_error; then
+        release_monitor_cleanup_lock
+        ui_err "限速或计划关机未能安全解除；定时任务保持不变，监控继续运行。"
+        ntc_operation_log stop failure
+        return 1
+    fi
+    if ! remove_lite_cron; then
+        release_monitor_cleanup_lock
+        ui_err "无法移除定时任务：限速已解除，但监控仍在运行，仍超额时下一分钟会重新限速。"
+        ntc_operation_log stop failure
+        return 1
+    fi
+    release_monitor_cleanup_lock
+    ui_ok "已移除 NTC 定时任务，监控和通知已停止；配置和状态文件保留。"
+    ntc_operation_log stop success
+    return 0
+}
+
+remove_shortcut_links() {
+    local link
+    for link in "$SHORTCUT_PATH" "$LEGACY_NCL_SHORTCUT_PATH" "$LEGACY_TC_SHORTCUT_PATH"; do
+        if [ "$(readlink "$link" 2>/dev/null)" = "$WORK_DIR/trafficcop-lite.sh" ]; then
+            rm -f "$link" && ui_ok "已删除快捷命令 $link"
+        fi
+    done
+}
+
+# 卸载。先问完所有问题，再按“备份 → 解除限速 → 取消计划关机 → 删除定时任务 → 删除目录”执行；
+# 删除定时任务之前任何一步失败都会中止，监控照常运行（1.x 先删定时任务，之后失败会留下没人解除的限速）。
+uninstall_lite() {
+    local confirm="" keep_backup="" backup_dir="" cancel_unowned=""
+    ui_title "卸载 NTC"
+    ui_note "会删除：$WORK_DIR（可先备份）、NTC 的定时任务、限速规则和它安排的关机、快捷命令 ntc。"
+    ui_note "不会卸载 vnstat、jq、bc 等系统软件包（之后可在依赖管理里处理）。"
+    printf '\n'
+    if ! read -r -p " 确认卸载请输入 UNINSTALL: " confirm || [ "$confirm" != UNINSTALL ]; then
+        printf '\n'
+        ui_note "已取消卸载。"
+        return 1
+    fi
+    if [ -d "$WORK_DIR" ]; then
+        if ! read -r -p " 删除前先备份配置和日志？[Y/n]: " keep_backup; then
+            printf '\n'
+            ui_note "已取消卸载。"
+            return 1
+        fi
+        case "${keep_backup,,}" in n|no) keep_backup=n ;; *) keep_backup=y ;; esac
+    fi
+
+    # NTC 没有记录、又无法确认归属的计划关机（配置是关机模式）：在取锁之前和其他问题一起问完，默认保留。
+    LITE_UNOWNED_SHUTDOWN_ANSWER=n
+    if [ ! -f "$SHUTDOWN_STATE_FILE" ] && grep -q '^LIMIT_MODE=shutdown' "$WORK_DIR/traffic_monitor_config.txt" 2>/dev/null \
+        && lite_has_pending_shutdown; then
+        ui_warn "系统里有一个计划关机，NTC 没有它的记录（可能是旧版本或其他程序安排的）。"
+        if ! read -r -p " 卸载时一并取消这个计划关机？[y/N]: " cancel_unowned; then
+            printf '\n'
+            ui_note "已取消卸载。"
+            return 1
+        fi
+        case "${cancel_unowned,,}" in y|yes) LITE_UNOWNED_SHUTDOWN_ANSWER=y ;; esac
+    fi
+
+    if ! acquire_monitor_cleanup_lock; then
+        ui_err "卸载已中止：无法取得监控锁，未作任何修改。"
+        return 1
+    fi
+    if [ "$keep_backup" = y ]; then
+        backup_dir="/etc/trafficcop-lite-backup-$(date +%Y%m%d-%H%M%S)"
+        if ! mkdir -m 700 "$backup_dir" || ! cp -a "$WORK_DIR/." "$backup_dir/"; then
+            release_monitor_cleanup_lock
+            ui_err "卸载已中止：配置和日志备份失败，未作其他修改。"
+            return 1
+        fi
+        chmod 700 "$backup_dir" 2>/dev/null || true
+        ui_ok "已备份到 $backup_dir"
+    fi
+    stop_lite_processes
+    if ! clear_lite_tc_rules_interactive; then
+        release_monitor_cleanup_lock
+        ui_err "卸载已中止：NTC 的限速未能安全解除；定时任务和配置都没有改动，监控照常运行。"
+        return 1
+    fi
+    if ! cancel_shutdown_interactive; then
+        release_monitor_cleanup_lock
+        ui_err "卸载已中止：NTC 安排的关机未能安全取消；定时任务和配置都没有改动。"
+        return 1
+    fi
+    if ! remove_lite_cron; then
+        release_monitor_cleanup_lock
+        ui_err "卸载已中止：无法移除定时任务。限速已解除，但监控仍在运行，仍超额时下一分钟会重新限速。"
+        return 1
+    fi
+    ui_ok "已移除 NTC 定时任务"
+    if [ -d "$WORK_DIR" ]; then
+        if ! rm -rf "$WORK_DIR"; then
+            release_monitor_cleanup_lock
+            ui_err "删除 $WORK_DIR 失败：定时任务已移除、限速已解除，请手动检查该目录。"
+            return 1
+        fi
+        ui_ok "已删除 $WORK_DIR"
+    fi
+    release_monitor_cleanup_lock
+    remove_shortcut_links
+    if ! cleanup_tc_recovery_files_if_unused; then
+        ui_err "NTC 主体已删除，但共享 TC 自动恢复文件未能安全清理；卸载未完整完成。"
+        return 1
+    fi
+    ui_ok "卸载完成。"
+    return 0
+}
+
+# 菜单里的卸载：成功后询问是否顺便处理依赖，然后退出菜单。
+uninstall_interactive() {
+    menu_clear
+    if ! uninstall_lite; then
+        pause
+        return 1
+    fi
+    printf '\n'
+    if [ -t 0 ] && ui_confirm "要进入依赖管理，卸载 NTC 安装的软件包吗？" n; then
+        dependency_host_menu || true
+    fi
+    return 0
+}
+
+component_display_version() {
+    local file="$1" version
+    version=$(sed -nE 's/^SCRIPT_VERSION="([0-9]+([.][0-9]+)*)".*/\1/p' "$file" 2>/dev/null | head -n 1)
+    [ -n "$version" ] || version=$(script_version_from_file "$file")
+    printf '%s' "${version:-未安装}"
+}
+
+show_versions() {
+    local name
+    printf 'NTC 主脚本 %s（%s）\n' "$SCRIPT_VERSION" "$LAST_UPDATE"
+    for name in "$MONITOR_SCRIPT" "$TELEGRAM_SCRIPT" "$MACHINE_LIMIT_SCRIPT"; do
+        printf '%s %s\n' "$name" "$(component_display_version "$WORK_DIR/$name")"
+    done
+}
+
+show_usage() {
+    cat <<EOF
+TrafficCop Lite（NTC）v$SCRIPT_VERSION：按月/季/年统计整机流量，超额后整机限速或关机。
+
+用法: sudo ntc [命令]
+
+  （无命令）                 打开菜单
+  status [--json]            状态：用量、阈值、预测、执行状态、TC、定时任务、Telegram
+  check                      立即检查一次（与每分钟的定时检查相同）
+  config                     配置向导
+  config show                显示当前配置
+  config set 选项… [--yes]   不进菜单修改配置（sudo ntc config set --help 查看选项）
+  pause | resume             暂停 / 恢复限制（流量照常统计）
+  grace <分钟>               宽限一段时间，期间只统计、不限速
+  enable | disable           启用 / 停用流量监控
+  logs [events|telegram|operations]   查看日志
+  telegram test|report       发送测试消息 / 立即发送一次日报
+  update [--mirror]          更新 NTC（--mirror 走国内镜像）
+  uninstall                  卸载 NTC
+  self-check [网卡]          只读检查 TC 状态
+  version                    显示各组件版本
+  help                       显示本帮助
+
+旧参数仍可用：--install [--yes]、--update、--uninstall、--stop、--logs [类型]、--config、
+--self-check [网卡]、--recover-tc [--auto|--manual]、
+--dependencies check|install [--yes]|remove [--all] [--yes]|owned
+EOF
+}
+
+usage_error() {
+    printf '%s\n\n' "未知命令或参数：$*" >&2
+    show_usage >&2
+    return 2
+}
+
+main() {
+    local _ cmd="${1:-}" status
+    if [ -z "${COLUMNS:-}" ] && [ -t 0 ] && command -v stty >/dev/null 2>&1; then
+        read -r _ COLUMNS < <(stty size 2>/dev/null) || true
+    fi
+    case "$cmd" in
+        help|--help|-h) show_usage; return 0 ;;
+        --dependencies) shift; dependency_host_cli "$@"; return $? ;;
+        # 已知子命令（含旧参数别名）。未知命令在要求 root、创建安装目录之前就报错退出 2。
+        ''|version|--version|self-check|--self-check|--tc-self-check|logs|--logs|status|--config|--install|\
+        uninstall|--uninstall|--stop|--recover-tc|update|--update|check|config|pause|resume|enable|disable|\
+        grace|telegram) ;;
+        *) usage_error "$@"; return 2 ;;
+    esac
+    check_root
+    # 只读命令先于安装目录初始化执行，保留原始权限和空安装现场。
+    case "$cmd" in
+        version|--version) [ "$#" -eq 1 ] || { usage_error "$@"; return 2; }; show_versions; return 0 ;;
+        self-check|--self-check|--tc-self-check) run_tc_self_check "${2:-}"; return $? ;;
+        logs|--logs)
+            [ "$#" -le 2 ] || { usage_error "$@"; return 2; }
+            if [ -n "${2:-}" ] || [ ! -t 0 ]; then
+                show_logs_cli "${2:-all}"
+                return $?
+            fi
+            view_logs
+            return $?
+            ;;
+        status) shift; run_installed_component "$MONITOR_SCRIPT" --status "$@"; return $? ;;
+        --config) [ "$#" -eq 1 ] || { usage_error "$@"; return 2; }; run_installed_component "$MONITOR_SCRIPT" --config-show; return $? ;;
+    esac
+    ensure_work_dir
+
+    case "$cmd" in
+        '') ;;
+        --install)
+            case "${2:-}" in
+                '') [ "$#" -eq 1 ] || return 2; dependency_install_for_host false || return $? ;;
+                --yes) [ "$#" -eq 2 ] || return 2; dependency_install_for_host true || return $? ;;
+                *) return 2 ;;
+            esac
+            install_from_entrypoint
+            status=$?
+            [ "$status" -eq 0 ] || return "$status"
+            ui_ok "安装完成。以后可执行：sudo ntc"
+            return 0
+            ;;
+        uninstall|--uninstall) [ "$#" -eq 1 ] || { usage_error "$@"; return 2; }; uninstall_lite; return $? ;;
+        --stop) stop_all_services; return $? ;;
+        --recover-tc) run_shared_tc_recovery "${2:---manual}"; return $? ;;
+        update|--update)
+            case "$#:${2:-}" in
+                1:) update_scripts "$RAW_BASE" ;;
+                2:--mirror) update_scripts "$UPDATE_PROXY_BASE" ;;
+                *) usage_error "$@"; return 2 ;;
+            esac
+            return $?
+            ;;
+        check) [ "$#" -eq 1 ] || { usage_error "$@"; return 2; }; run_installed_component "$MONITOR_SCRIPT" --check; return $? ;;
+        config)
+            case "${2:-}" in
+                '') [ "$#" -eq 1 ] || { usage_error "$@"; return 2; }
+                    ensure_runtime_ready || return 1
+                    bash "$WORK_DIR/$MONITOR_SCRIPT" --configure
+                    return $?
+                    ;;
+                show) [ "$#" -eq 2 ] || { usage_error "$@"; return 2; }; run_installed_component "$MONITOR_SCRIPT" --config-show; return $? ;;
+                set) shift 2; run_installed_component "$MONITOR_SCRIPT" --config-set "$@"; return $? ;;
+                *) usage_error "$@"; return 2 ;;
+            esac
+            ;;
+        pause|resume|enable|disable)
+            [ "$#" -eq 1 ] || { usage_error "$@"; return 2; }
+            run_installed_component "$MACHINE_LIMIT_SCRIPT" "--$cmd"
+            return $?
+            ;;
+        grace)
+            [ "$#" -eq 2 ] || { usage_error "$@"; return 2; }
+            run_installed_component "$MACHINE_LIMIT_SCRIPT" --grace "$2"
+            return $?
+            ;;
+        telegram)
+            case "$#:${2:-}" in
+                2:test) run_installed_component "$TELEGRAM_SCRIPT" --test ;;
+                2:report) run_installed_component "$TELEGRAM_SCRIPT" --report ;;
+                1:) ensure_runtime_ready || return 1; bash "$WORK_DIR/$TELEGRAM_SCRIPT" ;;
+                *) usage_error "$@"; return 2 ;;
+            esac
+            return $?
+            ;;
+        *) usage_error "$@"; return 2 ;;
+    esac
+
+    # 无参数：进入菜单。依赖命令齐全且没有未完成的依赖事务时，顺带补齐组件和快捷命令（已齐全则不输出）。
+    if ntc_missing_tools >/dev/null; then
+        if [ "$(dependency_package_manager)" != apt-get ] || dependency_no_pending; then
+            ensure_components_installed || true
+        fi
+    fi
+    main_menu
+    return 0
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

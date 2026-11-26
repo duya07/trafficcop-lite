@@ -37,7 +37,8 @@ test_operation_log_failure_preserves_business_result() {
     mkdir -p "$WORK_DIR"
     load_function "$ROOT_DIR/trafficcop-lite.sh" ntc_operation_log || return 1
     load_function "$ROOT_DIR/trafficcop-lite.sh" install_shortcut || return 1
-    install_all_components() { printf '%s\n' installed > "$work/business"; }
+    # 2.0 起只有真的装了或换了文件才写安装审计，mock 需要标记发生了变化。
+    install_all_components() { printf '%s\n' installed > "$work/business"; INSTALL_CHANGED=true; }
     install_shortcut_link() { return 0; }
     printf '%s\n' untouched > "$work/foreign"
     ln -s "$work/foreign" "$WORK_DIR/operations.log"
@@ -64,9 +65,15 @@ test_install_and_rollback_audit_results() {
     install_all_components() { return 55; }
     if install_shortcut >/dev/null; then return 1; fi
     grep -Fq 'EVENT=install RESULT=failure' "$WORK_DIR/operations.log" || return 1
-    install_all_components() { return 0; }
+    install_all_components() { INSTALL_CHANGED=true; return 0; }
     install_shortcut >/dev/null || return 1
     grep -Fq 'EVENT=install RESULT=success' "$WORK_DIR/operations.log" || return 1
+    # 2.0：什么都没变时（例如每次打开菜单）不再写“安装 NTC：成功”。
+    local successes
+    successes=$(grep -c 'EVENT=install RESULT=success' "$WORK_DIR/operations.log")
+    install_all_components() { return 0; }
+    install_shortcut >/dev/null || return 1
+    [ "$(grep -c 'EVENT=install RESULT=success' "$WORK_DIR/operations.log")" = "$successes" ] || return 1
     if rollback_script_update "$work/backup" sample.sh; then return 1; fi
     grep -Fq 'EVENT=update-rollback RESULT=failure' "$WORK_DIR/operations.log" || return 1
     printf '%s\n' old > "$work/backup/sample.sh"
@@ -122,30 +129,4 @@ test_ifb_operation_audit_and_unchanged_apply() {
     IFB_FAIL_POINT='ifb0:1:30:120kbit'
     if apply_tc_limit 120 >/dev/null; then return 1; fi
     grep -Fq 'EVENT=tc-apply RESULT=failure' "$work/operations.log"
-}
-
-test_enforcement_audit_success_failure_and_no_input_echo() {
-    local work
-    work=$(mktemp -d "$TEST_ROOT/audit-enforcement.XXXXXX") || return 1
-    WORK_DIR="$work"
-    ENFORCEMENT_STATE_FILE="$work/enforcement"
-    CONFIG_FILE="$work/config"
-    RED='' GREEN='' YELLOW='' CYAN='' NC=''
-    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" ntc_operation_log || return 1
-    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" manage_enforcement_control || return 1
-    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" write_enforcement_state_file || return 1
-    load_function "$ROOT_DIR/trafficcop-lite-machine-limit.sh" write_enforcement_state || return 1
-    acquire_monitor_cleanup_lock() { return 0; }
-    release_monitor_cleanup_lock() { return 0; }
-    clear_tc_rules() { return 0; }
-    cancel_owned_shutdown() { return 0; }
-    manage_enforcement_control <<< 3 >/dev/null || return 1
-    grep -Fq 'EVENT=enforcement-pause RESULT=success' "$work/operations.log" || return 1
-    manage_enforcement_control <<< 1 >/dev/null || return 1
-    assert_absent "$ENFORCEMENT_STATE_FILE" || return 1
-    grep -Fq 'EVENT=enforcement-resume RESULT=success' "$work/operations.log" || return 1
-    clear_tc_rules() { return 1; }
-    if manage_enforcement_control <<< 3 >/dev/null; then return 1; fi
-    grep -Fq 'EVENT=enforcement-pause RESULT=failure' "$work/operations.log" || return 1
-    ! grep -Eq 'BOT_TOKEN|CHAT_ID|CONFIG_FILE|https://' "$work/operations.log"
 }

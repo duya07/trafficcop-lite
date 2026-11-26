@@ -46,9 +46,671 @@ DOG_TC_OWNER_FILE="/etc/port-traffic-dog/tc-root-qdisc.owner"
 # 所以这一行不能删改。
 DOG_TC_MANIFEST_SCHEMA="traffic-tools-dog-classes-v1"
 HEALTH_STATE_FILE="$WORK_DIR/monitor_health"
+# 2.0：每分钟一轮的日志只在状态变化时写入；上次写入时的状态指纹记在这里。
+LOG_SIGNATURE_FILE="$WORK_DIR/monitor_log_signature"
+TG_CONFIG_FILE="$WORK_DIR/tg_notifier_config.txt"
+TC_RECOVERY_UNIT_FILE="${TRAFFIC_TOOLS_TC_RECOVERY_UNIT_FILE:-/etc/systemd/system/traffic-tools-tc-recovery.service}"
 LOG_MAX_LINES="${LOG_MAX_LINES:-5000}"
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="2.0.0"
 DEPENDENCY_STATE_DIR="${DEPENDENCY_STATE_DIR:-/var/lib/trafficcop-lite/dependencies}"
+
+# >>> ntc-common:ui >>>
+# 本区块由 tools/sync-common.sh 根据 src/common/ui.sh 生成，请改源文件后运行该脚本，勿直接修改。
+# ── 终端界面（与 Port Traffic Dog 2.1 的 src/16-ui.sh 同一套约定）──────────
+# 标题粗体青色，编号青色，分隔线、组标题与提示变暗；状态用绿/黄/红。
+# 只画横线、不画右边框：东亚歧义宽度按双宽显示的终端会把右边框挤乱。
+# 宽度一律按“显示列数”计算（中日韩全角字符占 2 列）；bash 的 printf %-Ns 按字节补齐，不能用于中文。
+# 只有标准输出是终端、没有设置 NO_COLOR、TERM 不是 dumb 时才输出颜色，日志和管道里没有控制序列。
+# 四个脚本共用同一套颜色，并非每个脚本都用到全部颜色（SC2034 对整个代码块关闭）。
+# shellcheck disable=SC2034
+{
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[0;33m'
+    BLUE='\033[0;34m'
+    PURPLE='\033[0;35m'
+    CYAN='\033[0;36m'
+    WHITE='\033[0;37m'
+    BOLD='\033[1m'
+    BOLD_CYAN='\033[1;36m'
+    DIM='\033[2m'
+    NC='\033[0m'
+    if [ ! -t 1 ] || [ -n "${NO_COLOR+x}" ] || [ "${TERM:-dumb}" = dumb ]; then
+        RED='' GREEN='' YELLOW='' BLUE='' PURPLE='' CYAN='' WHITE='' BOLD='' BOLD_CYAN='' DIM='' NC=''
+    fi
+    UI_RULE_MAX=76
+}
+
+# 把 $2 的显示宽度写入变量 $1（不开子进程，供循环里使用）。
+# 双宽：东亚宽/全角字符（Unicode East_Asian_Width 为 W/F），含常见 emoji；组合附加符与变体选择符为 0。
+ui_measure() {
+    local -n __ui_width_out=$1
+    local __ui_text="$2" __ui_i __ui_c __ui_w=0 LC_CTYPE=C.UTF-8
+    for ((__ui_i = 0; __ui_i < ${#__ui_text}; __ui_i++)); do
+        printf -v __ui_c '%d' "'${__ui_text:__ui_i:1}"
+        if (( __ui_c < 0x300 )); then
+            __ui_w=$((__ui_w + 1))
+        elif (( (__ui_c <= 0x36f) || (__ui_c >= 0x200b && __ui_c <= 0x200f) || (__ui_c >= 0xfe00 && __ui_c <= 0xfe0f) )); then
+            continue
+        elif (( (__ui_c >= 0x1100 && __ui_c <= 0x115f) || (__ui_c >= 0x2e80 && __ui_c <= 0xa4cf) ||
+                (__ui_c >= 0xac00 && __ui_c <= 0xd7a3) || (__ui_c >= 0xf900 && __ui_c <= 0xfaff) ||
+                (__ui_c >= 0xfe30 && __ui_c <= 0xfe4f) || (__ui_c >= 0xff00 && __ui_c <= 0xff60) ||
+                (__ui_c >= 0xffe0 && __ui_c <= 0xffe6) || (__ui_c >= 0x1f300 && __ui_c <= 0x1f64f) ||
+                (__ui_c >= 0x1f680 && __ui_c <= 0x1f6ff) || (__ui_c >= 0x1f900 && __ui_c <= 0x1f9ff) ||
+                (__ui_c >= 0x1fa70 && __ui_c <= 0x1faff) || (__ui_c >= 0x20000 && __ui_c <= 0x3fffd) )); then
+            __ui_w=$((__ui_w + 2))
+        elif (( __ui_c >= 0x231a && __ui_c <= 0x2b55 )) &&
+             (( (__ui_c >= 0x231a && __ui_c <= 0x231b) || (__ui_c >= 0x23e9 && __ui_c <= 0x23ec) || __ui_c == 0x23f0 ||
+                __ui_c == 0x23f3 || (__ui_c >= 0x25fd && __ui_c <= 0x25fe) || (__ui_c >= 0x2614 && __ui_c <= 0x2615) ||
+                (__ui_c >= 0x2648 && __ui_c <= 0x2653) || __ui_c == 0x267f || __ui_c == 0x2693 || __ui_c == 0x26a1 ||
+                (__ui_c >= 0x26aa && __ui_c <= 0x26ab) || (__ui_c >= 0x26bd && __ui_c <= 0x26be) ||
+                (__ui_c >= 0x26c4 && __ui_c <= 0x26c5) || __ui_c == 0x26ce || __ui_c == 0x26d4 || __ui_c == 0x26ea ||
+                (__ui_c >= 0x26f2 && __ui_c <= 0x26f3) || __ui_c == 0x26f5 || __ui_c == 0x26fa || __ui_c == 0x26fd ||
+                __ui_c == 0x2705 || (__ui_c >= 0x270a && __ui_c <= 0x270b) || __ui_c == 0x2728 || __ui_c == 0x274c ||
+                __ui_c == 0x274e || (__ui_c >= 0x2753 && __ui_c <= 0x2755) || __ui_c == 0x2757 ||
+                (__ui_c >= 0x2795 && __ui_c <= 0x2797) || __ui_c == 0x27b0 || __ui_c == 0x27bf ||
+                (__ui_c >= 0x2b1b && __ui_c <= 0x2b1c) || __ui_c == 0x2b50 || __ui_c == 0x2b55 )); then
+            __ui_w=$((__ui_w + 2))
+        else
+            __ui_w=$((__ui_w + 1))
+        fi
+    done
+    __ui_width_out=$__ui_w
+}
+
+ui_width() {
+    local w
+    ui_measure w "$1"
+    printf '%s' "$w"
+}
+
+# 左对齐补齐到 $2 列（超出时原样输出，不截断）。
+ui_pad() {
+    local w
+    ui_measure w "$1"
+    if [ "$w" -lt "$2" ]; then printf '%s%*s' "$1" $(($2 - w)) ''; else printf '%s' "$1"; fi
+}
+
+# 超过 $2 列时截断，末尾加“…”。
+ui_truncate() {
+    local text="$1" max="$2" out="" w=0 cw i ch
+    ui_measure w "$text"
+    if [ "$w" -le "$max" ]; then printf '%s' "$text"; return 0; fi
+    w=0
+    local LC_CTYPE=C.UTF-8
+    for ((i = 0; i < ${#text}; i++)); do
+        ch="${text:i:1}"
+        ui_measure cw "$ch"
+        [ $((w + cw)) -le $((max - 1)) ] || break
+        out+="$ch"; w=$((w + cw))
+    done
+    printf '%s…' "$out"
+}
+
+# 终端列数：优先问标准输入/错误所连的终端（菜单里 stdout 常被 $(...) 捕获），其次 $COLUMNS，默认 80。
+ui_columns() {
+    local size="" columns=""
+    if [ -t 0 ]; then size=$(stty size 2>/dev/null) || size=""
+    elif [ -t 2 ]; then size=$(stty size <&2 2>/dev/null) || size=""   # 先把 stdin 指向终端，再丢弃错误输出
+    fi
+    columns="${size##* }"
+    [[ "$columns" =~ ^[0-9]+$ ]] && [ "$columns" -ge 20 ] || columns="${COLUMNS:-80}"
+    [[ "$columns" =~ ^[0-9]+$ ]] && [ "$columns" -ge 20 ] && [ "$columns" -le 500 ] || columns=80
+    printf '%s' "$columns"
+}
+
+ui_rule() {
+    local w line
+    w=$(( $(ui_columns) - 2 ))
+    [ "$w" -le "$UI_RULE_MAX" ] || w=$UI_RULE_MAX
+    printf -v line '%*s' "$w" ''
+    printf ' %b%s%b\n' "$DIM" "${line// /─}" "$NC"
+}
+
+# 小节标题：空一行，标题与可选副标题，下接分隔线。在终端里按宽度截断：先截副标题，放不下时只留标题。
+ui_title() {
+    local max tw
+    max=$(ui_wrap_width)
+    if [ "$max" -gt 0 ]; then max=$((max - 1)); else max=100000; fi
+    ui_measure tw "$1"
+    printf '\n %b%s%b' "$BOLD_CYAN" "$(ui_truncate "$1" "$max")" "$NC"
+    if [ -n "${2:-}" ] && [ $((tw + 4)) -le "$max" ]; then
+        printf ' %b·%b %s' "$DIM" "$NC" "$(ui_truncate "$2" $((max - tw - 3)))"
+    fi
+    printf '\n'
+    ui_rule
+}
+
+# 菜单项：编号 文本 [变暗的附注]
+ui_option() {
+    printf '   %b%2s.%b %s' "$CYAN" "$1" "$NC" "$2"
+    [ -z "${3:-}" ] || printf '  %b%s%b' "$DIM" "$3" "$NC"
+    printf '\n'
+}
+
+# 折行宽度：标准输出（或 $1 指定的文件描述符）是终端、或显式设置了 COLUMNS 时按终端宽度折行；
+# 输出到文件或管道时不折行（输出 0），日志和脚本解析拿到的仍是完整的一行。
+ui_wrap_width() {
+    if [ -t "${1:-1}" ] || [ -n "${COLUMNS:-}" ]; then
+        ui_columns
+    else
+        printf '0'
+    fi
+}
+
+# 把纯文本（不含颜色码）按显示宽度折成多行，每行不超过 $2 列（0 表示不折行），逐行输出。
+# 优先在空格、中文字符之间和标点之后断行；闭合标点不放在行首；没有可断处（如很长的路径）才硬断。
+ui_wrap() {
+    local text="$1" max="${2:-0}" part line head rest w cw i ch brk
+    local LC_CTYPE=C.UTF-8
+    while IFS= read -r part; do
+        if ! [[ "$max" =~ ^[0-9]+$ ]] || [ "$max" -lt 1 ]; then
+            printf '%s\n' "$part"
+            continue
+        fi
+        ui_measure w "$part"
+        if [ "$w" -le "$max" ]; then
+            printf '%s\n' "$part"
+            continue
+        fi
+        line=""
+        w=0
+        brk=0
+        for ((i = 0; i < ${#part}; i++)); do
+            ch="${part:i:1}"
+            ui_measure cw "$ch"
+            if [ $((w + cw)) -gt "$max" ] && [ -n "$line" ]; then
+                case "$ch" in
+                    '，'|'。'|'、'|'；'|'：'|'）'|'」'|'』'|'！'|'？'|')'|','|'.')
+                        # 闭合标点不放在行首：把前一个字一起带到下一行。
+                        if [ "${#line}" -ge 2 ]; then brk=$((${#line} - 1)); fi
+                        ;;
+                esac
+                if [ "$brk" -gt 0 ]; then
+                    head="${line:0:brk}"
+                    rest="${line:brk}"
+                else
+                    head="$line"
+                    rest=""
+                fi
+                head="${head%"${head##*[! ]}"}"
+                rest="${rest#"${rest%%[! ]*}"}"
+                printf '%s\n' "$head"
+                line="$rest"
+                ui_measure w "$line"
+                brk=0
+                if [ -z "$line" ] && [ "$ch" = " " ]; then
+                    continue
+                fi
+            fi
+            if [ "$cw" -ge 2 ] && [ -n "$line" ]; then
+                brk=${#line}
+            fi
+            line+="$ch"
+            w=$((w + cw))
+            case "$ch" in
+                ' '|'，'|'。'|'、'|'；'|'：'|'）'|'」'|'』'|'！'|'？'|'/') brk=${#line} ;;
+                *) if [ "$cw" -ge 2 ]; then brk=${#line}; fi ;;
+            esac
+        done
+        printf '%s\n' "$line"
+    done <<< "$text"
+}
+
+# 键值行：键补齐到 $5 列（默认 8），$1 为键的颜色，$4 为值的颜色（可空）；值过长时折行，续行与值对齐。
+ui_row() {
+    local key_color="$1" key="$2" value="$3" value_color="${4:-}" kw="${5:-8}" max pad line first=true
+    max=$(ui_wrap_width)
+    if [ "$max" -gt 0 ]; then
+        max=$((max - kw - 4))
+        [ "$max" -ge 10 ] || max=10
+    fi
+    printf -v pad '%*s' $((kw + 4)) ''
+    while IFS= read -r line; do
+        if $first; then
+            printf '  %b%s%b  %b%s%b\n' "$key_color" "$(ui_pad "$key" "$kw")" "$NC" "$value_color" "$line" \
+                "${value_color:+$NC}"
+            first=false
+        else
+            printf '%s%b%s%b\n' "$pad" "$value_color" "$line" "${value_color:+$NC}"
+        fi
+    done < <(ui_wrap "$value" "$max")
+}
+
+# 键值行：键变暗并补齐到 $3 列（默认 8）。
+ui_kv() {
+    ui_row "$DIM" "$1" "$2" "" "${3:-8}"
+}
+
+# 用量行：「已用 / 限额  进度条  百分比  附注」。放不下时先去掉进度条，附注（如「（12 分钟前）」）换到下一行。
+ui_usage_kv() {
+    local key="$1" text="$2" pct="$3" note="${4:-}" kw="${5:-8}" max w wn pad
+    max=$(ui_wrap_width)
+    if [ "$max" -gt 0 ]; then max=$((max - kw - 4)); else max=100000; fi
+    ui_measure w "$text  ${pct}%"
+    printf '  %b%s%b  %s' "$DIM" "$(ui_pad "$key" "$kw")" "$NC" "$text"
+    if [ $((w + 12)) -le "$max" ]; then
+        printf '  %s' "$(ui_bar "$pct")"
+        w=$((w + 12))
+    fi
+    printf '  %s%%' "$pct"
+    if [ -n "$note" ]; then
+        ui_measure wn "$note"
+        if [ $((w + 2 + wn)) -le "$max" ]; then
+            printf '  %b%s%b' "$DIM" "$note" "$NC"
+        else
+            printf -v pad '%*s' $((kw + 4)) ''
+            printf '\n%s%b%s%b' "$pad" "$DIM" "$note" "$NC"
+        fi
+    fi
+    printf '\n'
+}
+
+# 提示与结果行：$1 文件描述符（决定是否折行），$2 前缀（可含颜色），$3 前缀显示宽度，$4 文字颜色（可空），
+# $5 文字；文字按终端宽度折行，续行与文字对齐。
+ui_message() {
+    local fd="$1" prefix="$2" indent="$3" color="$4" text="$5" max pad line
+    max=$(ui_wrap_width "$fd")
+    if [ "$max" -gt 0 ]; then
+        max=$((max - indent))
+        [ "$max" -ge 10 ] || max=10
+    fi
+    printf -v pad '%*s' "$indent" ''
+    while IFS= read -r line; do
+        printf '%b%b%s%b\n' "$prefix" "$color" "$line" "${color:+$NC}"
+        prefix="$pad"
+    done < <(ui_wrap "$text" "$max")
+}
+
+ui_note() {
+    ui_message 1 '  ' 2 "$DIM" "$1"
+}
+
+# 结果行：✓ 成功、! 提醒、✗ 失败（失败写到标准错误）。
+ui_ok() {
+    ui_message 1 "  ${GREEN}✓${NC} " 4 '' "$*"
+}
+
+ui_warn() {
+    ui_message 1 "  ${YELLOW}!${NC} " 4 '' "$*"
+}
+
+ui_err() {
+    ui_message 2 "  ${RED}✗${NC} " 4 '' "$*" >&2
+}
+
+# 读取菜单选择写入变量 $2，提示统一为“请选择 [0-N]”，$3 为附加说明。
+# 读到 EOF 返回 1，调用方据此返回上一级。
+ui_prompt() {
+    local __ui_hint="0-$1"
+    [ -z "${3:-}" ] || __ui_hint+="，$3"
+    read -r -p " 请选择 [${__ui_hint}]: " "$2"
+}
+
+# 等用户按回车；读到 EOF 直接返回。
+ui_pause() {
+    local __ui_pause_answer
+    read -r -p " 按回车继续…" __ui_pause_answer || printf '\n'
+}
+
+# 用量条：$1=百分比（整数，可超过 100），$2=格数（默认 10）。不足 75% 绿色，75%–89% 黄色，90% 起红色。
+ui_bar() {
+    local pct="${1:-0}" cells="${2:-10}" filled i full="" empty="" color
+    [[ "$pct" =~ ^[0-9]{1,9}$ ]] || pct=0
+    pct=$((10#$pct))
+    if [ "$pct" -ge 90 ]; then color="$RED"; elif [ "$pct" -ge 75 ]; then color="$YELLOW"; else color="$GREEN"; fi
+    filled=$(( (pct * cells + 50) / 100 ))
+    [ "$filled" -le "$cells" ] || filled=$cells
+    [ "$pct" -eq 0 ] || [ "$filled" -ge 1 ] || filled=1
+    for ((i = 0; i < cells; i++)); do
+        if [ "$i" -lt "$filled" ]; then full+="█"; else empty+="░"; fi
+    done
+    printf '%b%s%b%b%s%b' "$color" "$full" "$NC" "$DIM" "$empty" "$NC"
+}
+
+# 两组菜单，编号竖排：$1=左组标题 $2=右组标题 $3=左组项数，其后是全部菜单文字（编号从 1 起）。
+# 两列放得下时左右并排（左组 1..k，右组 k+1..n），否则分组单列。“0. 退出/返回”由调用方输出。
+ui_menu_groups() {
+    local left="$1" right="$2" split="$3" columns n rows i lw=0 rw=0 w cell
+    shift 3
+    local -a labels=("$@")
+    n=${#labels[@]}
+    columns=$(ui_columns)
+    for ((i = 0; i < n; i++)); do
+        ui_measure w "${labels[i]}"
+        if [ "$i" -lt "$split" ]; then [ "$w" -le "$lw" ] || lw=$w; else [ "$w" -le "$rw" ] || rw=$w; fi
+    done
+    cell=$((4 + lw + 4))   # 左列：编号“ 1. ”4 列 + 最长文字 + 列间距
+    if [ $((3 + cell + 4 + rw)) -le "$columns" ]; then
+        printf '   %b%s%s%b\n' "$DIM" "$(ui_pad "$left" "$cell")" "$right" "$NC"
+        rows=$(( split > n - split ? split : n - split ))
+        for ((i = 0; i < rows; i++)); do
+            printf '   '
+            if [ "$i" -lt "$split" ]; then
+                printf '%b%2d.%b ' "$CYAN" $((i + 1)) "$NC"
+                if [ $((split + i)) -lt "$n" ]; then
+                    printf '%s' "$(ui_pad "${labels[i]}" $((lw + 4)))"
+                else
+                    printf '%s' "${labels[i]}"
+                fi
+            else
+                printf '%*s' "$cell" ''
+            fi
+            [ $((split + i)) -ge "$n" ] || printf '%b%2d.%b %s' "$CYAN" $((split + i + 1)) "$NC" "${labels[split + i]}"
+            printf '\n'
+        done
+    else
+        printf '   %b%s%b\n' "$DIM" "$left" "$NC"
+        for ((i = 0; i < split; i++)); do ui_option $((i + 1)) "${labels[i]}"; done
+        printf '   %b%s%b\n' "$DIM" "$right" "$NC"
+        for ((i = split; i < n; i++)); do ui_option $((i + 1)) "${labels[i]}"; done
+    fi
+}
+
+# 清屏只在交互终端、非 dumb、未设置 NO_COLOR 时进行（clear 输出的是控制序列）。
+menu_clear() {
+    if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR+x}" ]; then clear 2>/dev/null || true; fi
+}
+
+# 状态级别对应的颜色（与 ntc_overall_status 的级别一致）：ok 绿、warn 黄、err 红，其余变暗。
+ui_level_color() {
+    case "${1:-}" in
+        ok) printf '%s' "$GREEN" ;;
+        warn) printf '%s' "$YELLOW" ;;
+        err) printf '%s' "$RED" ;;
+        *) printf '%s' "$DIM" ;;
+    esac
+}
+# <<< ntc-common:ui <<<
+
+# >>> ntc-common:input >>>
+# 本区块由 tools/sync-common.sh 根据 src/common/input.sh 生成，请改源文件后运行该脚本，勿直接修改。
+# ── 输入：读到 EOF 一律视为取消（返回 1），数字一律按十进制解析（允许前导零）─────────
+# 去掉首尾空白。
+ntc_trim() {
+    local __trim_v="$1"
+    __trim_v="${__trim_v#"${__trim_v%%[![:space:]]*}"}"
+    __trim_v="${__trim_v%"${__trim_v##*[![:space:]]}"}"
+    printf '%s' "$__trim_v"
+}
+
+# 整数，范围 [$2, $3]；输出规范值（08 → 8），不合法返回 1。
+ntc_int() {
+    local __int_v
+    [[ "${1:-}" =~ ^[0-9]{1,9}$ ]] || return 1
+    __int_v=$((10#$1))
+    [ "$__int_v" -ge "$2" ] && [ "$__int_v" -le "$3" ] || return 1
+    printf '%s' "$__int_v"
+}
+
+# 非负数（整数部分最多 9 位、小数最多 6 位）；输出去掉多余前导零的值，不合法返回 1。
+ntc_decimal() {
+    local __dec_int __dec_frac
+    [[ "${1:-}" =~ ^([0-9]{1,9})(\.([0-9]{1,6}))?$ ]] || return 1
+    __dec_int=$((10#${BASH_REMATCH[1]}))
+    __dec_frac="${BASH_REMATCH[3]}"
+    if [ -n "$__dec_frac" ]; then printf '%s.%s' "$__dec_int" "$__dec_frac"; else printf '%s' "$__dec_int"; fi
+}
+
+# ui_read 变量名 提示 [默认值]：显示“ 提示 [默认值]: ”，回车取默认值；EOF 返回 1。
+ui_read() {
+    local -n __ui_read_out="$1"
+    local __ui_read_prompt="$2" __ui_read_value=""
+    [ -z "${3:-}" ] || __ui_read_prompt+=" [$3]"
+    if ! read -r -p " ${__ui_read_prompt}: " __ui_read_value; then
+        printf '\n'
+        return 1
+    fi
+    __ui_read_value=$(ntc_trim "$__ui_read_value")
+    [ -n "$__ui_read_value" ] || __ui_read_value="${3:-}"
+    __ui_read_out="$__ui_read_value"
+}
+
+# ui_confirm 问题 [y|n]：只认 y/yes/n/no（不分大小写），回车取默认值（缺省 n）；EOF 视为否。
+ui_confirm() {
+    local __ui_answer __ui_default="${2:-n}" __ui_hint='[y/N]'
+    [ "$__ui_default" != y ] || __ui_hint='[Y/n]'
+    while true; do
+        if ! read -r -p " $1 $__ui_hint: " __ui_answer; then
+            printf '\n'
+            return 1
+        fi
+        __ui_answer=$(ntc_trim "$__ui_answer")
+        [ -n "$__ui_answer" ] || __ui_answer="$__ui_default"
+        case "${__ui_answer,,}" in
+            y|yes) return 0 ;;
+            n|no) return 1 ;;
+        esac
+        printf '  请输入 y 或 n。\n'
+    done
+}
+
+# ui_read_int 变量名 提示 默认值 最小 最大：直到输入合法为止；EOF 返回 1。
+ui_read_int() {
+    local -n __ui_int_out="$1"
+    local __ui_int_raw __ui_int_norm
+    while true; do
+        ui_read __ui_int_raw "$2" "$3" || return 1
+        if __ui_int_norm=$(ntc_int "$__ui_int_raw" "$4" "$5"); then
+            __ui_int_out="$__ui_int_norm"
+            return 0
+        fi
+        printf '  %b请输入 %s–%s 的整数。%b\n' "$YELLOW" "$4" "$5" "$NC"
+    done
+}
+
+# ui_read_decimal 变量名 提示 默认值：非负数，直到输入合法为止；EOF 返回 1。取值范围由调用方再检查。
+ui_read_decimal() {
+    local -n __ui_dec_out="$1"
+    local __ui_dec_raw __ui_dec_norm
+    while true; do
+        ui_read __ui_dec_raw "$2" "$3" || return 1
+        if __ui_dec_norm=$(ntc_decimal "$__ui_dec_raw"); then
+            __ui_dec_out="$__ui_dec_norm"
+            return 0
+        fi
+        printf '  %b请输入数字，例如 500 或 1.5。%b\n' "$YELLOW" "$NC"
+    done
+}
+# <<< ntc-common:input <<<
+
+# >>> ntc-common:report >>>
+# 本区块由 tools/sync-common.sh 根据 src/common/report.sh 生成，请改源文件后运行该脚本，勿直接修改。
+# ── 状态文件读取与本期预测（主菜单仪表盘、ntc status、Telegram 日报共用同一套算法）──────
+# 读取 KEY=VALUE 文件中最后一个 KEY 的值；文件不可读或没有该键时返回 1。
+ntc_kv() {
+    local __kv_line __kv_value="" __kv_found=1
+    [ -r "$1" ] || return 1
+    while IFS= read -r __kv_line || [ -n "$__kv_line" ]; do
+        case "$__kv_line" in
+            "$2="*) __kv_value="${__kv_line#*=}"; __kv_found=0 ;;
+        esac
+    done < "$1"
+    printf '%s' "${__kv_value%$'\r'}"
+    return "$__kv_found"
+}
+
+# 本地日期 YYYY-MM-DD 当天 00:00 的 epoch。
+ntc_date_epoch() {
+    [[ "${1:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || return 1
+    date -d "$1 00:00:00" +%s 2>/dev/null
+}
+
+# 本期预测。$1=已用 $2=执行阈值 $3=周期起始日 $4=周期最后一天（含） [$5=当前 epoch]
+# 输出一行：已过天数 总天数 剩余天数 日均 预计期末用量 预计到达阈值的 epoch（0=已达到，-1=本期不会达到）。
+# 期初不足 6 小时按 6 小时折算，避免刚开始几个小时的日均被放大。
+ntc_forecast() {
+    local start_epoch end_epoch now="${5:-}"
+    [ -n "$now" ] || now=$(date +%s)
+    start_epoch=$(ntc_date_epoch "$3") || return 1
+    end_epoch=$(ntc_date_epoch "$4") || return 1
+    end_epoch=$((end_epoch + 86400))
+    [ "$end_epoch" -gt "$start_epoch" ] || return 1
+    awk -v u="$1" -v t="$2" -v s="$start_epoch" -v e="$end_epoch" -v n="$now" 'BEGIN {
+        if (u !~ /^[0-9]+(\.[0-9]+)?$/ || t !~ /^[0-9]+(\.[0-9]+)?$/ || n !~ /^[0-9]+$/) exit 1
+        total = (e - s) / 86400
+        elapsed = (n - s) / 86400
+        if (elapsed < 0.25) elapsed = 0.25
+        if (elapsed > total) elapsed = total
+        left = (e - n) / 86400
+        if (left < 0) left = 0
+        avg = u / elapsed
+        projected = avg * total
+        hit = -1
+        if (u + 0 >= t + 0) hit = 0
+        else if (avg > 0 && projected > t + 0) hit = s + (t / avg) * 86400
+        printf "%.2f %d %.2f %.3f %.2f %.0f\n", elapsed, int(total + 0.5), left, avg, projected, hit
+    }'
+}
+
+# 百分比（向下取整）：$1=已用 $2=限额。
+ntc_percent() {
+    awk -v u="$1" -v l="$2" 'BEGIN {
+        if (u !~ /^[0-9]+(\.[0-9]+)?$/ || l !~ /^[0-9]+(\.[0-9]+)?$/ || l + 0 <= 0) exit 1
+        printf "%d\n", u * 100 / l
+    }'
+}
+
+# 最多保留两位小数并去掉末尾的 0：12.3456 → 12.35，500.00 → 500。
+ntc_num() {
+    awk -v v="$1" 'BEGIN {
+        if (v !~ /^-?[0-9]+(\.[0-9]+)?$/) exit 1
+        s = sprintf("%.2f", v)
+        sub(/\.?0+$/, "", s)
+        if (s == "" || s == "-") s = "0"
+        print s
+    }'
+}
+
+# 字节换算成配置单位（decimal=GB，binary=GiB），保留两位小数。
+ntc_bytes_to_unit() {
+    awk -v b="$1" -v u="$2" 'BEGIN {
+        if (b !~ /^[0-9]+$/) exit 1
+        d = (u == "binary") ? 1073741824 : 1000000000
+        printf "%.2f\n", b / d
+    }'
+}
+
+ntc_unit_label() {
+    if [ "${1:-binary}" = decimal ]; then printf 'GB'; else printf 'GiB'; fi
+}
+
+ntc_mode_label() {
+    case "$1" in
+        out) printf '出站' ;;
+        in) printf '入站' ;;
+        total) printf '出+入' ;;
+        max) printf '出入取较大' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# 周期说明：$1=monthly|quarterly|yearly $2=起始日 $3=年度起始月
+ntc_period_label() {
+    case "$1" in
+        monthly) printf '每月 %s 日重置' "$2" ;;
+        quarterly) printf '每季度（1/4/7/10 月 %s 日）重置' "$2" ;;
+        yearly) printf '每年 %s 月 %s 日重置' "${3:-1}" "$2" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+# 剩余天数的说法：$1=剩余天数（可带小数）。
+ntc_days_left_text() {
+    awk -v d="$1" 'BEGIN { if (d + 0 < 1) print "不到 1 天"; else printf "%d 天\n", d }'
+}
+
+# 敏感值的显示形式（Telegram Token、Chat ID 等）：只露首尾各 4 个字符，8 个字符以内全部遮住。
+ntc_mask() {
+    local v="${1:-}"
+    if [ -z "$v" ]; then printf '未设置'
+    elif [ "${#v}" -le 8 ]; then printf '****'
+    else printf '%s…%s' "${v:0:4}" "${v: -4}"
+    fi
+}
+
+# 监控健康状况（读 monitor_health）：输出“级别<TAB>说明”，级别为 ok|error|off|unknown。
+# $1=健康文件 [$2=当前 epoch] [$3=多少秒没更新算停摆，默认 600]
+ntc_health_summary() {
+    local file="$1" now="${2:-}" stale="${3:-600}" health reason updated age
+    [ -n "$now" ] || now=$(date +%s)
+    if ! health=$(ntc_kv "$file" HEALTH); then
+        printf 'unknown\t还没有运行记录\n'
+        return 0
+    fi
+    reason=$(ntc_kv "$file" REASON) || reason=""
+    updated=$(ntc_kv "$file" UPDATED_EPOCH) || updated=""
+    [[ "$updated" =~ ^[0-9]+$ ]] || updated=0
+    age=$((now - updated))
+    [ "$age" -ge 0 ] || age=0
+    case "$health" in
+        disabled) printf 'off\t监控已停用\n' ;;
+        ok|error)
+            if [ "$age" -gt "$stale" ]; then
+                printf 'error\t已 %d 分钟没有运行，请检查 cron\n' $((age / 60))
+            elif [ "$health" = ok ]; then
+                printf 'ok\t运行正常（%d 分钟前检查过）\n' $((age / 60))
+            else
+                printf 'error\t%s\n' "${reason:-最近一次检查失败}"
+            fi
+            ;;
+        *) printf 'unknown\t状态文件无法识别\n' ;;
+    esac
+}
+
+# crontab 文本 $1 里是否有未注释、包含 $2 的条目。
+ntc_cron_has_entry() {
+    awk -v needle="$2" '!/^[[:space:]]*#/ && index($0, needle) { found = 1 } END { exit !found }' <<< "$1"
+}
+
+# Telegram 预警档位的实际取值，$1 为 Telegram 配置文件。规则与 Telegram 组件的 read_config 一致：
+# 没有 WARN_PERCENTS 键 → 80,90（默认）；空或 off → off（关闭）；不是 1–99 的整数列表 → 按 80,90 执行。
+ntc_tg_warn_percents() {
+    local value
+    if ! value=$(ntc_kv "$1" WARN_PERCENTS); then
+        printf '80,90'
+    elif [ -z "$value" ] || [ "${value,,}" = off ]; then
+        printf 'off'
+    elif [[ ! "$value" =~ ^[0-9]{1,2}(,[0-9]{1,2})*$ ]] || [[ ",$value," =~ ,0{1,2}, ]]; then
+        printf '80,90'
+    else
+        printf '%s' "$value"
+    fi
+}
+
+# 综合状态（主菜单仪表盘与「状态详情」共用，按优先级取第一条）。
+# $1=已停用 $2=能读取 root crontab $3=监控定时任务存在（三者取 true/false） $4=健康文件
+# $5=用量状态（current_traffic_state 的 STATUS） $6=限速 kbit/s $7=宽限截止 epoch [$8=当前 epoch]
+# 输出一行：级别<TAB>状态词<TAB>说明。级别为 ok|warn|err|off（调用方据此选颜色），说明可能为空。
+ntc_overall_status() {
+    local kind text hhmm
+    if [ "$1" = true ]; then
+        printf 'off\t○ 已停用\t不统计也不限速（在「限制执行」里启用）\n'
+    elif [ "$2" != true ]; then
+        printf 'warn\t! 状态未知\t无法读取 root crontab，不能确认监控是否在运行\n'
+    elif [ "$3" != true ]; then
+        printf 'warn\t! 未运行\t定时任务缺失（在「限制执行」里启用流量监控）\n'
+    else
+        IFS=$'\t' read -r kind text < <(ntc_health_summary "$4" "${8:-}")
+        case "$kind:$5" in
+            error:*) printf 'err\t✗ 异常\t%s\n' "$text" ;;
+            unknown:*) printf 'warn\t… 等待首次检查\t定时任务每分钟检查一次\n' ;;
+            *:limited) printf 'err\t● 已限速\t整机限速 %s kbit/s，进入新周期后自动解除\n' "${6:-?}" ;;
+            *:shutdown) printf 'err\t● 已安排关机\t已达到阈值，按配置关机\n' ;;
+            *:shutdown_external) printf 'warn\t! 已有关机计划\t系统里已有其他程序安排的关机\n' ;;
+            *:grace)
+                if [[ "${7:-}" =~ ^[1-9][0-9]*$ ]] && hhmm=$(date -d "@$7" '+%m-%d %H:%M' 2>/dev/null); then
+                    printf 'warn\t● 宽限中\t到 %s，期间只统计、不限速\n' "$hhmm"
+                else
+                    printf 'warn\t● 宽限中\t期间只统计、不限速\n'
+                fi
+                ;;
+            *:paused) printf 'warn\t● 已暂停限制\t流量照常统计（在「限制执行」里恢复）\n' ;;
+            *) printf 'ok\t● 监控中\t\n' ;;
+        esac
+    fi
+}
+# <<< ntc-common:report <<<
 
 dependency_manifest() {
     case "${1:-all}" in core|all) ;; *) return 2 ;; esac
@@ -64,6 +726,8 @@ dependency_removal_is_safe() { return 1; }
 dependency_peer_uses_package() { return 0; }
 dependency_audit() { :; }
 
+# >>> ntc-common:deps >>>
+# 本区块由 tools/sync-common.sh 根据 src/common/deps.sh 生成，请改源文件后运行该脚本，勿直接修改。
 # BEGIN MANAGED DEPENDENCIES
 # Shared reference implementation embedded into each standalone product; not sourced at runtime.
 # Adapted from duya07/easy_Caddy dependency lifecycle, commit 843e7b4b686d5d191c9cd7dac7066a96fcbef5c1.
@@ -492,6 +1156,7 @@ dependency_menu() {
 }
 
 # END MANAGED DEPENDENCIES
+# <<< ntc-common:deps <<<
 
 trim_log_file() {
     local file="$1"
@@ -508,25 +1173,8 @@ trim_log_file() {
     rm -f "$tmp_file" 2>/dev/null || true
 }
 
-invocation_writes_generic_log() {
-    case "${1:-}" in
-        --self-check|--tc-self-check) return 1 ;;
-        *) return 0 ;;
-    esac
-}
-
-write_invocation_log_header() {
-    invocation_writes_generic_log "${1:-}" || return 0
-    trim_log_file "$LOG_FILE" "$LOG_MAX_LINES"
-    echo "-----------------------------------------------------" | tee -a "$LOG_FILE"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 当前版本：$SCRIPT_VERSION" | tee -a "$LOG_FILE"
-}
-
-write_invocation_log_footer() {
-    invocation_writes_generic_log "${1:-}" || return 0
-    echo "-----------------------------------------------------" | tee -a "$LOG_FILE"
-}
-
+# >>> ntc-common:tc-bin >>>
+# 本区块由 tools/sync-common.sh 根据 src/common/tc-bin.sh 生成，请改源文件后运行该脚本，勿直接修改。
 find_tc_bin() {
     local candidate
     for candidate in /usr/sbin/tc /sbin/tc /usr/bin/tc /bin/tc; do
@@ -537,10 +1185,12 @@ find_tc_bin() {
     done
     command -v tc 2>/dev/null || true
 }
+# <<< ntc-common:tc-bin <<<
 
 TC_BIN="$(find_tc_bin)"
 
-# Keep this small audit writer identical in the four standalone distribution scripts.
+# >>> ntc-common:audit >>>
+# 本区块由 tools/sync-common.sh 根据 src/common/audit.sh 生成，请改源文件后运行该脚本，勿直接修改。
 # Only fixed event/result values are accepted; extra arguments are never recorded.
 ntc_operation_log() {
     local event="${1:-}" result="${2:-}"
@@ -604,6 +1254,7 @@ ntc_operation_log() {
     # Logging failures must never change the business result or the caller's shell options.
     return 0
 }
+# <<< ntc-common:audit <<<
 
 
 
@@ -815,9 +1466,13 @@ vnstat_config_value() {
 }
 
 read_current_crontab() {
-    local error_file="$WORK_DIR/.crontab-read-error.$$"
-    local current_crontab status
+    # 错误输出放在临时目录：只读的 --status 也走这里，不能往安装目录写文件（安装目录也可能还不存在）。
+    local error_file current_crontab status
 
+    if ! error_file=$(mktemp "${TMPDIR:-/tmp}/ntc-crontab-read.XXXXXX" 2>/dev/null); then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 读取当前 crontab 失败：无法创建临时文件" | tee -a "$LOG_FILE" >&2
+        return 1
+    fi
     current_crontab=$(LC_ALL=C crontab -l 2>"$error_file")
     status=$?
     if [ "$status" -eq 0 ]; then
@@ -835,6 +1490,8 @@ read_current_crontab() {
     return 1
 }
 
+# >>> ntc-common:crontab-lock >>>
+# 本区块由 tools/sync-common.sh 根据 src/common/crontab-lock.sh 生成，请改源文件后运行该脚本，勿直接修改。
 acquire_root_crontab_lock() {
     mkdir -p "$(dirname "$ROOT_CRONTAB_LOCK_FILE")" || return 1
     exec 7>"$ROOT_CRONTAB_LOCK_FILE" || return 1
@@ -848,6 +1505,7 @@ release_root_crontab_lock() {
     flock -u 7 2>/dev/null || true
     exec 7>&-
 }
+# <<< ntc-common:crontab-lock <<<
 
 read_root_crontab_locked() {
     local current_crontab="" status=0
@@ -1385,28 +2043,29 @@ ensure_vnstat_runtime_config() {
 }
 
 ensure_vnstat_daily_retention() {
-    local required_days current_days answer
+    local required_days current_days period_word
     case "$TRAFFIC_PERIOD" in
-        monthly) required_days=40 ;;
-        quarterly) required_days=100 ;;
-        yearly) required_days=400 ;;
+        monthly) required_days=40 period_word="每月" ;;
+        quarterly) required_days=100 period_word="每季度" ;;
+        yearly) required_days=400 period_word="每年" ;;
     esac
     current_days=$(vnstat_config_value "DailyDays")
     if [ "$current_days" = "-1" ] || { [[ "$current_days" =~ ^[0-9]+$ ]] && [ "$current_days" -ge "$required_days" ]; }; then
         return 0
     fi
 
-    echo "当前 vnStat DailyDays=${current_days:-未知}，${TRAFFIC_PERIOD} 周期建议至少保留 $required_days 天日数据。"
-    read -r -p "是否由脚本调整 vnStat 日数据保留期？[Y/n]: " answer
-    case "$answer" in
-        n|N)
+    if [ "${CONFIG_ASSUME_YES:-false}" != "true" ]; then
+        printf '\n'
+        ui_note "vnStat 目前只保留 ${current_days:-未知} 天的日数据，${period_word}重置的周期至少需要 $required_days 天。"
+        # 读到 EOF 与回答 n 一样取消（1.2.x 读到 EOF 会按“是”继续修改 vnStat）。
+        if ! ui_confirm "由 NTC 把 vnStat 日数据保留期调整为 $required_days 天？" y; then
             echo "未调整 vnStat 日数据保留期，已取消本次配置；原监控配置不会被覆盖。"
             return 1
-            ;;
-    esac
+        fi
+    fi
 
     ensure_vnstat_runtime_config "$MAIN_INTERFACE" "$required_days" true || return 1
-    echo "vnStat DailyDays 已调整为 $required_days；原配置已按配置文件路径备份在 $WORK_DIR 下。"
+    ui_ok "vnStat 日数据保留期已调整为 $required_days 天（原配置备份在 $WORK_DIR 下）。"
 }
 
 restore_file_snapshot() {
@@ -1689,6 +2348,7 @@ check_and_install_packages() {
     local missing_commands=()
     local packages_to_install=()
     local PACKAGE_MANAGER
+    local vnstat_version vnstat_major
 
     # 重新发现固定路径下的 tc，避免脚本启动后安装成功却继续使用旧的空值。
     TC_BIN="$(find_tc_bin)"
@@ -1698,9 +2358,8 @@ check_and_install_packages() {
         fi
     done
 
-    if [ "${#missing_commands[@]}" -eq 0 ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 所有必要的软件包已安装" | tee -a "$LOG_FILE"
-    else
+    # 2.0：依赖齐全时什么都不输出（1.x 每次打开都打印版本、网卡与 vnStat 起始日期）。
+    if [ "${#missing_commands[@]}" -gt 0 ]; then
         PACKAGE_MANAGER="$(detect_package_manager)"
         if [ -z "$PACKAGE_MANAGER" ]; then
             echo "$(date '+%Y-%m-%d %H:%M:%S') 缺少命令：${missing_commands[*]}，且未识别到支持的包管理器，请手动安装。" | tee -a "$LOG_FILE"
@@ -1740,70 +2399,14 @@ check_and_install_packages() {
         return 1
     fi
 
-    # 获取 vnstat 版本
-    local vnstat_version vnstat_major
     vnstat_version=$(vnstat --version 2>&1 | head -n 1)
-    echo "$(date '+%Y-%m-%d %H:%M:%S') vnstat 版本: $vnstat_version" | tee -a "$LOG_FILE"
     vnstat_major=$(printf '%s\n' "$vnstat_version" | sed -n 's/^[^0-9]*\([0-9][0-9]*\)\..*/\1/p')
     if ! [[ "$vnstat_major" =~ ^[0-9]+$ ]] || [ "$vnstat_major" -lt 2 ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 错误：需要 vnStat 2.x 或更高版本。" | tee -a "$LOG_FILE"
-        return 1
-    fi
-
-    # 获取主要网络接口
-    local main_interface
-    main_interface=$(ip route show default 2>/dev/null | awk '{
-        for (i = 1; i <= NF; i++) {
-            if ($i == "dev" && (i + 1) <= NF) {
-                print $(i + 1)
-                exit
-            }
-        }
-    }')
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 主要网络接口: $main_interface" | tee -a "$LOG_FILE"
-
-    # 获取 vnstat 统计开始时间
-    if [ -n "$main_interface" ]; then
-        local vnstat_json vnstat_start_time
-        vnstat_json=$(vnstat_cmd -i "$main_interface" --json d 2>/dev/null || true)
-        if [ -n "$vnstat_json" ] &&
-           vnstat_json=$(normalize_vnstat_json_for_interface "$vnstat_json" "$main_interface") &&
-           vnstat_data_is_fresh "$vnstat_json"; then
-            vnstat_start_time=$(echo "$vnstat_json" | jq -r '.interfaces[0].created.date | "\(.year)-\(.month | tostring | if length == 1 then "0" + . else . end)-\(.day | tostring | if length == 1 then "0" + . else . end)"')
-        else
-            vnstat_start_time=""
-        fi
-        
-        if [ -n "$vnstat_start_time" ] && [ "$vnstat_start_time" != "null-null-null" ]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') vnstat 统计开始日期: $vnstat_start_time，在此之前的流量不会被纳入统计！" | tee -a "$LOG_FILE"
-        else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 无法获取 vnstat 统计开始时间" | tee -a "$LOG_FILE"
-            echo "vnStat 统计起始信息无效，未记录原始响应。" | tee -a "$LOG_FILE"
-        fi
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 无法获取主要网络接口" | tee -a "$LOG_FILE"
-    fi
-}
-
-
-# 检查配置和定时任务
-check_existing_setup() {
-     if [ -s "$CONFIG_FILE" ] && read_config; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 配置已存在"| tee -a "$LOG_FILE"
-        local crontab_content="" crontab_status=0
-        crontab_content=$(read_root_crontab_locked 2>/dev/null) || crontab_status=$?
-        if [ "$crontab_status" -ne 0 ]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 无法读取 root crontab，未能确认定时任务状态。"| tee -a "$LOG_FILE"
-        elif printf '%s\n' "$crontab_content" | grep -Fq "$SCRIPT_PATH --run"; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 每分钟一次的定时任务已在执行。"| tee -a "$LOG_FILE"
-        else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 警告：定时任务未找到，可能需要重新设置。"| tee -a "$LOG_FILE"
-        fi
-        return 0
-    else
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 错误：需要 vnStat 2.x 或更高版本（当前：${vnstat_version:-未知}）。" | tee -a "$LOG_FILE"
         return 1
     fi
 }
+
 
 is_decimal() {
     [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]
@@ -1990,7 +2593,6 @@ EOF
     fi
     chmod 600 "$tmp_file" 2>/dev/null || true
     mv -f "$tmp_file" "$CONFIG_FILE" || { rm -f "$tmp_file"; return 1; }
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 配置已更新"| tee -a "$LOG_FILE"
 }
 
 restore_monitor_config_snapshot() {
@@ -2180,85 +2782,6 @@ rollback_monitor_config_transaction() {
 }
 
 
-# 显示当前配置
-show_current_config() {
-    local unit_label
-    [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && unit_label="GB" || unit_label="GiB"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 当前配置:"
-    echo "流量统计模式: $TRAFFIC_MODE"
-    echo "流量统计周期: $TRAFFIC_PERIOD"
-    if [ "$TRAFFIC_PERIOD" = "yearly" ]; then
-        echo "年度起始月份: ${PERIOD_START_MONTH:-1}"
-    fi
-    echo "周期起始日: ${PERIOD_START_DAY:-1}"
-    echo "流量限制: $TRAFFIC_LIMIT $unit_label"
-    echo "容错范围: $TRAFFIC_TOLERANCE $unit_label"
-    echo "限速: ${LIMIT_SPEED:-20} kbit/s"
-    echo "主要网络接口: $MAIN_INTERFACE"
-    echo "限制模式: $LIMIT_MODE"
-    echo "历史不足时继续统计: ${ALLOW_PARTIAL_HISTORY:-false}"
-    if [ "${VNSTAT_MAX_BANDWIDTH:-0}" -eq 0 ]; then
-        echo "vnStat 异常速率检查: 已关闭 (0)"
-    else
-        echo "vnStat 异常速率检查上限: ${VNSTAT_MAX_BANDWIDTH} Mbit/s"
-    fi
-    if [ "$LIMIT_MODE" = "tc" ]; then
-        echo "开机后限速宽限: ${TC_BOOT_GRACE_MINUTES:-10} 分钟"
-    fi
-}
-
-# 检测主要网络接口
-get_main_interface() {
-    local main_interface
-    main_interface=$(ip route show default 2>/dev/null | awk '{
-        for (i = 1; i <= NF; i++) {
-            if ($i == "dev" && (i + 1) <= NF) {
-                print $(i + 1)
-                exit
-            }
-        }
-    }')
-    if [ -z "$main_interface" ]; then
-        main_interface=$(ip link | grep 'state UP' | sed -n 's/^[0-9]*: \([^:]*\):.*/\1/p' | head -n1)
-    fi
-    
-    if [ -z "$main_interface" ]; then
-        while true; do
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 无法自动检测主要网络接口。"| tee -a "$LOG_FILE" >&2
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 可用的网络接口有："| tee -a "$LOG_FILE" >&2
-            ip -o link show | sed -n 's/^[0-9]*: \([^:]*\):.*/\1/p' >&2
-            if ! read -r -p "请从上面的列表中选择一个网络接口: " main_interface; then
-                echo "" >&2
-                echo "输入已结束，已取消本次配置。" >&2
-                return 1
-            fi
-            if [ -z "$main_interface" ]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') 请输入一个有效的接口名称。"| tee -a "$LOG_FILE" >&2
-            elif ip link show "$main_interface" > /dev/null 2>&1; then
-                break
-            else
-                echo "$(date '+%Y-%m-%d %H:%M:%S') 无效的接口，请重新选择。"| tee -a "$LOG_FILE" >&2
-            fi
-        done
-    else
-        if ! read -r -p "检测到的主要网络接口是: $main_interface, 按Enter使用此接口，或输入新的接口名称: " new_interface; then
-            echo "" >&2
-            echo "输入已结束，已取消本次配置。" >&2
-            return 1
-        fi
-        if [ -n "$new_interface" ]; then
-            if ip link show "$new_interface" > /dev/null 2>&1; then
-                main_interface=$new_interface
-            else
-                echo "$(date '+%Y-%m-%d %H:%M:%S') 输入的接口无效，将使用检测到的接口: $main_interface"| tee -a "$LOG_FILE" >&2
-            fi
-        fi
-    fi
-    
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 主要网络接口: $main_interface"| tee -a "$LOG_FILE" >&2
-    echo "$main_interface"
-}
-
 date_num_to_iso() {
     local date_num="$1"
     printf '%s-%s-%s\n' "${date_num:0:4}" "${date_num:4:2}" "${date_num:6:2}"
@@ -2308,7 +2831,7 @@ history_incomplete_for_current_period() {
 }
 
 configure_history_policy() {
-    local period_start available_start available_num retention_start retention_num trafficless_entries history_choice
+    local period_start available_start available_num retention_start retention_num trafficless_entries
     local history_status
 
     ALLOW_PARTIAL_HISTORY=false
@@ -2334,33 +2857,35 @@ configure_history_policy() {
         && { ! [[ "$available_num" =~ ^[0-9]{8}$ ]] || [ "$retention_num" -gt "$available_num" ]; }; then
         available_start="$retention_start"
     fi
-    echo ""
-    echo "检测到 vnStat 历史不足以覆盖周期起点 $period_start。"
-    echo "当前可用流量历史约从 $available_start 开始；受 vnStat 本地历史记录限制，此前流量无法补回。"
-    echo "继续后，脚本会按现有历史统计并正常执行限制，但实际已用流量可能偏低。"
-    echo "主菜单会持续显示该提示，直到进入具有完整历史的新周期。"
-    echo ""
-    echo "1) 我已了解，按现有 vnStat 历史继续"
-    echo "0) 取消配置，不保存本次修改"
-    read -r -p "请输入选择 [0/1]: " history_choice
-    if [ "$history_choice" != "1" ]; then
+    # ntc config set 不提问：由 --allow-partial-history（或原配置里已确认过）决定。
+    case "${CONFIG_PARTIAL_HISTORY:-ask}" in
+        allow)
+            ui_warn "vnStat 历史约从 $available_start 开始，不足以覆盖周期起点 $period_start；本期已用量会偏低。"
+            ALLOW_PARTIAL_HISTORY=true
+            return 0
+            ;;
+        deny)
+            ui_err "vnStat 历史约从 $available_start 开始，不足以覆盖周期起点 $period_start，未保存；如接受本期统计偏低，请加 --allow-partial-history。"
+            return 1
+            ;;
+    esac
+    printf '\n'
+    ui_warn "vnStat 历史不足以覆盖周期起点 $period_start。"
+    ui_note "现有流量历史约从 $available_start 开始，此前的流量无法补回；继续的话本期已用量会偏低，"
+    ui_note "限制仍按这个偏低的数字执行。主菜单会一直提示，直到进入历史完整的新周期。"
+    if ! ui_confirm "按现有 vnStat 历史继续？" n; then
         echo "已取消配置；原配置未被覆盖。"
         return 1
     fi
     ALLOW_PARTIAL_HISTORY=true
 }
 
+# >>> ntc-common:enforcement-state >>>
+# 本区块由 tools/sync-common.sh 根据 src/common/enforcement-state.sh 生成，请改源文件后运行该脚本，勿直接修改。
 enforcement_state_value() {
     local key="$1"
     if [ -f "$ENFORCEMENT_STATE_FILE" ]; then
         grep "^${key}=" "$ENFORCEMENT_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-
-    fi
-}
-
-shutdown_state_value() {
-    local key="$1"
-    if [ -f "$SHUTDOWN_STATE_FILE" ]; then
-        grep "^${key}=" "$SHUTDOWN_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-
     fi
 }
 
@@ -2383,6 +2908,14 @@ write_enforcement_state_file() {
 
 write_enforcement_state() {
     write_enforcement_state_file "$1" "$2" "$3" "$ENFORCEMENT_STATE_FILE"
+}
+# <<< ntc-common:enforcement-state <<<
+
+shutdown_state_value() {
+    local key="$1"
+    if [ -f "$SHUTDOWN_STATE_FILE" ]; then
+        grep "^${key}=" "$SHUTDOWN_STATE_FILE" 2>/dev/null | tail -n 1 | cut -d'=' -f2-
+    fi
 }
 
 clear_owned_shutdown_schedule() {
@@ -2415,7 +2948,7 @@ clear_owned_shutdown_schedule() {
 }
 
 configure_post_save_enforcement() {
-    local current_usage limit_threshold unit_label policy_choice grace_minutes until_epoch
+    local current_usage limit_threshold unit_label policy_choice grace_minutes=10 until_epoch
     local comparison_status desired_mode="" desired_reason="" desired_message=""
     local enforcement_candidate="${ENFORCEMENT_STATE_FILE}.config-candidate.$$"
 
@@ -2459,13 +2992,28 @@ configure_post_save_enforcement() {
     esac
 
     if [ "$desired_mode" != "none" ]; then
-        echo ""
-        echo "当前可统计流量为 $current_usage $unit_label，已经达到执行阈值 $limit_threshold $unit_label。"
-        echo "为避免保存配置后突然限速或关机，请选择本次执行策略："
-        echo "1) 宽限一段时间后再执行（推荐）"
-        echo "2) 立即执行"
-        echo "3) 仅监控，暂停执行限制，稍后在机器限速管理中恢复"
-        read -r -p "请输入选择 (1-3，默认为1): " policy_choice || return 1
+        # 2.0：向导在显示摘要前已经问过（或 ntc config set 用 --when-over 指定），这里直接沿用；
+        # 没有预设时才当场询问。
+        case "${CONFIG_EXCEED_POLICY:-}" in
+            now) policy_choice=2 ;;
+            monitor) policy_choice=3 ;;
+            grace:*)
+                policy_choice=1
+                grace_minutes=$(ntc_int "${CONFIG_EXCEED_POLICY#grace:}" 1 1440) || grace_minutes=10
+                ;;
+            *)
+                echo ""
+                echo "当前可统计流量为 $current_usage $unit_label，已经达到执行阈值 $limit_threshold $unit_label。"
+                echo "为避免保存配置后突然限速或关机，请选择本次执行策略："
+                ui_option 1 "宽限一段时间后再执行" "推荐"
+                ui_option 2 "立即执行"
+                ui_option 3 "仅监控，暂停执行限制" "稍后在「限制执行」里恢复"
+                ui_read_int policy_choice "请选择" 1 1 3 || return 1
+                if [ "$policy_choice" = 1 ]; then
+                    ui_read_int grace_minutes "宽限分钟数" 10 1 1440 || return 1
+                fi
+                ;;
+        esac
         case "$policy_choice" in
             2) desired_mode="none" ;;
             3)
@@ -2474,26 +3022,11 @@ configure_post_save_enforcement() {
                 until_epoch=0
                 desired_message="限制执行已暂停；流量统计和主页显示仍会继续。"
                 ;;
-            1|"")
-                read -r -p "请输入宽限分钟数 (1-1440，默认为10): " grace_minutes || return 1
-                grace_minutes=${grace_minutes:-10}
-                if ! [[ "$grace_minutes" =~ ^[0-9]{1,4}$ ]] || [ $((10#$grace_minutes)) -lt 1 ] ||
-                   [ $((10#$grace_minutes)) -gt 1440 ]; then
-                    echo "输入无效，使用默认值：10 分钟"
-                    grace_minutes=10
-                fi
-                grace_minutes=$((10#$grace_minutes))
+            *)
                 desired_mode="grace"
                 desired_reason="config"
                 until_epoch=$(( $(date +%s) + grace_minutes * 60 ))
                 desired_message="已设置 $grace_minutes 分钟宽限；期间只统计流量，不执行限制。"
-                ;;
-            *)
-                echo "输入无效，使用推荐值：宽限 10 分钟"
-                desired_mode="grace"
-                desired_reason="config"
-                until_epoch=$(( $(date +%s) + 600 ))
-                desired_message="已设置 10 分钟宽限；期间只统计流量，不执行限制。"
                 ;;
         esac
     fi
@@ -2524,7 +3057,7 @@ configure_post_save_enforcement() {
     # 1.1.10–1.2.0 这里是 `[ -n "$desired_message" ] && echo`：没有提示语（用量低于阈值、或选择立即执行）
     # 时返回 1，导致首次配置整体回滚。
     if [ -n "$desired_message" ]; then
-        echo "$desired_message"
+        ui_ok "$desired_message"
     fi
     return 0
 }
@@ -2540,187 +3073,42 @@ cancel_config_on_eof() {
     return 1
 }
 
-# 初始配置函数
+# 配置向导（ntc config、主菜单「修改监控配置」）：先问完全部问题，再准备 vnStat、按新配置预览本期用量、
+# 显示摘要，确认后才保存。任何一步读到输入结束（Ctrl-D）都取消，原配置与 vnStat 状态保持不变。
 initial_config() {
-    local config_backup="${CONFIG_FILE}.before-config.$$"
-    local enforcement_backup="${ENFORCEMENT_STATE_FILE}.before-config.$$"
-    local tc_backup="${TC_STATE_FILE}.before-config.$$"
-    local shutdown_backup="${SHUTDOWN_STATE_FILE}.before-config.$$"
+    local preview_usage preview_threshold
 
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 开始初始化配置" | tee -a "$LOG_FILE"
     CONFIG_TC_CLEAR_ATTEMPTED=false
     CONFIG_SHUTDOWN_CLEAR_ATTEMPTED=false
-
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 正在检测主要网络接口..."| tee -a "$LOG_FILE"
-    MAIN_INTERFACE=$(get_main_interface) || return 1
-    [ -n "$MAIN_INTERFACE" ] || return 1
-    prompt_vnstat_max_bandwidth || return 1
-    begin_initial_vnstat_transaction "$MAIN_INTERFACE" || return 1
-    if ! ensure_vnstat_runtime_config "$MAIN_INTERFACE" ||
-       ! ensure_vnstat_interface "$MAIN_INTERFACE"; then
-        rollback_initial_vnstat_transaction ||
-            echo "vnStat 初始化失败，且未能完整恢复修改前状态。" >&2
+    CONFIG_EXCEED_POLICY=""
+    if ! config_wizard_collect; then
+        cancel_config_on_eof
         return 1
     fi
-
-    while true; do
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 请选择流量统计模式："| tee -a "$LOG_FILE"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 1. 只计算出站流量"| tee -a "$LOG_FILE"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 2. 只计算进站流量"| tee -a "$LOG_FILE"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 3. 出进站流量都计算"| tee -a "$LOG_FILE"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 4. 出站和进站流量只取大"| tee -a "$LOG_FILE"
-        read -r -p "请输入选择 (1-4): " mode_choice || { cancel_config_on_eof; return 1; }
-        case $mode_choice in
-            1) TRAFFIC_MODE="out"; break ;;
-            2) TRAFFIC_MODE="in"; break ;;
-            3) TRAFFIC_MODE="total"; break ;;
-            4) TRAFFIC_MODE="max"; break ;;
-            *) echo "无效输入，请重新选择。" ;;
-        esac
-    done
-
-    read -r -p "请选择流量统计周期 (m/q/y，默认为m): " period_choice || { cancel_config_on_eof; return 1; }
-    case $period_choice in
-        q) TRAFFIC_PERIOD="quarterly" ;;
-        y) TRAFFIC_PERIOD="yearly" ;;
-        m|"") TRAFFIC_PERIOD="monthly" ;;
-        *) echo "无效输入，使用默认值：monthly"; TRAFFIC_PERIOD="monthly" ;;
-    esac
-    if ! ensure_vnstat_daily_retention; then
-        rollback_initial_vnstat_transaction ||
-            echo "本次配置已取消，但 vnStat 状态未能完整恢复。" >&2
+    config_prepare_vnstat || return 1
+    if ! preview_usage=$(get_traffic_usage 2>/dev/null) || ! is_decimal "$preview_usage"; then
+        ui_err "无法按新配置读取本期流量（vnStat 数据暂不可用），已取消本次配置；原配置未改动。"
+        rollback_initial_vnstat_transaction || ui_err "vnStat 状态未能完整恢复。"
         return 1
     fi
-
-    echo "请选择流量单位："
-    echo "1. GB（十进制，1 GB = 1000^3 字节，推荐用于服务商配额）"
-    echo "2. GiB（二进制，1 GiB = 1024^3 字节，兼容旧版）"
-    read -r -p "请输入选择 (1-2，默认为1): " unit_choice || { cancel_config_on_eof; return 1; }
-    case "$unit_choice" in
-        2) TRAFFIC_UNIT="binary" ;;
-        1|"") TRAFFIC_UNIT="decimal" ;;
-        *) echo "无效输入，使用默认值：GB"; TRAFFIC_UNIT="decimal" ;;
-    esac
-
-    PERIOD_START_MONTH=1
-    if [ "$TRAFFIC_PERIOD" = "yearly" ]; then
-        read -r -p "请输入年度周期起始月份 (1-12，默认为1): " PERIOD_START_MONTH || { cancel_config_on_eof; return 1; }
-        if [[ -z "$PERIOD_START_MONTH" ]]; then
-            PERIOD_START_MONTH=1
-        elif ! [[ "$PERIOD_START_MONTH" =~ ^[1-9]$|^1[0-2]$ ]]; then
-            echo "无效输入，使用默认值：1"
-            PERIOD_START_MONTH=1
+    preview_threshold=$(config_threshold)
+    if compare_decimal "$preview_usage" "$preview_threshold" ge; then
+        if ! config_ask_exceed_policy "$preview_usage" "$preview_threshold"; then
+            cancel_config_on_eof
+            return 1
         fi
+    else
+        # 预览时还没到阈值；万一保存前的几秒内越过阈值，也先宽限 10 分钟，不在保存过程中再提问。
+        CONFIG_EXCEED_POLICY="grace:10"
     fi
-
-    read -r -p "请输入周期起始日 (1-31，默认为1): " PERIOD_START_DAY || { cancel_config_on_eof; return 1; }
-    if [[ -z "$PERIOD_START_DAY" ]]; then
-        PERIOD_START_DAY=1
-    elif ! [[ "$PERIOD_START_DAY" =~ ^[1-9]$|^[12][0-9]$|^3[01]$ ]]; then
-        echo "无效输入，使用默认值：1"
-        PERIOD_START_DAY=1
-    fi
-
-    while true; do
-        read -r -p "请输入流量限制 ($([ "$TRAFFIC_UNIT" = "decimal" ] && echo GB || echo GiB)): " TRAFFIC_LIMIT || { cancel_config_on_eof; return 1; }
-        if [[ "$TRAFFIC_LIMIT" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(echo "$TRAFFIC_LIMIT > 0" | bc -l 2>/dev/null || echo "0") )); then
-            break
-        else
-            echo "无效输入，请输入一个大于 0 的数字。"
-        fi
-    done
-
-    while true; do
-        read -r -p "请输入容错范围 ($([ "$TRAFFIC_UNIT" = "decimal" ] && echo GB || echo GiB)): " TRAFFIC_TOLERANCE || { cancel_config_on_eof; return 1; }
-        if [[ "$TRAFFIC_TOLERANCE" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(echo "$TRAFFIC_TOLERANCE < $TRAFFIC_LIMIT" | bc -l 2>/dev/null || echo "0") )); then
-            break
-        else
-            echo "无效输入，容错范围必须大于等于 0 且小于流量限制。"
-        fi
-    done
-
-    while true; do
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 请选择限制模式："| tee -a "$LOG_FILE"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 1. TC 模式（更灵活）"| tee -a "$LOG_FILE"
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 2. 关机模式（更安全）"| tee -a "$LOG_FILE"
-        read -r -p "请输入选择 (1-2): " limit_mode_choice || { cancel_config_on_eof; return 1; }
-        case $limit_mode_choice in
-            1) 
-                LIMIT_MODE="tc"
-                read -r -p "请输入限速 (kbit/s，默认为20): " LIMIT_SPEED || { cancel_config_on_eof; return 1; }
-                LIMIT_SPEED=${LIMIT_SPEED:-20}
-                if ! [[ "$LIMIT_SPEED" =~ ^[1-9][0-9]*$ ]]; then
-                    echo "无效输入，使用默认值：20 kbit/s"
-                    LIMIT_SPEED=20
-                fi
-                read -r -p "请输入开机后限速宽限时间（防卡死，单位：分钟；0=立即，默认为10）: " TC_BOOT_GRACE_MINUTES || { cancel_config_on_eof; return 1; }
-                TC_BOOT_GRACE_MINUTES=${TC_BOOT_GRACE_MINUTES:-10}
-                if ! [[ "$TC_BOOT_GRACE_MINUTES" =~ ^[0-9]{1,4}$ ]] || [ $((10#$TC_BOOT_GRACE_MINUTES)) -gt 1440 ]; then
-                    echo "无效输入，使用默认值：10 分钟"
-                    TC_BOOT_GRACE_MINUTES=10
-                fi
-                TC_BOOT_GRACE_MINUTES=$((10#$TC_BOOT_GRACE_MINUTES))
-                break 
-                ;;
-            2) 
-                LIMIT_MODE="shutdown"
-                LIMIT_SPEED=""  # 关机模式不需要限速
-                TC_BOOT_GRACE_MINUTES=10
-                break 
-                ;;
-            *) echo "无效输入，请重新选择。" ;;
-        esac
-    done
-
-    if ! configure_history_policy; then
-        rollback_initial_vnstat_transaction ||
-            echo "本次配置已取消，但 vnStat 状态未能完整恢复。" >&2
+    config_show_summary "$preview_usage" "$preview_threshold"
+    if ! ui_confirm "保存？" y; then
+        rollback_initial_vnstat_transaction || ui_err "vnStat 状态未能完整恢复。"
+        ui_note "已取消，原配置未改动。"
         return 1
     fi
-
-    if ! snapshot_monitor_config_state "$config_backup" "$enforcement_backup" \
-        "$tc_backup" "$shutdown_backup"; then
-        rm -f "$config_backup" "$enforcement_backup" "$tc_backup" "$shutdown_backup"
-        rollback_initial_vnstat_transaction ||
-            echo "无法建立配置快照，且 vnStat 状态未能完整恢复。" >&2
-        return 1
-    fi
-
-    if ! write_config; then
-        if rollback_monitor_config_transaction "$config_backup" "$enforcement_backup" \
-            "$tc_backup" "$shutdown_backup"; then
-            echo "配置写入失败，已恢复修改前的监控配置、执行策略与 vnStat 状态。"
-        else
-            echo "配置写入失败，且无法完整恢复修改前状态；配置与运行态备份已保留，请立即检查。"
-        fi
-        ntc_operation_log monitor-config failure
-        return 1
-    fi
-
-    if ! configure_post_save_enforcement; then
-        if rollback_monitor_config_transaction "$config_backup" "$enforcement_backup" \
-            "$tc_backup" "$shutdown_backup"; then
-            echo "后续安全处理失败，已恢复修改前的监控配置、执行策略与 vnStat 状态。"
-        else
-            echo "后续安全处理失败，且无法完整恢复旧运行态；配置与运行态备份已保留，请立即检查。"
-        fi
-        ntc_operation_log monitor-config failure
-        return 1
-    fi
-
-    if ! commit_initial_vnstat_transaction; then
-        if rollback_monitor_config_transaction "$config_backup" "$enforcement_backup" \
-            "$tc_backup" "$shutdown_backup"; then
-            echo "vnStat 服务持久化失败，已恢复修改前的配置与运行态。"
-        else
-            echo "vnStat 服务持久化失败，且无法完整恢复旧运行态；备份已保留，请立即检查。"
-        fi
-        ntc_operation_log monitor-config failure
-        return 1
-    fi
-
-    rm -f "$config_backup" "$enforcement_backup" "$tc_backup" "$shutdown_backup"
-    ntc_operation_log monitor-config success
+    config_commit || return 1
+    ui_ok "配置已保存。"
 }
 
 # 返回指定年月的周期锚点。若用户配置了不存在的日期（如 2 月 31 日），使用当月最后一天。
@@ -4300,7 +4688,11 @@ write_usage_state() {
     mv -f "$tmp_file" "$USAGE_STATE_FILE" || { rm -f "$tmp_file"; return 1; }
 }
 
+# 系统里是否有待执行的计划关机。systemd-logind 安排的关机会写 /run/systemd/shutdown/scheduled（取消时删除），
+# 各个 systemd 版本都有；shutdown --show 要 systemd 250 起才有，logind 的计划关机也没有常驻进程，
+# 只看 --show 或 pgrep 会漏掉它（monitor 会每分钟重新安排关机，暂停/停用会误删 NTC 的关机记录），所以先看这个文件。
 has_pending_shutdown() {
+    [ ! -e "${SYSTEMD_SHUTDOWN_SCHEDULED_FILE:-/run/systemd/shutdown/scheduled}" ] || return 0
     if shutdown --help 2>&1 | grep -q -- '--show'; then
         shutdown --show >/dev/null 2>&1
     elif command_exists pgrep; then
@@ -4329,8 +4721,8 @@ pending_shutdown_matches_owned_state() {
             return 0
         fi
     fi
-    if [ -r /run/systemd/shutdown/scheduled ] &&
-       grep -Fq "$task_token" /run/systemd/shutdown/scheduled 2>/dev/null; then
+    if [ -r "${SYSTEMD_SHUTDOWN_SCHEDULED_FILE:-/run/systemd/shutdown/scheduled}" ] &&
+       grep -Fq "$task_token" "${SYSTEMD_SHUTDOWN_SCHEDULED_FILE:-/run/systemd/shutdown/scheduled}" 2>/dev/null; then
         return 0
     fi
     return 1
@@ -4460,7 +4852,9 @@ owned_tc_limit_active() {
 
 TC_BOOT_GRACE_REMAINING=0
 
-tc_boot_grace_active() {
+# 只看开机时长的开机宽限判断（不读 TC），开机自动恢复与每分钟的限速判断共用。
+# 宽限内返回 0，并把剩余分钟数写入 TC_BOOT_GRACE_REMAINING。
+boot_grace_window_active() {
     local grace_minutes uptime_seconds grace_seconds
 
     TC_BOOT_GRACE_REMAINING=0
@@ -4469,12 +4863,21 @@ tc_boot_grace_active() {
     grace_minutes=$((10#$grace_minutes))
     [ "$grace_minutes" -le 1440 ] || grace_minutes=10
     [ "$grace_minutes" -gt 0 ] || return 1
-    owned_tc_limit_active && return 1
     uptime_seconds=$(awk '{ printf "%d", $1 }' /proc/uptime 2>/dev/null) || return 1
     [[ "$uptime_seconds" =~ ^[0-9]+$ ]] || return 1
     grace_seconds=$((grace_minutes * 60))
     [ "$uptime_seconds" -lt "$grace_seconds" ] || return 1
     TC_BOOT_GRACE_REMAINING=$(( (grace_seconds - uptime_seconds + 59) / 60 ))
+    return 0
+}
+
+tc_boot_grace_active() {
+    boot_grace_window_active || return 1
+    # 限速已经生效（例如宽限设置得比上次开机时长还长）就不再“宽限”。
+    if owned_tc_limit_active; then
+        TC_BOOT_GRACE_REMAINING=0
+        return 1
+    fi
     return 0
 }
 
@@ -4754,6 +5157,15 @@ recover_owned_tc_hierarchy() {
             return 1
         fi
         state_expected=true
+    fi
+
+    # 开机自动恢复时若仍在开机限速宽限期内，就不重建 NTC 的整机上限，只清理它的状态（2.0）。
+    # Dog 的端口限速由共享 runner 先行重建，不受影响；宽限结束后每分钟的检查会重新限速。
+    if [ "$mode" = "--auto" ] && [ "$state_expected" = "true" ] && [ "${LIMIT_MODE:-}" = "tc" ] &&
+       boot_grace_window_active; then
+        echo "仍在开机限速宽限期（剩余约 $TC_BOOT_GRACE_REMAINING 分钟），暂不恢复整机限速；宽限结束后每分钟的检查会重新限速。"
+        clear_owned_tc_rules "开机宽限期内不恢复整机限速"
+        return $?
     fi
 
     if [ "${LIMIT_MODE:-}" != "tc" ] && [ "$state_expected" = "false" ]; then
@@ -5131,9 +5543,1200 @@ setup_crontab() {
 }
 
 
-# 主函数
-main() {
+# ════════════════════════════════════════════════════════════════════════════
+# 2.0：日志只记事件、状态详情、配置向导与命令行
+# ════════════════════════════════════════════════════════════════════════════
+
+CONFIG_ASSUME_YES=false        # ntc config set --yes：vnStat 保留期调整与保存都不再询问
+CONFIG_EXCEED_POLICY=""        # 保存时已超阈值的处理：grace:<分钟>|now|monitor；空表示当场询问
+CONFIG_PARTIAL_HISTORY=ask     # vnStat 历史不足以覆盖周期起点时：ask 询问 | allow 继续 | deny 取消
+
+# 非负小数的规范写法：去掉多余的前导零与末尾的 0（500.000 → 500，01.50 → 1.5）；不合法返回 1。
+normalize_decimal() {
+    local value
+    value=$(ntc_decimal "${1:-}") || return 1
+    if [[ "$value" == *.* ]]; then
+        value="${value%"${value##*[!0]}"}"
+        value="${value%.}"
+    fi
+    printf '%s' "$value"
+}
+
+# 提前量的默认值：限额大于 1 时为 1，否则为 0（保证默认值总小于限额）。
+default_tolerance() {
+    if compare_decimal "${1:-0}" 1 gt; then printf '1'; else printf '0'; fi
+}
+
+# 执行阈值 = 限额 − 提前量（用 awk 计算，不依赖 bc）。
+config_threshold() {
+    normalize_decimal "$(awk -v l="$TRAFFIC_LIMIT" -v t="${TRAFFIC_TOLERANCE:-0}" 'BEGIN { printf "%.6f", l - t }')"
+}
+
+# 默认路由所在网卡；没有默认路由时取第一块已启用的非回环网卡。只检测，不提问。
+detect_main_interface() {
+    local iface
+    iface=$(ip route show default 2>/dev/null |
+        awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i + 1); exit } }')
+    if [ -z "$iface" ]; then
+        iface=$(ip -o link show up 2>/dev/null | awk -F': ' '{ sub(/@.*/, "", $2) } $2 != "lo" { print $2; exit }')
+    fi
+    [ -n "$iface" ] || return 1
+    printf '%s\n' "$iface"
+}
+
+interface_exists() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] && ip link show "$1" >/dev/null 2>&1
+}
+
+# 可选的网卡（不含 lo），空格分隔。
+list_interfaces() {
+    ip -o link show 2>/dev/null | awk -F': ' '{ sub(/@.*/, "", $2) } $2 != "lo" { printf "%s%s", sep, $2; sep = " " }'
+}
+
+# 向导第 1 步：只收集答案，不改动任何东西。答案写入 MAIN_INTERFACE、TRAFFIC_* 等配置变量；
+# 已有配置时每项默认取当前值。只有读到输入结束（EOF）才返回 1，输入不合法会重问。
+config_wizard_collect() {
+    local answer detected value default_choice unit_label tolerance_default
+
+    ui_title "流量监控配置" "共 7 项；回车使用 [ ] 里的值，Ctrl-D 随时取消"
+
+    detected="${MAIN_INTERFACE:-}"
+    [ -n "$detected" ] || detected=$(detect_main_interface) || detected=""
+    while true; do
+        if [ -n "$detected" ]; then
+            ui_read answer "1/7 网卡" "$detected" || return 1
+        else
+            ui_note "没有检测到默认路由。可用网卡：$(list_interfaces)"
+            ui_read answer "1/7 网卡" || return 1
+        fi
+        if interface_exists "$answer"; then
+            MAIN_INTERFACE="$answer"
+            break
+        fi
+        ui_warn "网卡「${answer}」不存在。可用网卡：$(list_interfaces)"
+    done
+
+    printf '\n'
+    ui_option 1 "出站" "只算上传"
+    ui_option 2 "入站" "只算下载"
+    ui_option 3 "出+入" "上传与下载相加"
+    ui_option 4 "出入取较大" "上传、下载分别累计，取较大的一个"
+    case "${TRAFFIC_MODE:-}" in
+        out) default_choice=1 ;;
+        in) default_choice=2 ;;
+        max) default_choice=4 ;;
+        *) default_choice=3 ;;
+    esac
+    ui_read_int value "2/7 统计方向" "$default_choice" 1 4 || return 1
+    case "$value" in
+        1) TRAFFIC_MODE=out ;;
+        2) TRAFFIC_MODE=in ;;
+        3) TRAFFIC_MODE=total ;;
+        *) TRAFFIC_MODE=max ;;
+    esac
+
+    printf '\n'
+    ui_option 1 "每月"
+    ui_option 2 "每季度" "1/4/7/10 月"
+    ui_option 3 "每年"
+    case "${TRAFFIC_PERIOD:-}" in
+        quarterly) default_choice=2 ;;
+        yearly) default_choice=3 ;;
+        *) default_choice=1 ;;
+    esac
+    ui_read_int value "3/7 重置周期" "$default_choice" 1 3 || return 1
+    case "$value" in
+        1) TRAFFIC_PERIOD=monthly ;;
+        2) TRAFFIC_PERIOD=quarterly ;;
+        *) TRAFFIC_PERIOD=yearly ;;
+    esac
+    if [ "$TRAFFIC_PERIOD" = yearly ]; then
+        ui_read_int PERIOD_START_MONTH "    每年从几月开始" "${PERIOD_START_MONTH:-1}" 1 12 || return 1
+    else
+        PERIOD_START_MONTH=1
+    fi
+    ui_read_int PERIOD_START_DAY "    每期从几号开始（没有这一天的月份按月末算）" "${PERIOD_START_DAY:-1}" 1 31 || return 1
+
+    printf '\n'
+    ui_option 1 "GB" "十进制，1 GB = 1000³ 字节，服务商通常这样计"
+    ui_option 2 "GiB" "二进制，1 GiB = 1024³ 字节"
+    if [ "${TRAFFIC_UNIT:-decimal}" = binary ]; then default_choice=2; else default_choice=1; fi
+    ui_read_int value "4/7 流量单位" "$default_choice" 1 2 || return 1
+    if [ "$value" = 2 ]; then TRAFFIC_UNIT=binary; else TRAFFIC_UNIT=decimal; fi
+    unit_label=$(ntc_unit_label "$TRAFFIC_UNIT")
+
+    printf '\n'
+    while true; do
+        ui_read_decimal value "5/7 每期流量限额（$unit_label）" "${TRAFFIC_LIMIT:-}" || return 1
+        if compare_decimal "$value" 0 gt; then
+            TRAFFIC_LIMIT=$(normalize_decimal "$value")
+            break
+        fi
+        ui_warn "限额必须大于 0。"
+    done
+    tolerance_default="${TRAFFIC_TOLERANCE:-$(default_tolerance "$TRAFFIC_LIMIT")}"
+    while true; do
+        ui_read_decimal value "6/7 提前量（$unit_label，用量达到「限额 − 提前量」就执行）" "$tolerance_default" || return 1
+        if compare_decimal "$value" "$TRAFFIC_LIMIT" lt; then
+            TRAFFIC_TOLERANCE=$(normalize_decimal "$value")
+            break
+        fi
+        ui_warn "提前量必须小于限额 $TRAFFIC_LIMIT $unit_label。"
+    done
+
+    printf '\n'
+    ui_option 1 "整机限速" "限速后仍能 SSH 登录处理"
+    ui_option 2 "关机" "最省流量，需要到服务商面板开机"
+    if [ "${LIMIT_MODE:-tc}" = shutdown ]; then default_choice=2; else default_choice=1; fi
+    ui_read_int value "7/7 达到阈值后" "$default_choice" 1 2 || return 1
+    if [ "$value" = 1 ]; then
+        LIMIT_MODE=tc
+        ui_read_int LIMIT_SPEED "    限速（kbit/s）" "${LIMIT_SPEED:-20}" 1 10000000 || return 1
+        ui_read_int TC_BOOT_GRACE_MINUTES "    开机后几分钟内先不限速（防止开机即被限死；0 = 立即限速）" \
+            "${TC_BOOT_GRACE_MINUTES:-10}" 0 1440 || return 1
+    else
+        LIMIT_MODE=shutdown
+        LIMIT_SPEED="${LIMIT_SPEED:-20}"
+        TC_BOOT_GRACE_MINUTES="${TC_BOOT_GRACE_MINUTES:-10}"
+    fi
+}
+
+# 向导第 2 步：开始 vnStat 事务，确认 vnStat 正在统计这块网卡、日数据保留期够用、历史能覆盖周期起点。
+# 任何一步失败都回滚 vnStat 事务。
+config_prepare_vnstat() {
+    if ! begin_initial_vnstat_transaction "$MAIN_INTERFACE"; then
+        ui_err "无法开始 vnStat 配置事务，已取消本次配置；原配置未改动。"
+        return 1
+    fi
+    if ! ensure_vnstat_runtime_config "$MAIN_INTERFACE" || ! ensure_vnstat_interface "$MAIN_INTERFACE"; then
+        ui_err "vnStat 无法统计网卡 $MAIN_INTERFACE，已取消本次配置；原配置未改动。"
+        rollback_initial_vnstat_transaction || ui_err "vnStat 状态未能完整恢复。"
+        return 1
+    fi
+    if ! ensure_vnstat_daily_retention || ! configure_history_policy; then
+        rollback_initial_vnstat_transaction || ui_err "vnStat 状态未能完整恢复。"
+        return 1
+    fi
+}
+
+# 保存时已达到新阈值：先问清楚这次怎么处理，结果写入 CONFIG_EXCEED_POLICY。EOF 返回 1。
+config_ask_exceed_policy() {
+    local usage="$1" threshold="$2" unit_label action value minutes
+    unit_label=$(ntc_unit_label "$TRAFFIC_UNIT")
+    if [ "$LIMIT_MODE" = shutdown ]; then action="关机"; else action="限速"; fi
+    printf '\n'
+    ui_warn "本期已用 $(ntc_num "$usage") $unit_label，已达到新的执行阈值 $(ntc_num "$threshold") $unit_label。"
+    ui_note "为免保存后立刻${action}，请选择这次怎么处理："
+    ui_option 1 "先宽限一段时间" "推荐"
+    ui_option 2 "立即${action}"
+    ui_option 3 "只统计，暂停执行" "之后在「限制执行」里恢复"
+    ui_read_int value "请选择" 1 1 3 || return 1
+    case "$value" in
+        1)
+            ui_read_int minutes "    宽限分钟数" 10 1 1440 || return 1
+            CONFIG_EXCEED_POLICY="grace:$minutes"
+            ;;
+        2) CONFIG_EXCEED_POLICY=now ;;
+        *) CONFIG_EXCEED_POLICY=monitor ;;
+    esac
+}
+
+# 配置各项（向导摘要、ntc config show、修改配置菜单共用）。
+config_summary_rows() {
+    local unit_label
+    unit_label=$(ntc_unit_label "${TRAFFIC_UNIT:-binary}")
+    ui_kv "网卡" "$MAIN_INTERFACE"
+    ui_kv "统计方向" "$(ntc_mode_label "$TRAFFIC_MODE")"
+    ui_kv "重置周期" "$(ntc_period_label "$TRAFFIC_PERIOD" "${PERIOD_START_DAY:-1}" "${PERIOD_START_MONTH:-1}")"
+    ui_kv "每期限额" "$(ntc_num "$TRAFFIC_LIMIT") $unit_label"
+    ui_kv "提前量" "$(ntc_num "${TRAFFIC_TOLERANCE:-0}") $unit_label（用量达到 $(ntc_num "$(config_threshold)") $unit_label 时执行）"
+    if [ "$LIMIT_MODE" = shutdown ]; then
+        ui_kv "超额处理" "关机"
+    else
+        ui_kv "超额处理" "整机限速 ${LIMIT_SPEED:-20} kbit/s"
+        if [ "${TC_BOOT_GRACE_MINUTES:-10}" = 0 ]; then
+            ui_kv "开机宽限" "无（开机后立即按状态限速）"
+        else
+            ui_kv "开机宽限" "开机后 ${TC_BOOT_GRACE_MINUTES:-10} 分钟内不限速"
+        fi
+    fi
+    if [ "${VNSTAT_MAX_BANDWIDTH:-0}" = 0 ]; then
+        ui_kv "异常速率" "vnStat 不检查（0）"
+    else
+        ui_kv "异常速率" "vnStat 丢弃超过 ${VNSTAT_MAX_BANDWIDTH} Mbit/s 的读数"
+    fi
+    [ "${ALLOW_PARTIAL_HISTORY:-false}" != true ] || ui_kv "历史数据" "本期 vnStat 历史不完整，已确认按现有历史统计"
+}
+
+config_show_summary() {
+    local usage="$1" threshold="$2" unit_label policy_text=""
+    unit_label=$(ntc_unit_label "$TRAFFIC_UNIT")
+    ui_title "确认配置"
+    config_summary_rows
+    if compare_decimal "$usage" "$threshold" ge; then
+        case "$CONFIG_EXCEED_POLICY" in
+            now) if [ "$LIMIT_MODE" = shutdown ]; then policy_text="保存后立即关机"; else policy_text="保存后立即限速"; fi ;;
+            monitor) policy_text="保存后暂停执行，只统计" ;;
+            grace:*) policy_text="保存后先宽限 ${CONFIG_EXCEED_POLICY#grace:} 分钟" ;;
+        esac
+        ui_kv "本期已用" "$(ntc_num "$usage") $unit_label，已达到阈值：$policy_text"
+    else
+        ui_kv "本期已用" "$(ntc_num "$usage") $unit_label，未达到阈值"
+    fi
+    printf '\n'
+}
+
+# 写进事件日志的一行配置说明。
+config_oneline() {
+    local unit_label action
+    unit_label=$(ntc_unit_label "${TRAFFIC_UNIT:-binary}")
+    if [ "$LIMIT_MODE" = shutdown ]; then action="超额关机"; else action="超额限速 ${LIMIT_SPEED:-20} kbit/s"; fi
+    printf '%s %s，%s，限额 %s %s，提前量 %s %s，%s' "$MAIN_INTERFACE" "$(ntc_mode_label "$TRAFFIC_MODE")" \
+        "$(ntc_period_label "$TRAFFIC_PERIOD" "${PERIOD_START_DAY:-1}" "${PERIOD_START_MONTH:-1}")" \
+        "$TRAFFIC_LIMIT" "$unit_label" "${TRAFFIC_TOLERANCE:-0}" "$unit_label" "$action"
+}
+
+# 保存（向导与 ntc config set 共用）：快照 → 写配置 → 保存后的执行策略（清除旧限速与本脚本的关机计划，
+# 按预设写入宽限或暂停）→ 提交 vnStat 事务。任何一步失败都回滚配置、执行策略、TC/关机状态与 vnStat。
+# 调用前 vnStat 事务必须已经开始。
+config_commit() {
+    local config_backup="${CONFIG_FILE}.before-config.$$"
+    local enforcement_backup="${ENFORCEMENT_STATE_FILE}.before-config.$$"
+    local tc_backup="${TC_STATE_FILE}.before-config.$$"
+    local shutdown_backup="${SHUTDOWN_STATE_FILE}.before-config.$$"
+    local step="配置写入"
+
+    CONFIG_TC_CLEAR_ATTEMPTED=false
+    CONFIG_SHUTDOWN_CLEAR_ATTEMPTED=false
+    if ! snapshot_monitor_config_state "$config_backup" "$enforcement_backup" \
+        "$tc_backup" "$shutdown_backup"; then
+        rm -f "$config_backup" "$enforcement_backup" "$tc_backup" "$shutdown_backup"
+        rollback_initial_vnstat_transaction || ui_err "vnStat 状态未能完整恢复。"
+        ui_err "无法建立修改前的快照（可能有无法确认归属的关机计划或 TC 状态），已取消保存；原配置未改动。"
+        ntc_operation_log monitor-config failure
+        return 1
+    fi
+    if write_config; then
+        step="保存后的执行策略处理"
+        if configure_post_save_enforcement; then
+            step="vnStat 服务持久化"
+            if commit_initial_vnstat_transaction; then
+                rm -f "$config_backup" "$enforcement_backup" "$tc_backup" "$shutdown_backup"
+                ntc_operation_log monitor-config success
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 监控配置已更新：$(config_oneline)" >> "$LOG_FILE"
+                return 0
+            fi
+        fi
+    fi
+    if rollback_monitor_config_transaction "$config_backup" "$enforcement_backup" \
+        "$tc_backup" "$shutdown_backup"; then
+        ui_err "${step}失败，已恢复修改前的监控配置、执行策略与 vnStat 状态。"
+    else
+        ui_err "${step}失败，且无法完整恢复修改前状态；配置与运行态备份已保留，请立即检查。"
+    fi
+    ntc_operation_log monitor-config failure
+    return 1
+}
+
+# root crontab 里是否有本脚本的 --run 任务（注释行不算）。
+monitor_cron_present() {
+    local cron
+    cron=$(read_root_crontab_locked 2>/dev/null) || return 1
+    ntc_cron_has_entry "$cron" "$SCRIPT_PATH --run"
+}
+
+# 保存之后：定时任务缺失才写入（不再每次重写 crontab），然后立即检查一轮，让主菜单马上有数据。
+config_after_save() {
+    if ! monitor_cron_present; then
+        if setup_crontab >/dev/null; then
+            ui_ok "已添加每分钟一次的检查任务。"
+        else
+            ui_err "定时任务写入失败：流量不会被自动检查，请稍后在 ntc 主菜单的「限制执行」里启用流量监控。"
+        fi
+    fi
+    monitor_check_now || true
+    return 0
+}
+
+# 只改 vnStat 异常速率上限：只动 vnStat 配置和本行配置，不重新评估限速、宽限或暂停。
+save_vnstat_max_bandwidth() {
+    local backup="${CONFIG_FILE}.before-config.$$"
+
+    if ! begin_initial_vnstat_transaction "$MAIN_INTERFACE"; then
+        ui_err "无法开始 vnStat 配置事务，未作修改。"
+        return 1
+    fi
+    if ! cp -p "$CONFIG_FILE" "$backup"; then
+        rollback_initial_vnstat_transaction || ui_err "vnStat 状态未能完整恢复。"
+        ui_err "无法备份当前配置，未作修改。"
+        return 1
+    fi
+    if ensure_vnstat_runtime_config "$MAIN_INTERFACE" && write_config && commit_initial_vnstat_transaction; then
+        rm -f "$backup"
+        ntc_operation_log monitor-config success
+        echo "$(date '+%Y-%m-%d %H:%M:%S') vnStat 异常速率上限已改为 ${VNSTAT_MAX_BANDWIDTH} Mbit/s（0 = 不检查）" >> "$LOG_FILE"
+        return 0
+    fi
+    if restore_file_snapshot "$backup" true "$CONFIG_FILE" && rollback_initial_vnstat_transaction; then
+        rm -f "$backup"
+        ui_err "保存失败，已恢复原配置与 vnStat 设置。"
+    else
+        ui_err "保存失败，且未能完整恢复；原配置备份在 $backup。"
+    fi
+    ntc_operation_log monitor-config failure
+    return 1
+}
+
+configure_vnstat_max_bandwidth() {
+    local old="${VNSTAT_MAX_BANDWIDTH:-0}"
+    ui_title "vnStat 异常速率上限" "高级"
+    ui_note "vnStat 会丢弃超过这个速率的读数，用来过滤网卡计数器跳变造成的虚高流量。"
+    ui_note "0 表示不检查（NTC 默认）；只在出现用量突然暴涨的误报时才需要设置。"
+    printf '\n'
+    if ! prompt_vnstat_max_bandwidth; then
+        printf '\n'
+        ui_note "已取消。"
+        return 1
+    fi
+    if [ "$VNSTAT_MAX_BANDWIDTH" = "$old" ]; then
+        ui_note "没有变化。"
+        return 0
+    fi
+    if save_vnstat_max_bandwidth; then
+        ui_ok "已保存：vnStat 异常速率上限 ${VNSTAT_MAX_BANDWIDTH} Mbit/s（0 = 不检查）。"
+        return 0
+    fi
+    VNSTAT_MAX_BANDWIDTH="$old"
+    return 1
+}
+
+# ntc config（主菜单「修改监控配置」）。
+configure_menu() {
+    local choice n rc=0
+    # 由 ntc 主菜单调起时（NTC_MENU_PAUSE=1），不经过子菜单就结束的路径在返回前停一下，免得结果被主菜单重画盖掉；
+    # 子菜单里的动作自己会停，命令行 ntc config 不停。
+    if [ ! -f "$CONFIG_FILE" ]; then
+        if initial_config; then config_after_save; else rc=1; fi
+        [ "${NTC_MENU_PAUSE:-}" != 1 ] || ui_pause
+        return "$rc"
+    fi
+    if ! read_config >/dev/null 2>&1; then
+        ui_warn "现有配置文件有误，将重新配置（保存前不会改动原文件）。"
+        if initial_config; then config_after_save; else rc=1; fi
+        [ "${NTC_MENU_PAUSE:-}" != 1 ] || ui_pause
+        return "$rc"
+    fi
+    if [ "${DISABLED:-false}" = "true" ]; then
+        ui_title "流量监控配置" "已停用"
+        config_summary_rows
+        printf '\n'
+        ui_warn "流量监控已停用：不会安装定时任务，也不会统计、限速或关机。"
+        ui_note "如需继续监控或修改配置，请先在 ntc 主菜单的「限制执行」里选择启用。"
+        [ "${NTC_MENU_PAUSE:-}" != 1 ] || ui_pause
+        return 0
+    fi
+    while true; do
+        menu_clear
+        ui_title "修改监控配置"
+        config_summary_rows
+        printf '\n'
+        ui_option 1 "修改配置" "逐项确认，回车保留当前值"
+        ui_option 2 "vnStat 异常速率上限" "高级"
+        ui_rule
+        ui_option 0 "返回"
+        if ! ui_prompt 2 choice; then
+            printf '\n'
+            return 0
+        fi
+        if ! n=$(ntc_int "$(ntc_trim "$choice")" 0 2); then
+            ui_warn "无效选择，请输入 0–2。"
+            sleep 1
+            continue
+        fi
+        case "$n" in
+            0) return 0 ;;
+            1)
+                if initial_config; then
+                    config_after_save
+                fi
+                ui_pause
+                ;;
+            2)
+                configure_vnstat_max_bandwidth
+                ui_pause
+                ;;
+        esac
+        # 菜单重画前重新读取，显示的就是刚保存（或回滚后）的配置。
+        read_config >/dev/null 2>&1 || return 1
+    done
+}
+
+# ntc config show：只读。
+show_config() {
+    local problems
+    if [ ! -f "$CONFIG_FILE" ]; then
+        ui_warn "尚未配置流量监控：运行 sudo ntc config 开始。"
+        return 1
+    fi
+    if ! read_config >/dev/null 2>&1; then
+        problems=$(read_config 2>&1 | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} //' |
+            awk 'NF { printf "%s%s", sep, $0; sep = "；" }')
+        ui_err "配置文件有误：${problems:-无法读取}"
+        return 1
+    fi
+    ui_title "当前配置" "$CONFIG_FILE"
+    config_summary_rows
+    [ "${DISABLED:-false}" != true ] || ui_kv "状态" "已停用（在「限制执行」里启用）"
+}
+
+config_set_usage() {
+    cat << 'EOF'
+用法：ntc config set 参数… [--yes]
+  --interface 网卡                    --mode out|in|total|max（出站/入站/出+入/取较大）
+  --period monthly|quarterly|yearly   --start-day 1-31    --start-month 1-12（仅每年）
+  --unit GB|GiB                       --limit 数值        --tolerance 数值（提前量）
+  --action tc|shutdown                --speed kbit/s（1-10000000）
+  --boot-grace 分钟（0-1440）          --vnstat-max-bw Mbit/s（0-50000，0 = 不检查）
+  --when-over grace:分钟|now|monitor  保存时用量已达到阈值的处理（默认 grace:10）
+  --allow-partial-history             vnStat 历史不足以覆盖周期起点时仍然保存
+  --yes                               不再确认（vnStat 日数据保留期不足时自动调整）
+未给出的项保持当前值；首次配置至少需要 --limit。参数也可写成 --limit=500。
+示例：ntc config set --limit 500 --tolerance 1 --speed 50 --yes
+EOF
+}
+
+config_set_error() {
+    printf '%s\n' "ntc config set：$*" >&2
+    printf '%s\n' "运行 ntc config set --help 查看参数。" >&2
+}
+
+# ntc config set：与向导相同的校验和保存事务，但不逐项提问。
+config_set_cli() {
+    local arg value had_config=false changed=false only_max_bw=true preview_usage preview_threshold
+
+    if [ -f "$CONFIG_FILE" ]; then
+        had_config=true
+        if ! read_config >/dev/null 2>&1; then
+            ui_err "现有配置文件有误，无法在它的基础上修改；请运行 sudo ntc config 重新配置。"
+            return 1
+        fi
+        if [ "${DISABLED:-false}" = "true" ]; then
+            ui_err "流量监控已停用：请先运行 sudo ntc enable（或在「限制执行」里启用）再修改配置。"
+            return 1
+        fi
+    fi
+    CONFIG_ASSUME_YES=false
+    CONFIG_EXCEED_POLICY="grace:10"
+    # 原配置已经确认过按不完整历史统计时沿用该确认，否则需要显式加参数。
+    if [ "${ALLOW_PARTIAL_HISTORY:-false}" = "true" ]; then CONFIG_PARTIAL_HISTORY=allow; else CONFIG_PARTIAL_HISTORY=deny; fi
+
+    while [ "$#" -gt 0 ]; do
+        arg="$1"
+        case "$arg" in
+            -y|--yes) CONFIG_ASSUME_YES=true; shift; continue ;;
+            --allow-partial-history) CONFIG_PARTIAL_HISTORY=allow; shift; continue ;;
+            -h|--help) config_set_usage; return 0 ;;
+            --*=*) value="${arg#*=}"; arg="${arg%%=*}"; shift ;;
+            --*)
+                case "$arg" in
+                    --interface|--mode|--period|--start-day|--start-month|--unit|--limit|--tolerance|--action|\
+                    --speed|--boot-grace|--vnstat-max-bw|--when-over) ;;
+                    *) config_set_error "无法识别的参数：$arg"; return 2 ;;
+                esac
+                if [ "$#" -lt 2 ]; then
+                    config_set_error "$arg 需要一个值"
+                    return 2
+                fi
+                value="$2"
+                shift 2
+                ;;
+            *) config_set_error "无法识别的参数：$arg"; return 2 ;;
+        esac
+        case "$arg" in
+            --when-over)
+                case "$value" in
+                    now|monitor) CONFIG_EXCEED_POLICY="$value" ;;
+                    grace:*)
+                        value=$(ntc_int "${value#grace:}" 1 1440) || { config_set_error "--when-over grace:分钟 的分钟数必须是 1–1440"; return 2; }
+                        CONFIG_EXCEED_POLICY="grace:$value"
+                        ;;
+                    *) config_set_error "--when-over 只能是 grace:分钟、now 或 monitor"; return 2 ;;
+                esac
+                continue
+                ;;
+            --interface)
+                interface_exists "$value" || { config_set_error "网卡不存在：$value（可用：$(list_interfaces)）"; return 2; }
+                MAIN_INTERFACE="$value"
+                ;;
+            --mode)
+                case "$value" in
+                    out|in|total|max) TRAFFIC_MODE="$value" ;;
+                    *) config_set_error "--mode 只能是 out、in、total 或 max"; return 2 ;;
+                esac
+                ;;
+            --period)
+                case "$value" in
+                    monthly|m) TRAFFIC_PERIOD=monthly ;;
+                    quarterly|q) TRAFFIC_PERIOD=quarterly ;;
+                    yearly|y) TRAFFIC_PERIOD=yearly ;;
+                    *) config_set_error "--period 只能是 monthly、quarterly 或 yearly"; return 2 ;;
+                esac
+                ;;
+            --start-day)
+                PERIOD_START_DAY=$(ntc_int "$value" 1 31) || { config_set_error "--start-day 必须是 1–31 的整数"; return 2; }
+                ;;
+            --start-month)
+                PERIOD_START_MONTH=$(ntc_int "$value" 1 12) || { config_set_error "--start-month 必须是 1–12 的整数"; return 2; }
+                ;;
+            --unit)
+                case "${value,,}" in
+                    gb|decimal) TRAFFIC_UNIT=decimal ;;
+                    gib|binary) TRAFFIC_UNIT=binary ;;
+                    *) config_set_error "--unit 只能是 GB 或 GiB"; return 2 ;;
+                esac
+                ;;
+            --limit)
+                if ! value=$(normalize_decimal "$value") || ! compare_decimal "$value" 0 gt; then
+                    config_set_error "--limit 必须是大于 0 的数字"
+                    return 2
+                fi
+                TRAFFIC_LIMIT="$value"
+                ;;
+            --tolerance)
+                TRAFFIC_TOLERANCE=$(normalize_decimal "$value") || { config_set_error "--tolerance 必须是不小于 0 的数字"; return 2; }
+                ;;
+            --action)
+                case "$value" in
+                    tc|limit) LIMIT_MODE=tc ;;
+                    shutdown) LIMIT_MODE=shutdown ;;
+                    *) config_set_error "--action 只能是 tc 或 shutdown"; return 2 ;;
+                esac
+                ;;
+            --speed)
+                LIMIT_SPEED=$(ntc_int "$value" 1 10000000) || { config_set_error "--speed 必须是 1–10000000 的整数（kbit/s）"; return 2; }
+                ;;
+            --boot-grace)
+                TC_BOOT_GRACE_MINUTES=$(ntc_int "$value" 0 1440) || { config_set_error "--boot-grace 必须是 0–1440 的整数（分钟）"; return 2; }
+                ;;
+            --vnstat-max-bw)
+                vnstat_max_bandwidth_valid "$value" || { config_set_error "--vnstat-max-bw 必须是 0–50000 的整数（Mbit/s）"; return 2; }
+                VNSTAT_MAX_BANDWIDTH=$((10#$value))
+                changed=true
+                continue
+                ;;
+            *) config_set_error "无法识别的参数：$arg"; return 2 ;;
+        esac
+        changed=true
+        only_max_bw=false
+    done
+
+    if ! $changed; then
+        config_set_error "没有给出要修改的配置项"
+        return 2
+    fi
+    if ! $had_config; then
+        if [ -z "${TRAFFIC_LIMIT:-}" ]; then
+            config_set_error "首次配置至少需要 --limit"
+            return 2
+        fi
+        if [ -z "${MAIN_INTERFACE:-}" ] && ! MAIN_INTERFACE=$(detect_main_interface); then
+            config_set_error "没有检测到默认网卡，请用 --interface 指定"
+            return 2
+        fi
+        TRAFFIC_MODE="${TRAFFIC_MODE:-total}"
+        TRAFFIC_PERIOD="${TRAFFIC_PERIOD:-monthly}"
+        PERIOD_START_DAY="${PERIOD_START_DAY:-1}"
+        TRAFFIC_UNIT="${TRAFFIC_UNIT:-decimal}"
+        TRAFFIC_TOLERANCE="${TRAFFIC_TOLERANCE:-$(default_tolerance "$TRAFFIC_LIMIT")}"
+        LIMIT_MODE="${LIMIT_MODE:-tc}"
+        LIMIT_SPEED="${LIMIT_SPEED:-20}"
+        TC_BOOT_GRACE_MINUTES="${TC_BOOT_GRACE_MINUTES:-10}"
+        only_max_bw=false
+    fi
+    [ "$TRAFFIC_PERIOD" = yearly ] || PERIOD_START_MONTH=1
+    PERIOD_START_MONTH="${PERIOD_START_MONTH:-1}"
+    if ! compare_decimal "${TRAFFIC_TOLERANCE:-0}" "$TRAFFIC_LIMIT" lt; then
+        config_set_error "提前量（${TRAFFIC_TOLERANCE:-0}）必须小于限额（$TRAFFIC_LIMIT）"
+        return 2
+    fi
+
+    if $only_max_bw; then
+        ui_title "修改 vnStat 异常速率上限"
+        ui_kv "异常速率" "${VNSTAT_MAX_BANDWIDTH} Mbit/s（0 = 不检查）"
+        if [ "$CONFIG_ASSUME_YES" != true ] && ! ui_confirm "保存？" y; then
+            ui_note "已取消，原配置未改动。"
+            return 1
+        fi
+        save_vnstat_max_bandwidth || return 1
+        ui_ok "配置已保存。"
+        return 0
+    fi
+
+    config_prepare_vnstat || return 1
+    if ! preview_usage=$(get_traffic_usage 2>/dev/null) || ! is_decimal "$preview_usage"; then
+        ui_err "无法按新配置读取本期流量（vnStat 数据暂不可用），未保存。"
+        rollback_initial_vnstat_transaction || ui_err "vnStat 状态未能完整恢复。"
+        return 1
+    fi
+    preview_threshold=$(config_threshold)
+    config_show_summary "$preview_usage" "$preview_threshold"
+    if [ "$CONFIG_ASSUME_YES" != true ] && ! ui_confirm "保存？" y; then
+        rollback_initial_vnstat_transaction || ui_err "vnStat 状态未能完整恢复。"
+        ui_note "已取消，原配置未改动。"
+        return 1
+    fi
+    config_commit || return 1
+    ui_ok "配置已保存。"
+    config_after_save
+}
+
+# ── 日志只记事件 ─────────────────────────────────────────────────────────
+# 每分钟一轮的输出先写进缓冲文件；状态变化、检查失败或出现新的失败原因时整段写进真实日志，同一失败最多
+# 10 分钟写一次，一切正常时每小时写一行“运行正常”。1.x 每分钟写 5 行流水账，5000 行只能保留十几个小时。
+ROUND_LOG_BUFFER=""
+ROUND_REAL_LOG_FILE=""
+ROUND_LOG_STATUS=""
+
+round_log_begin() {
+    ROUND_REAL_LOG_FILE="$LOG_FILE"
+    ROUND_LOG_STATUS=""
+    # 调用方持有监控锁，残留的缓冲文件只可能来自被强杀的旧进程。
+    rm -f "$WORK_DIR"/.round-log.* 2>/dev/null || true
+    ROUND_LOG_BUFFER=$(mktemp "$WORK_DIR/.round-log.XXXXXX" 2>/dev/null) || {
+        ROUND_LOG_BUFFER=""
+        return 1
+    }
+    chmod 600 "$ROUND_LOG_BUFFER" 2>/dev/null || true
+    LOG_FILE="$ROUND_LOG_BUFFER"
+}
+
+# 本轮之后的状态指纹：只包含决定“发生了什么”的字段，不含每分钟都在变的用量和时间戳。
+round_state_signature() {
+    {
+        printf 'rc=%s\n' "${1:-}"
+        grep -E '^(STATUS|PERIOD_START)=' "$USAGE_STATE_FILE"
+        cat "$ENFORCEMENT_STATE_FILE"
+        grep -v '^APPLIED_AT=' "$TC_STATE_FILE"
+        cat "$SHUTDOWN_STATE_FILE"
+        grep -E '^(HEALTH|REASON)=' "$HEALTH_STATE_FILE"
+        cat "$PERIOD_STATE_FILE"
+    } 2>/dev/null | cksum | awk '{ print $1 "-" $2 }'
+}
+
+usage_status_label() {
     case "${1:-}" in
+        normal) printf '流量正常' ;;
+        limited) printf '已整机限速' ;;
+        grace) printf '宽限中，只统计不限速' ;;
+        paused) printf '已暂停限制，只统计不限速' ;;
+        shutdown) printf '已安排关机' ;;
+        shutdown_external) printf '系统已有其他关机计划，NTC 没有再提交关机' ;;
+        *) printf '%s' "${1:-状态未知}" ;;
+    esac
+}
+
+round_heartbeat_line() {
+    local now_text status usage threshold unit
+    now_text=$(date '+%Y-%m-%d %H:%M:%S')
+    if [ "${DISABLED:-false}" = "true" ]; then
+        printf '%s 运行正常：流量监控已停用（NTC %s）\n' "$now_text" "$SCRIPT_VERSION"
+        return 0
+    fi
+    status=$(ntc_kv "$USAGE_STATE_FILE" STATUS) || status=""
+    usage=$(ntc_kv "$USAGE_STATE_FILE" USAGE) || usage="?"
+    threshold=$(ntc_kv "$USAGE_STATE_FILE" LIMIT_THRESHOLD) || threshold="?"
+    unit=$(ntc_kv "$USAGE_STATE_FILE" UNIT) || unit=""
+    printf '%s 运行正常：本期已用 %s %s / 阈值 %s %s，%s（NTC %s）\n' "$now_text" "$usage" "$unit" "$threshold" "$unit" \
+        "$(usage_status_label "$status")" "$SCRIPT_VERSION"
+}
+
+# 结束本轮：决定缓冲内容是否写进真实日志，再删除缓冲。可以重复调用（EXIT trap 兜底）。
+round_log_finish() {
+    local status="${1:-${ROUND_LOG_STATUS:-}}" buffer="${ROUND_LOG_BUFFER:-}" real="${ROUND_REAL_LOG_FILE:-}"
+    local signature previous now last_write age=999999
+
+    [ -n "$buffer" ] || return 0
+    ROUND_LOG_BUFFER=""
+    LOG_FILE="$real"
+    [[ "$status" =~ ^[0-9]+$ ]] || status=interrupted
+    signature=$(round_state_signature "$status")
+    previous=$(cat "$LOG_SIGNATURE_FILE" 2>/dev/null || true)
+    now=$(date +%s)
+    if last_write=$(stat -c %Y "$real" 2>/dev/null) && [[ "$last_write" =~ ^[0-9]+$ ]]; then
+        age=$((now - last_write))
+    fi
+    if [ "$signature" != "$previous" ] || { [ "$status" != 0 ] && [ "$age" -ge 600 ]; }; then
+        [ ! -s "$buffer" ] || cat "$buffer" >> "$real"
+        if printf '%s\n' "$signature" > "${LOG_SIGNATURE_FILE}.tmp.$$" 2>/dev/null; then
+            mv -f "${LOG_SIGNATURE_FILE}.tmp.$$" "$LOG_SIGNATURE_FILE" 2>/dev/null ||
+                rm -f "${LOG_SIGNATURE_FILE}.tmp.$$"
+        fi
+    elif [ "$status" = 0 ] && [ "$age" -ge 3600 ]; then
+        round_heartbeat_line >> "$real"
+    fi
+    rm -f "$buffer"
+}
+
+# 一轮检查（cron 的 --run 与 ntc check 共用）。
+run_monitor_round() {
+    local run_status=0
+    if ! read_config; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 配置文件读取失败，请检查配置" | tee -a "$LOG_FILE"
+        write_health_state error "配置文件读取失败" || true
+        return 1
+    fi
+    if [ "${DISABLED:-false}" = "true" ]; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 监控已标记为禁用，跳过自动检查" | tee -a "$LOG_FILE"
+        write_health_state disabled "监控已禁用" || true
+        return 0
+    fi
+    if ! ensure_vnstat_runtime_config "$MAIN_INTERFACE"; then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') vnStat 运行配置或服务校验失败，跳过本轮检查。" | tee -a "$LOG_FILE"
+        write_health_state error "vnStat 运行配置或服务校验失败" || true
+        return 1
+    fi
+    if ! check_reset_limit; then
+        # 周期文件未更新，下一轮会重试；记录健康状态，避免 Telegram 静默。
+        echo "$(date '+%Y-%m-%d %H:%M:%S') 新周期的限速/关机计划清理失败，下一轮重试。" | tee -a "$LOG_FILE"
+        write_health_state error "新周期的限速/关机计划清理失败（TC 规则可能被其他程序占用，见 traffic_monitor.log）" || true
+        return 1
+    fi
+    check_and_limit_traffic || run_status=$?
+    if [ "$run_status" -eq 0 ]; then
+        write_health_state ok "" || true
+    else
+        write_health_state error "$(last_log_reason)" || true
+    fi
+    return "$run_status"
+}
+
+# ntc check：与定时任务完全相同的一轮，之后在屏幕上给一句结论。
+monitor_check_now() {
+    local rc=0 status usage threshold unit reason text
+    round_log_begin || true
+    run_monitor_round > /dev/null 2>> "${ROUND_LOG_BUFFER:-/dev/null}" || rc=$?
+    ROUND_LOG_STATUS="$rc"
+    if [ "$rc" -ne 0 ]; then
+        reason=$(ntc_kv "$HEALTH_STATE_FILE" REASON) || reason=""
+        ui_err "检查失败：${reason:-原因见日志}"
+        if [ -n "$ROUND_LOG_BUFFER" ] && [ -s "$ROUND_LOG_BUFFER" ]; then
+            ui_note "本轮最后几行输出："
+            tail -n 8 "$ROUND_LOG_BUFFER" | sed 's/^/    /'
+        fi
+    elif [ "${DISABLED:-false}" = "true" ]; then
+        ui_warn "流量监控已停用：不统计也不限速（在 ntc 主菜单的「限制执行」里启用）。"
+    else
+        status=$(ntc_kv "$USAGE_STATE_FILE" STATUS) || status=""
+        usage=$(ntc_kv "$USAGE_STATE_FILE" USAGE) || usage="?"
+        threshold=$(ntc_kv "$USAGE_STATE_FILE" LIMIT_THRESHOLD) || threshold="?"
+        unit=$(ntc_kv "$USAGE_STATE_FILE" UNIT) || unit=""
+        text="本期已用 $(ntc_num "$usage" 2>/dev/null || printf '%s' "$usage") $unit / 阈值 $(ntc_num "$threshold" 2>/dev/null || printf '%s' "$threshold") $unit，$(usage_status_label "$status")"
+        [ "$status" != limited ] || text+=" ${LIMIT_SPEED:-20} kbit/s"
+        if [ "$status" = normal ]; then ui_ok "检查完成：$text。"; else ui_warn "检查完成：$text。"; fi
+    fi
+    round_log_finish "$rc"
+    return "$rc"
+}
+
+# ── 状态详情（ntc status）：只读，不取锁、不写文件、不改 TC ─────────────────
+# 1:4001 及以上（Dog 端口限速）的 HTB 类数量；读 `tc class show` 的输出。
+count_dog_classes() {
+    local kind id n=0
+    while read -r kind _ id _; do
+        [ "$kind" = class ] || continue
+        [[ "$id" =~ ^1:([0-9a-f]{1,4})$ ]] || continue
+        if [ $((16#${BASH_REMATCH[1]})) -ge 16385 ]; then
+            n=$((n + 1))
+        fi
+    done
+    printf '%s' "$n"
+}
+
+enforcement_reason_label() {
+    case "${1:-}" in
+        manual) printf '手动' ;;
+        config) printf '保存配置时选择' ;;
+        shutdown_reboot) printf '关机后重启保护' ;;
+        boot) printf '开机宽限' ;;
+        "") printf '未注明原因' ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+status_collect() {
+    local cron usage state_start updated
+    ST_NOW=$(date +%s)
+    ST_CONFIGURED=false
+    ST_VALID=false
+    ST_CONFIG_ERROR=""
+    if [ -f "$CONFIG_FILE" ]; then
+        ST_CONFIGURED=true
+        if read_config >/dev/null 2>&1; then
+            ST_VALID=true
+        else
+            ST_CONFIG_ERROR=$(read_config 2>&1 | sed -E 's/^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} //' |
+                awk 'NF { printf "%s%s", sep, $0; sep = "；" }')
+            [ -n "$ST_CONFIG_ERROR" ] || ST_CONFIG_ERROR="无法读取配置文件"
+        fi
+    fi
+    # 只读取上次保存的 vnStat 配置路径；resolve_vnstat_config_path 会写文件，这里不用。
+    VNSTAT_CONFIG_PATH=$(cat "$VNSTAT_CONFIG_PATH_FILE" 2>/dev/null || true)
+    if [ -z "$VNSTAT_CONFIG_PATH" ] || [ ! -f "$VNSTAT_CONFIG_PATH" ]; then
+        unset VNSTAT_CONFIG_PATH
+    fi
+
+    ST_PERIOD_START="" ST_PERIOD_END="" ST_THRESHOLD="" ST_USAGE="" ST_USAGE_SOURCE="" ST_USAGE_AGE=0
+    ST_PERCENT="" ST_FORECAST=""
+    if $ST_VALID; then
+        align_timezone_with_vnstat
+        ST_PERIOD_START=$(get_period_start_date)
+        ST_PERIOD_END=$(get_period_end_date)
+        ST_THRESHOLD=$(config_threshold)
+        state_start=$(ntc_kv "$USAGE_STATE_FILE" PERIOD_START) || state_start=""
+        updated=$(ntc_kv "$USAGE_STATE_FILE" UPDATED_EPOCH) || updated=""
+        usage=$(ntc_kv "$USAGE_STATE_FILE" USAGE) || usage=""
+        if [ "$state_start" = "$ST_PERIOD_START" ] && [[ "$updated" =~ ^[0-9]+$ ]] &&
+           [ $((ST_NOW - updated)) -le 600 ] && is_decimal "$usage"; then
+            ST_USAGE="$usage"
+            ST_USAGE_SOURCE=state
+            ST_USAGE_AGE=$(( (ST_NOW - updated) / 60 ))
+        elif usage=$(get_traffic_usage 2>/dev/null) && is_decimal "$usage"; then
+            ST_USAGE="$usage"
+            ST_USAGE_SOURCE=live
+        fi
+        if [ -n "$ST_USAGE" ]; then
+            ST_PERCENT=$(ntc_percent "$ST_USAGE" "$TRAFFIC_LIMIT") || ST_PERCENT=""
+            ST_FORECAST=$(ntc_forecast "$ST_USAGE" "$ST_THRESHOLD" "$ST_PERIOD_START" "$ST_PERIOD_END" "$ST_NOW") ||
+                ST_FORECAST=""
+        fi
+    fi
+
+    ST_STATE_STATUS=$(ntc_kv "$USAGE_STATE_FILE" STATUS) || ST_STATE_STATUS=""
+    ST_ENF_MODE=$(ntc_kv "$ENFORCEMENT_STATE_FILE" MODE) || ST_ENF_MODE=""
+    ST_ENF_UNTIL=$(ntc_kv "$ENFORCEMENT_STATE_FILE" UNTIL_EPOCH) || ST_ENF_UNTIL=""
+    ST_ENF_REASON=$(ntc_kv "$ENFORCEMENT_STATE_FILE" REASON) || ST_ENF_REASON=""
+    IFS=$'\t' read -r ST_HEALTH ST_HEALTH_TEXT < <(ntc_health_summary "$HEALTH_STATE_FILE" "$ST_NOW")
+
+    ST_CRON_OK=true
+    ST_CRON_MONITOR=false
+    ST_CRON_TELEGRAM=false
+    if ! cron=$(read_current_crontab 2>/dev/null); then
+        ST_CRON_OK=false
+        cron=""
+    fi
+    if ntc_cron_has_entry "$cron" "$SCRIPT_PATH --run"; then ST_CRON_MONITOR=true; fi
+    if ntc_cron_has_entry "$cron" "$WORK_DIR/trafficcop-lite-telegram.sh"; then ST_CRON_TELEGRAM=true; fi
+    if ! $ST_CONFIGURED; then
+        ST_LEVEL=off ST_WORD="○ 尚未配置" ST_DETAIL="运行 sudo ntc config 开始"
+    elif [ -n "$ST_CONFIG_ERROR" ]; then
+        ST_LEVEL=err ST_WORD="✗ 配置有误" ST_DETAIL="$ST_CONFIG_ERROR"
+    else
+        IFS=$'\t' read -r ST_LEVEL ST_WORD ST_DETAIL < <(ntc_overall_status "${DISABLED:-false}" "$ST_CRON_OK" \
+            "$ST_CRON_MONITOR" "$HEALTH_STATE_FILE" "$ST_STATE_STATUS" "${LIMIT_SPEED:-}" "$ST_ENF_UNTIL" "$ST_NOW")
+    fi
+
+    ST_TG=none ST_TG_REPORT="" ST_TG_WARN=""
+    if [ -f "$TG_CONFIG_FILE" ]; then
+        if [ "$(ntc_kv "$TG_CONFIG_FILE" TG_DISABLED)" = true ]; then
+            ST_TG=disabled
+        elif $ST_CRON_TELEGRAM; then
+            ST_TG=enabled
+        else
+            ST_TG=no-cron
+        fi
+        ST_TG_REPORT=$(ntc_kv "$TG_CONFIG_FILE" DAILY_REPORT_TIME) || ST_TG_REPORT=""
+        # 与 Telegram 组件同一套规则：空或 off 是关闭，写坏的值按默认 80,90 执行。
+        ST_TG_WARN=$(ntc_tg_warn_percents "$TG_CONFIG_FILE")
+    fi
+
+    ST_TC_ROOT="" ST_TC_ACTIVE=unknown ST_TC_DOG=""
+    if [ -n "$TC_BIN" ] && [[ "${MAIN_INTERFACE:-}" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]]; then
+        ST_TC_ROOT=$(tc_root_qdisc "$MAIN_INTERFACE" 2>/dev/null | awk '{ print $2 }')
+        if [ -f "$TC_STATE_FILE" ]; then
+            owned_tc_limit_active 2>/dev/null
+            case $? in
+                0) ST_TC_ACTIVE=yes ;;
+                1) ST_TC_ACTIVE=no ;;
+                *) ST_TC_ACTIVE=unknown ;;
+            esac
+        else
+            ST_TC_ACTIVE=no
+        fi
+        ST_TC_DOG=$(tc_class_output "$MAIN_INTERFACE" 2>/dev/null | count_dog_classes)
+    fi
+
+    ST_RECOVERY=none
+    if [ -f "$TC_RECOVERY_UNIT_FILE" ]; then
+        if command_exists systemctl && systemctl is-enabled --quiet traffic-tools-tc-recovery.service 2>/dev/null; then
+            ST_RECOVERY=enabled
+        else
+            ST_RECOVERY=disabled
+        fi
+    fi
+    if ! command -v vnstat >/dev/null 2>&1; then
+        ST_VNSTAT=missing
+    elif vnstat_daemon_is_running; then
+        ST_VNSTAT=running
+    else
+        ST_VNSTAT=stopped
+    fi
+    if [ -f "$DOG_CONFIG_FILE" ]; then ST_DOG=true; else ST_DOG=false; fi
+}
+
+status_print_human() {
+    local unit_label color text elapsed left avg projected hit hhmm warn_text tc_text
+    ui_title "状态详情" "$(hostname -s 2>/dev/null || uname -n)"
+    if ! $ST_CONFIGURED; then
+        ui_warn "尚未配置流量监控：运行 sudo ntc config，或在 ntc 主菜单选「修改监控配置」。"
+    elif [ -n "$ST_CONFIG_ERROR" ]; then
+        ui_err "配置文件有误：$ST_CONFIG_ERROR"
+    else
+        color=$(ui_level_color "$ST_LEVEL")
+        ui_row "$DIM" "状态" "$ST_WORD${ST_DETAIL:+  $ST_DETAIL}" "$color"
+        unit_label=$(ntc_unit_label "$TRAFFIC_UNIT")
+        ui_kv "网卡" "$MAIN_INTERFACE · $(ntc_mode_label "$TRAFFIC_MODE")"
+        text="$(ntc_period_label "$TRAFFIC_PERIOD" "$PERIOD_START_DAY" "$PERIOD_START_MONTH")：$ST_PERIOD_START 至 $ST_PERIOD_END"
+        if [ -n "$ST_FORECAST" ]; then
+            read -r elapsed _ left avg projected hit <<< "$ST_FORECAST"
+            text+="，还剩 $(ntc_days_left_text "$left")"
+        fi
+        ui_kv "周期" "$text"
+        if [ -n "$ST_USAGE" ]; then
+            text=""
+            if [ "$ST_USAGE_SOURCE" = live ]; then
+                text="（刚从 vnStat 读取）"
+            elif [ "$ST_USAGE_AGE" -ge 1 ]; then
+                text="（${ST_USAGE_AGE} 分钟前）"
+            fi
+            if [ -n "$ST_PERCENT" ]; then
+                ui_usage_kv "本期已用" "$(ntc_num "$ST_USAGE") $unit_label / $(ntc_num "$TRAFFIC_LIMIT") $unit_label" \
+                    "$ST_PERCENT" "$text"
+            else
+                ui_kv "本期已用" "$(ntc_num "$ST_USAGE") $unit_label / $(ntc_num "$TRAFFIC_LIMIT") $unit_label${text:+  $text}"
+            fi
+        else
+            ui_kv "本期已用" "暂时无法读取（vnStat 数据不可用）"
+        fi
+        ui_kv "执行阈值" "$(ntc_num "$ST_THRESHOLD") $unit_label（限额 − 提前量 $(ntc_num "$TRAFFIC_TOLERANCE") $unit_label）"
+        if [ -n "$ST_FORECAST" ]; then
+            if [ "$hit" = 0 ]; then
+                ui_kv "本期预计" "已达到阈值"
+            elif awk -v e="$elapsed" 'BEGIN { exit !(e < 1) }'; then
+                ui_kv "本期预计" "本期刚开始，满一天后显示预计用量"
+            elif [ "$hit" != -1 ]; then
+                ui_row "$DIM" "本期预计" "约 $(ntc_num "$projected") $unit_label，按目前速度 $(date -d "@$hit" '+%m-%d %H:%M' 2>/dev/null || echo '?') 达到阈值" "$YELLOW"
+            else
+                ui_kv "本期预计" "约 $(ntc_num "$projected") $unit_label（按本期日均 $(ntc_num "$avg") $unit_label），本期不会达到阈值"
+            fi
+        fi
+        if [ "$LIMIT_MODE" = shutdown ]; then
+            ui_kv "超额处理" "关机"
+        elif [ "${TC_BOOT_GRACE_MINUTES:-10}" -gt 0 ]; then
+            ui_kv "超额处理" "整机限速 ${LIMIT_SPEED} kbit/s；开机后 ${TC_BOOT_GRACE_MINUTES} 分钟内不限速"
+        else
+            ui_kv "超额处理" "整机限速 ${LIMIT_SPEED} kbit/s"
+        fi
+        case "$ST_ENF_MODE" in
+            grace)
+                if [[ "$ST_ENF_UNTIL" =~ ^[0-9]+$ ]] && hhmm=$(date -d "@$ST_ENF_UNTIL" '+%m-%d %H:%M' 2>/dev/null); then
+                    if [ "$ST_ENF_UNTIL" -gt "$ST_NOW" ]; then text="宽限到 $hhmm"; else text="宽限已于 $hhmm 结束"; fi
+                else
+                    text="宽限中"
+                fi
+                ui_kv "执行策略" "$text（$(enforcement_reason_label "$ST_ENF_REASON")）"
+                ;;
+            paused) ui_kv "执行策略" "已暂停（$(enforcement_reason_label "$ST_ENF_REASON")），只统计不执行" ;;
+            *) ui_kv "执行策略" "按配置执行" ;;
+        esac
+        ui_kv "最近检查" "$ST_HEALTH_TEXT"
+        [ "${ALLOW_PARTIAL_HISTORY:-false}" != true ] || ui_note "本期 vnStat 历史不完整，已用量可能偏低；进入新周期后恢复正常。"
+    fi
+
+    if ! $ST_CRON_OK; then
+        ui_kv "定时任务" "无法读取 root crontab"
+    else
+        text="监控：$($ST_CRON_MONITOR && printf '已安装' || printf '未安装')"
+        text+="；Telegram：$($ST_CRON_TELEGRAM && printf '已安装' || printf '未安装')"
+        ui_kv "定时任务" "$text"
+    fi
+    case "$ST_TG" in
+        none) ui_kv "Telegram" "未配置" ;;
+        disabled) ui_kv "Telegram" "已停用" ;;
+        no-cron) ui_kv "Telegram" "已配置，但定时任务缺失（不会发送）" ;;
+        *)
+            if [ "${ST_TG_WARN:-80,90}" = off ]; then
+                warn_text="用量预警已关闭"
+            else
+                warn_text="用量预警 $(printf '%s' "${ST_TG_WARN:-80,90}" | sed 's/,/%、/g')%"
+            fi
+            ui_kv "Telegram" "已启用${ST_TG_REPORT:+；每日 $ST_TG_REPORT 日报}；$warn_text"
+            ;;
+    esac
+    if [ -z "$TC_BIN" ]; then
+        ui_kv "TC" "未找到 tc 命令"
+    elif [ -n "${MAIN_INTERFACE:-}" ]; then
+        case "$ST_TC_ACTIVE" in
+            yes) tc_text="NTC 整机限速生效中（$(ntc_kv "$TC_STATE_FILE" LIMIT_SPEED) kbit/s）" ;;
+            no)
+                if [ -f "$TC_STATE_FILE" ]; then
+                    tc_text="NTC 有限速记录，但规则不在（下一轮检查会处理）"
+                else
+                    tc_text="NTC 未限速"
+                fi
+                ;;
+            *) tc_text="NTC 限速状态无法确认（运行 ntc self-check 查看）" ;;
+        esac
+        [ -z "$ST_TC_DOG" ] || [ "$ST_TC_DOG" = 0 ] || tc_text+="；Dog 端口限速 ${ST_TC_DOG} 个"
+        ui_kv "TC" "$tc_text；根队列 ${ST_TC_ROOT:-无}"
+    fi
+    case "$ST_RECOVERY" in
+        enabled) ui_kv "自动恢复" "已启用（开机时检查 Dog/NTC 的 TC 规则）" ;;
+        disabled) ui_kv "自动恢复" "已安装，未启用" ;;
+        *) ui_kv "自动恢复" "未启用" ;;
+    esac
+    case "$ST_VNSTAT" in
+        running) ui_kv "vnStat" "守护进程运行中" ;;
+        stopped) ui_kv "vnStat" "守护进程未运行：流量无法统计" ;;
+        *) ui_kv "vnStat" "未安装" ;;
+    esac
+    if $ST_DOG; then ui_kv "Dog" "已安装（与 NTC 共用 TC 层级）"; else ui_kv "Dog" "未安装"; fi
+}
+
+status_print_json() {
+    local elapsed="" left="" avg="" projected="" hit="" unit=""
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "输出 JSON 需要 jq。" >&2
+        return 1
+    fi
+    [ -z "$ST_FORECAST" ] || read -r elapsed _ left avg projected hit <<< "$ST_FORECAST"
+    [ -z "${TRAFFIC_UNIT:-}" ] || unit=$(ntc_unit_label "$TRAFFIC_UNIT")
+    jq -n \
+        --arg version "$SCRIPT_VERSION" --arg now "$ST_NOW" \
+        --arg configured "$ST_CONFIGURED" --arg config_error "$ST_CONFIG_ERROR" --arg disabled "${DISABLED:-false}" \
+        --arg level "$ST_LEVEL" --arg word "$ST_WORD" --arg detail "$ST_DETAIL" --arg state "$ST_STATE_STATUS" \
+        --arg interface "${MAIN_INTERFACE:-}" --arg mode "${TRAFFIC_MODE:-}" --arg period "${TRAFFIC_PERIOD:-}" \
+        --arg start_day "${PERIOD_START_DAY:-}" --arg start_month "${PERIOD_START_MONTH:-}" \
+        --arg period_start "$ST_PERIOD_START" --arg period_end "$ST_PERIOD_END" --arg days_left "$left" \
+        --arg unit "$unit" --arg usage "$ST_USAGE" --arg usage_source "$ST_USAGE_SOURCE" \
+        --arg limit "${TRAFFIC_LIMIT:-}" --arg tolerance "${TRAFFIC_TOLERANCE:-}" --arg threshold "$ST_THRESHOLD" \
+        --arg percent "$ST_PERCENT" --arg elapsed "$elapsed" --arg avg "$avg" --arg projected "$projected" --arg hit "$hit" \
+        --arg action "${LIMIT_MODE:-}" --arg speed "${LIMIT_SPEED:-}" --arg boot_grace "${TC_BOOT_GRACE_MINUTES:-}" \
+        --arg enf_mode "$ST_ENF_MODE" --arg enf_until "$ST_ENF_UNTIL" --arg enf_reason "$ST_ENF_REASON" \
+        --arg health "$ST_HEALTH" --arg health_text "$ST_HEALTH_TEXT" \
+        --arg cron_ok "$ST_CRON_OK" --arg cron_monitor "$ST_CRON_MONITOR" --arg cron_telegram "$ST_CRON_TELEGRAM" \
+        --arg tg "$ST_TG" --arg tg_report "$ST_TG_REPORT" --arg tg_warn "$ST_TG_WARN" \
+        --arg tc_root "$ST_TC_ROOT" --arg tc_active "$ST_TC_ACTIVE" --arg tc_dog "$ST_TC_DOG" \
+        --arg recovery "$ST_RECOVERY" --arg vnstat "$ST_VNSTAT" --arg max_bw "${VNSTAT_MAX_BANDWIDTH:-}" \
+        --arg dog "$ST_DOG" --arg partial "${ALLOW_PARTIAL_HISTORY:-false}" '
+        def num: if . == "" then null else (tonumber? // null) end;
+        def str: if . == "" then null else . end;
+        def flag: . == "true";
+        {
+          version: $version,
+          generated_epoch: ($now | num),
+          configured: ($configured | flag),
+          config_error: ($config_error | str),
+          disabled: ($disabled | flag),
+          status: {level: ($level | str), label: ($word | str), detail: ($detail | str), state: ($state | str)},
+          interface: ($interface | str),
+          mode: ($mode | str),
+          period: {type: ($period | str), start_day: ($start_day | num), start_month: ($start_month | num),
+                   start: ($period_start | str), end: ($period_end | str), days_left: ($days_left | num)},
+          unit: ($unit | str),
+          usage: ($usage | num),
+          usage_source: ($usage_source | str),
+          limit: ($limit | num),
+          tolerance: ($tolerance | num),
+          threshold: ($threshold | num),
+          percent: ($percent | num),
+          forecast: (if $projected == "" then null else
+                      {days_elapsed: ($elapsed | num), avg_per_day: ($avg | num), projected: ($projected | num),
+                       reached: (($hit | num) == 0),
+                       reach_epoch: (($hit | num) as $h | if $h == null or $h <= 0 then null else $h end)} end),
+          action: {type: ($action | str), speed_kbit: ($speed | num), boot_grace_minutes: ($boot_grace | num)},
+          enforcement: {mode: (($enf_mode | str) // "normal"), until_epoch: ($enf_until | num), reason: ($enf_reason | str)},
+          health: {state: ($health | str), text: ($health_text | str)},
+          cron: {readable: ($cron_ok | flag), monitor: ($cron_monitor | flag), telegram: ($cron_telegram | flag)},
+          telegram: {state: $tg, daily_report_time: ($tg_report | str), warn_percents: ($tg_warn | str)},
+          tc: {root_qdisc: ($tc_root | str),
+               ntc_limit_active: (if $tc_active == "unknown" then null else ($tc_active == "yes") end),
+               dog_classes: ($tc_dog | num)},
+          tc_auto_recovery: $recovery,
+          vnstat: {daemon: $vnstat, max_bandwidth_mbit: ($max_bw | num)},
+          dog_installed: ($dog | flag),
+          partial_history: ($partial | flag)
+        }'
+}
+
+monitor_status() {
+    local json=false
+    case "$#:${1:-}" in
+        0:) ;;
+        1:--json) json=true ;;
+        *)
+            echo "用法：trafficcop-lite-monitor.sh --status [--json]" >&2
+            return 2
+            ;;
+    esac
+    status_collect
+    if $json; then
+        status_print_json
+    else
+        status_print_human
+    fi
+}
+
+# ── 入口 ────────────────────────────────────────────────────────────────
+# 取监控锁（fd 9）。cron：拿不到就静默退出（上一轮或配置向导还在运行，返回 3）；
+# 开机恢复与交互操作最多等 15 秒。
+monitor_take_lock() {
+    touch "${LOCK_FILE}"
+    chmod 600 "$LOCK_FILE" 2>/dev/null || true
+    exec 9>"${LOCK_FILE}"
+    case "${1:-interactive}" in
+        cron)
+            flock -n 9 || return 3
+            ;;
+        recover)
+            if ! flock -w 15 9; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 另一个脚本实例长时间占用监控锁，TC 恢复未执行。" | tee -a "$LOG_FILE"
+                return 1
+            fi
+            ;;
+        *)
+            if ! flock -w 15 9; then
+                ui_err "另一个 NTC 操作正在进行（每分钟的检查或另一处配置），请稍后再试。"
+                return 1
+            fi
+            ;;
+    esac
+    trap 'round_log_finish; trim_log_file "$LOG_FILE" "$LOG_MAX_LINES"; flock -u 9 2>/dev/null || true' EXIT
+}
+
+show_monitor_usage() {
+    cat << 'EOF'
+用法：trafficcop-lite-monitor.sh [选项]
+  （无参数）、--configure   修改监控配置；尚未配置时直接进入向导
+  --config-show             显示当前配置
+  --config-set 参数…        不提问地修改配置（--config-set --help 查看参数）
+  --status [--json]         状态详情（只读）
+  --check                   立即检查一次（与每分钟的定时任务相同）
+  --run                     定时任务入口（每分钟一次；日志只记事件）
+  --self-check [网卡]       只读检查 TC 规则
+  --tc-clear-owned [原因]   清除 NTC 自己的 TC 限速
+  --tc-recover-owned [--auto|--manual]   按状态重建 NTC 的 TC 限速（开机恢复用）
+  -h, --help                显示本帮助
+平时请用 ntc 命令：ntc status、ntc check、ntc config …
+EOF
+}
+
+main() {
+    local rc=0
+    case "${1:-}" in
+        -h|--help)
+            show_monitor_usage
+            return 0
+            ;;
         --self-check|--tc-self-check)
             tc_self_check "${2:-}"
             return $?
@@ -5142,138 +6745,98 @@ main() {
             clear_owned_tc_rules "${2:-手动清理}"
             return $?
             ;;
+        --status)
+            shift
+            LOG_FILE=/dev/null
+            monitor_status "$@"
+            return $?
+            ;;
+        --config-show)
+            if [ "$#" -ne 1 ]; then
+                echo "用法：trafficcop-lite-monitor.sh --config-show" >&2
+                return 2
+            fi
+            LOG_FILE=/dev/null
+            show_config
+            return $?
+            ;;
+        --config-set)
+            case "${2:-}" in
+                -h|--help) config_set_usage; return 0 ;;
+            esac
+            ;;
+        --check)
+            if [ "$#" -ne 1 ]; then
+                echo "用法：trafficcop-lite-monitor.sh --check" >&2
+                return 2
+            fi
+            ;;
+        ""|--configure)
+            if [ "$#" -gt 1 ]; then
+                echo "用法：trafficcop-lite-monitor.sh [--configure]" >&2
+                return 2
+            fi
+            ;;
+        --run|--cron|--tc-recover-owned) ;;
+        *)
+            echo "无法识别的参数：$1" >&2
+            show_monitor_usage >&2
+            return 2
+            ;;
     esac
 
     # 在脚本开始时调用迁移函数
     migrate_files
-
-    # 切换到工作目录
     cd "$WORK_DIR" || exit 1
 
-    # 创建锁文件（如果不存在）
-    touch "${LOCK_FILE}"
-    chmod 600 "$LOCK_FILE" 2>/dev/null || true
-
-    # cron 模式拿不到锁直接退出；显式/开机恢复允许短暂等待正在结束的 cron，
-    # 避免两者恰好在开机同一分钟启动时让 recovery unit 偶发失败。
-    exec 9>"${LOCK_FILE}"
-    if [ "${1:-}" = "--tc-recover-owned" ]; then
-        if ! flock -w 15 9; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 另一个脚本实例长时间占用监控锁，TC 恢复未执行。" | tee -a "$LOG_FILE"
-            exit 1
-        fi
-    elif ! flock -n 9; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 另一个脚本实例正在运行，退出。" | tee -a "$LOG_FILE"
-        exit 1
-    fi
-    trap 'trim_log_file "$LOG_FILE" "$LOG_MAX_LINES"; flock -u 9 2>/dev/null || true' EXIT
-    if [ "${1:-}" = "--tc-recover-owned" ]; then
-        if ! read_config; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置文件读取失败，未修改 TC。" | tee -a "$LOG_FILE"
-            return 1
-        fi
-        # 与 --run 一致：周期边界按 vnStat 的 UseUTC 计算（只读，不修改 vnStat 配置）。
-        align_timezone_with_vnstat
-        recover_owned_tc_hierarchy "${2:---manual}"
-        return $?
-    fi
-
-    # 检查是否以 --run 模式运行
-    if [ "$1" = "--run" ] || [ "$1" = "--cron" ]; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 正在以自动化模式运行" | tee -a "$LOG_FILE"
-        if read_config; then
-            if [ "${DISABLED:-false}" = "true" ]; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') 监控已标记为禁用，跳过自动检查" | tee -a "$LOG_FILE"
-                write_health_state disabled "监控已禁用" || true
-                return
-            fi
-            if ! ensure_vnstat_runtime_config "$MAIN_INTERFACE"; then
-                echo "$(date '+%Y-%m-%d %H:%M:%S') vnStat 运行配置或服务校验失败，跳过本轮检查。" | tee -a "$LOG_FILE"
-                write_health_state error "vnStat 运行配置或服务校验失败" || true
+    case "${1:-}" in
+        --run|--cron)
+            monitor_take_lock cron || return 0
+            round_log_begin || true
+            run_monitor_round > /dev/null 2>> "${ROUND_LOG_BUFFER:-/dev/null}" || rc=$?
+            round_log_finish "$rc"
+            return "$rc"
+            ;;
+        --tc-recover-owned)
+            monitor_take_lock recover || return 1
+            if ! read_config; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 配置文件读取失败，未修改 TC。" | tee -a "$LOG_FILE"
                 return 1
             fi
-            if ! check_reset_limit; then
-                # 周期文件未更新，下一轮会重试；记录健康状态，避免 Telegram 静默。
-                echo "$(date '+%Y-%m-%d %H:%M:%S') 新周期的限速/关机计划清理失败，下一轮重试。" | tee -a "$LOG_FILE"
-                write_health_state error "新周期的限速/关机计划清理失败（TC 规则可能被其他程序占用，见 traffic_monitor.log）" || true
+            # 与 --run 一致：周期边界按 vnStat 的 UseUTC 计算（只读，不修改 vnStat 配置）。
+            align_timezone_with_vnstat
+            recover_owned_tc_hierarchy "${2:---manual}"
+            return $?
+            ;;
+        --check)
+            monitor_take_lock || return 1
+            if [ ! -f "$CONFIG_FILE" ]; then
+                ui_warn "尚未配置流量监控：运行 sudo ntc config 开始。"
                 return 1
             fi
-            local run_status=0
-            check_and_limit_traffic || run_status=$?
-            if [ "$run_status" -eq 0 ]; then
-                write_health_state ok "" || true
-            else
-                write_health_state error "$(last_log_reason)" || true
+            monitor_check_now
+            return $?
+            ;;
+        --config-set)
+            shift
+            monitor_take_lock || return 1
+            if ! check_and_install_packages; then
+                ui_err "依赖检查未通过，未修改配置。"
+                return 1
             fi
-            return "$run_status"
-        else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置文件读取失败，请检查配置" | tee -a "$LOG_FILE"
-            write_health_state error "配置文件读取失败" || true
-            return 1
-        fi
-    fi
-
- # 非 --run 模式下的操作
-  # 首先检查并安装必要的软件包
-    if ! check_and_install_packages; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 依赖检查未通过，已停止后续配置和限速检查。" | tee -a "$LOG_FILE"
-        return 1
-    fi
-    if check_existing_setup; then
-        read_config || return 1
-        # 已在“机器限速管理”中停用：只展示配置，不重装定时任务、不执行限速或关机
-        # （1.2.0 在这里会重新加上 --run 任务并立即执行一轮限制，而 --run 遇到停用直接跳过，限速无人解除）。
-        if [ "${DISABLED:-false}" = "true" ]; then
-            show_current_config
-            echo ""
-            echo "流量监控已停用：不会安装定时任务，也不会执行限速或关机。"
-            echo "如需继续监控或修改配置，请先在主菜单 3) 机器限速管理 中选择启用。"
-            return 0
-        fi
-        ensure_vnstat_runtime_config "$MAIN_INTERFACE" || return 1
-        show_current_config
-
-        local modify_answer=""
-        echo ""
-        # 只有明确输入 y/Y 才进入向导（1.2.0 是 5 秒内按任意键，按 n 或回车也会进入）。
-        if read -r -t 30 -p "是否修改配置？[y/N]（30 秒内不输入则保持现有配置）: " modify_answer &&
-           [[ "$modify_answer" =~ ^[Yy]$ ]]; then
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 开始修改配置..." | tee -a "$LOG_FILE"
-            initial_config || return 1
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 配置已更新，脚本将每分钟自动运行一次" | tee -a "$LOG_FILE"
-        else
-            echo ""
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 保持现有配置。" | tee -a "$LOG_FILE"
-        fi
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 开始初始化配置..." | tee -a "$LOG_FILE"
-        initial_config || return 1
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 初始配置完成，脚本将每分钟自动运行一次" | tee -a "$LOG_FILE"
-    fi
-    setup_crontab || return 1
-
-    # 显示当前流量使用情况和限制状态
-    if read_config; then
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 当前流量使用情况：" | tee -a "$LOG_FILE"
-        local current_usage unit_label
-        #echo "Debug: Current usage from get_traffic_usage: $current_usage" | tee -a "$LOG_FILE"
-        if current_usage=$(get_traffic_usage); then
-            local start_date
-            start_date=$(get_period_start_date)
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 当前统计周期: $TRAFFIC_PERIOD (从 $start_date 开始)" | tee -a "$LOG_FILE"
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 统计模式: $TRAFFIC_MODE" | tee -a "$LOG_FILE"
-            [ "${TRAFFIC_UNIT:-binary}" = "decimal" ] && unit_label="GB" || unit_label="GiB"
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 当前使用流量: $current_usage $unit_label" | tee -a "$LOG_FILE"
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 检查并限制流量：" | tee -a "$LOG_FILE"
-            check_and_limit_traffic
-        else
-            echo "$(date '+%Y-%m-%d %H:%M:%S') 无法可靠获取流量数据，请检查 vnstat 配置；本轮不会清除现有限速。" | tee -a "$LOG_FILE"
-            return 1
-        fi
-    else
-        echo "$(date '+%Y-%m-%d %H:%M:%S') 配置文件读取失败，请检查配置" | tee -a "$LOG_FILE"
-        return 1
-    fi
+            config_set_cli "$@"
+            return $?
+            ;;
+        *)
+            monitor_take_lock || return 1
+            if ! check_and_install_packages; then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') 依赖检查未通过，已停止后续配置和限速检查。" | tee -a "$LOG_FILE"
+                return 1
+            fi
+            configure_menu
+            return $?
+            ;;
+    esac
 }
 
 
@@ -5281,7 +6844,8 @@ main() {
 # Sourcing exposes functions without creating files, installing traps or running a menu.
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     case "${1:-}" in
-        --self-check|--tc-self-check) ;;
+        # 只读命令不创建工作目录、不改权限。
+        --self-check|--tc-self-check|--status|--config-show|-h|--help) ;;
         *)
             umask 077
             mkdir -p "$WORK_DIR"
@@ -5289,9 +6853,6 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
             [ ! -f "$LOG_FILE" ] || chmod 600 "$LOG_FILE" 2>/dev/null || true
             ;;
     esac
-    write_invocation_log_header "${1:-}" || printf '%s\n' 'NTC monitor log unavailable' >&2
     main "$@"
-    exit_code=$?
-    write_invocation_log_footer "${1:-}" || printf '%s\n' 'NTC monitor log unavailable' >&2
-    exit "$exit_code"
+    exit $?
 fi

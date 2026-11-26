@@ -4904,6 +4904,34 @@ test_monitor_cli_rejects_unknown_arguments() {
     grep -Fq -- '--config-set' "$work/help" || return 1
     assert_absent "$work/calls"
 }
+
+# 每分钟的检查只把事件写进日志（2.0）：main 在切到本轮缓冲之前不得直接写真实日志（1.x 遗留的 migrate_files 每次运行
+# 都写一行「使用独立工作目录」，cron 下就是每分钟一行）；ntc check 只打印一句结论。
+# shellcheck disable=SC2034,SC2209,SC2317,SC2329
+test_monitor_main_writes_no_log_before_round_buffer() {
+    local work out
+    work=$(mktemp -d "$TEST_ROOT/monitor-main-log.XXXXXX") || return 1
+    WORK_DIR="$work"
+    LOG_FILE="$work/traffic_monitor.log"
+    CONFIG_FILE="$work/traffic_monitor_config.txt"
+    printf '%s\n' LIMIT_MODE=tc > "$CONFIG_FILE"
+    load_function "$MONITOR_SCRIPT" main || return 1
+    load_function "$MONITOR_SCRIPT" migrate_files 2> /dev/null || true
+    monitor_take_lock() { :; }
+    round_log_begin() { [ ! -s "$LOG_FILE" ] && printf '%s\n' begin >> "$work/calls"; }
+    run_monitor_round() { printf '%s\n' round >> "$work/calls"; }
+    round_log_finish() { printf '%s\n' finish >> "$work/calls"; }
+    monitor_check_now() { printf '%s\n' '  ✓ 检查完成：流量正常。'; }
+
+    ( main --run ) < /dev/null > "$work/out" 2>&1 || return 1
+    assert_file_content $'begin\nround\nfinish' "$work/calls" || return 1
+    assert_absent "$LOG_FILE" || return 1
+    [ ! -s "$work/out" ] || return 1
+
+    out=$( ( main --check ) < /dev/null 2>&1 ) || return 1
+    [ "$out" = '  ✓ 检查完成：流量正常。' ] || return 1
+    assert_absent "$LOG_FILE"
+}
 # 四个脚本里的共享区块必须与 src/common 一致（CI 也会跑这一条）。
 # shellcheck disable=SC2034,SC2209,SC2317,SC2329
 test_common_blocks_are_in_sync() {
@@ -4923,6 +4951,7 @@ run_test 'boot-time TC recovery defers the NTC cap during boot grace (2.0)' test
 run_test 'config set validates arguments and never prompts with --yes (2.0)' test_config_set_validates_arguments_without_prompting
 run_test 'status --json is typed and read-only (2.0)' test_monitor_status_json_is_typed_and_read_only
 run_test 'monitor CLI rejects unknown arguments before touching state (2.0)' test_monitor_cli_rejects_unknown_arguments
+run_test 'monitor main writes nothing to the real log before the round buffer (2.0)' test_monitor_main_writes_no_log_before_round_buffer
 # ── end 2.0 monitor ──
 
 # ── 2.0 main ──

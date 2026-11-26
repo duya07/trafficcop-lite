@@ -1261,11 +1261,6 @@ ntc_operation_log() {
 
 
 
-migrate_files() {
-    mkdir -p "$WORK_DIR"
-    echo "$(date '+%Y-%m-%d %H:%M:%S') 使用独立工作目录: $WORK_DIR" | tee -a "$LOG_FILE"
-}
-
 command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
@@ -6785,8 +6780,8 @@ main() {
             ;;
     esac
 
-    # 在脚本开始时调用迁移函数
-    migrate_files
+    # 工作目录由文件末尾的入口在非只读命令前创建。这里不能写日志：--run 要等 round_log_begin 切到本轮缓冲后，
+    # 日志才只记事件（1.x 的 migrate_files 在这里每次运行都写一行「使用独立工作目录」）。
     cd "$WORK_DIR" || exit 1
 
     case "${1:-}" in
